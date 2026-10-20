@@ -34,5 +34,15 @@
     "bridge",
     "json-rpc"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "author": "zxm681",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zxm681/dsh-pier.git",
+    "directory": "packages/dsh-vscode-kit"
+  },
+  "homepage": "https://github.com/zxm681/dsh-pier#readme",
+  "bugs": {
+    "url": "https://github.com/zxm681/dsh-pier/issues"
+  }
 }

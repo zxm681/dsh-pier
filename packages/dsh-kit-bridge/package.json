@@ -5,6 +5,16 @@
   "version": "0.2.0",
   "publisher": "dsh-kit-dev",
   "license": "MIT",
+  "author": "zxm681",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zxm681/dsh-pier.git",
+    "directory": "packages/dsh-kit-bridge"
+  },
+  "homepage": "https://github.com/zxm681/dsh-pier#readme",
+  "bugs": {
+    "url": "https://github.com/zxm681/dsh-pier/issues"
+  },
   "private": true,
   "type": "module",
   "engines": {

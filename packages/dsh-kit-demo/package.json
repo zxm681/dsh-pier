@@ -6,13 +6,27 @@
   "description": "Example consumer proving a third-party DSH plugin can use dsh-vscode-kit with zero coupling.",
   "main": "./src/index.js",
   "license": "MIT",
+  "author": "zxm681",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zxm681/dsh-pier.git",
+    "directory": "packages/dsh-kit-demo"
+  },
+  "homepage": "https://github.com/zxm681/dsh-pier#readme",
+  "bugs": {
+    "url": "https://github.com/zxm681/dsh-pier/issues"
+  },
   "peerDependencies": {
     "@deepseek-ai/dsh": ">=0.2.1-0 <0.3.0",
     "dsh-vscode-kit": "*"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/dsh": { "optional": true },
-    "dsh-vscode-kit": { "optional": true }
+    "@deepseek-ai/dsh": {
+      "optional": true
+    },
+    "dsh-vscode-kit": {
+      "optional": true
+    }
   },
   "scripts": {
     "test": "node --test \"test/*.test.js\""
