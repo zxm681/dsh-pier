@@ -1,0 +1,73 @@
+{
+  "name": "dsh-kit-bridge",
+  "displayName": "DSH Kit Bridge",
+  "description": "Thin bridge exposing a minimal set of VS Code capabilities to DeepSeek Harness plugins over loopback TCP.",
+  "version": "0.2.0",
+  "publisher": "dsh-kit-dev",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.cjs",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "dshKit.showStatus",
+        "title": "DSH Kit: 显示桥接状态"
+      },
+      {
+        "command": "dshKit.reconnect",
+        "title": "DSH Kit: 重新连接"
+      },
+      {
+        "command": "dshKit.revokeTrust",
+        "title": "DSH Kit: 撤销已信任的 DSH"
+      },
+      {
+        "command": "dshKit.selfTest",
+        "title": "DSH Kit: 运行自检"
+      }
+    ],
+    "configuration": {
+      "title": "DSH Kit Bridge",
+      "properties": {
+        "dshKit.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用桥接。关闭后扩展不连接任何 DSH 实例。"
+        },
+        "dshKit.dshHome": {
+          "type": "string",
+          "default": "",
+          "description": "DSH 主目录（发现文件所在处）。留空则用 DSH_HOME 环境变量或 ~/.dsh。"
+        },
+        "dshKit.pollIntervalMs": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 500,
+          "description": "轮询发现文件的间隔（毫秒）。"
+        },
+        "dshKit.selfTestOnStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "启动时在真实 VS Code 里跑一次能力自检，结果写到 ~/.dsh/dsh-vscode-kit/selftest-<pid>.json（仅供排障，默认关）。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

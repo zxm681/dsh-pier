@@ -1,0 +1,38 @@
+{
+  "name": "dsh-vscode-kit",
+  "version": "0.1.0",
+  "description": "DSH Editor Bridge Protocol v1 — DSH-side protocol library that lets any DSH plugin call VS Code capabilities over a loopback TCP bridge.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./protocol": "./src/protocol.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.1-0 <0.3.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "vscode",
+    "bridge",
+    "json-rpc"
+  ],
+  "license": "MIT"
+}

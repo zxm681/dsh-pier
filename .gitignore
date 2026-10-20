@@ -1,0 +1,7 @@
+node_modules/
+*.vsix
+out/
+work/smoke-result.json
+work/smoke-target.txt
+.DS_Store
+*.log

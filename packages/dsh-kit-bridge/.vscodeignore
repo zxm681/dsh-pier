@@ -1,0 +1,7 @@
+# 开发时排除；运行期只需要 out/extension.cjs
+src/**
+test/**
+scripts/**
+node_modules/**
+package-lock.json
+*.vsix
