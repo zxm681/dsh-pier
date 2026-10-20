@@ -109,6 +109,7 @@ export async function startBridgeServer(opts = {}) {
     timeoutMs,
     sweep = true,
     onConnected,
+    onAuthorized,
   } = opts
 
   if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
@@ -127,15 +128,37 @@ export async function startBridgeServer(opts = {}) {
       if (socket.destroyed || !socket.writable) return
       socket.write(line)
     }
-    const link = connect({
+    // ★ 安全：连接建立 ≠ 准入。
+    //
+    // TCP 连上只证明「有个进程够得着这个端口」，不证明它是合法编辑器。
+    // 所以这里先打成未准入，只有通过 token 校验的入站消息才把它升为准入连接。
+    // 上层（index.js 的 _activeLink）只在准入连接里挑 active —— 否则任何一个
+    // 本机进程裸连上来、什么都不发，靠「最后连上的赢」就能截走 DSH 的调用
+    // （安全审计 洞 2；work/scripts/lesson3-hijack.mjs 是它的复现）。
+    //
+    // 注意：仍要照常 links.add(link)，因为 close() 靠这个集合销毁底层 socket
+    // （踩过：只 close 协议终端不断 TCP，server.close() 会永久挂住）。
+    // 「准入」是另一个维度，用标志位表达，不要和「连接存在」混为一谈。
+    let link
+    link = connect({
       write,
       onRequest,
       timeoutMs,
       token,
       onError,
       // 所有入站消息都要求顶层 token 与本实例 token 一致（协议 §3.3）。
-      authorize: (incoming) => incoming === token,
+      authorize: (incoming) => {
+        if (incoming !== token) return false
+        // 第一条通过校验的消息即为准入时刻。此后这条连接才有资格当 active。
+        if (link.authorized !== true) {
+          link.authorized = true
+          // 准入是「异步才可能发生」的事件，必须在这里通知，不能靠连接建立。
+          try { onAuthorized?.(link) } catch (err) { onError?.(err) }
+        }
+        return true
+      },
     })
+    link.authorized = false
     link.socket = socket
     const feed = createLineSplitter((line) => link.handleLine(line))
     socket.on('data', (chunk) => {

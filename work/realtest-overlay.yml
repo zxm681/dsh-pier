@@ -16,3 +16,5 @@
         smoke:
           path: 'D:\default-workspace\projects\dsh-vscode-dev\work\smoke-target.txt'
           outFile: 'D:\default-workspace\projects\dsh-vscode-dev\work\smoke-result.json'
+          # 给真机反证留一个窗口：等编辑器连上后，脚本会在这期间挂一条裸连接
+          delayMs: 12000

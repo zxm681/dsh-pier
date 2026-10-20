@@ -42,16 +42,17 @@ VS Code
 | 6 验收 | `phase6-验收报告.md` | ✅ 6/6 |
 | 7 经验 | `phase7-经验手册.md` | ✅ |
 | 8 手册指导开发 | 按手册加了 `getDiagnostics` / `listOpenEditors` | ✅ 抓到出口路径 bug |
+| 9 安全审计 | 教学答疑时挖出三个安全洞 | 洞 1、2 已修并真机复验；洞 3 已知未修 |
 
 ## 三个包
 
 | 包 | 作用 | 版本 | 测试 |
 |---|---|---|---|
-| `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 38 ✅ |
+| `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 46 ✅ |
 | `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.2.0 | 23 ✅ |
 | `packages/dsh-kit-demo` | 示例消费者，证明零耦合接入 | 0.1.0 | 7 ✅ |
 
-合计 **68 条单测 + 13 项跨进程 E2E**，全绿。
+合计 **76 条单测 + 13 项跨进程 E2E**，全绿。
 
 ## 快速开始
 
@@ -85,7 +86,7 @@ export function apply(ctx) {
 ## 跑测试
 
 ```bash
-cd packages/dsh-vscode-kit   && node --test "test/*.test.js"   # 38
+cd packages/dsh-vscode-kit   && node --test "test/*.test.js"   # 46
 cd packages/dsh-kit-bridge   && node --test "test/*.test.js"   # 23
 cd packages/dsh-kit-demo     && node --test "test/*.test.js"   # 7
 cd packages/dsh-kit-bridge   && node scripts/e2e.mjs           # 13 跨进程
@@ -123,6 +124,25 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 
 `-32005` 与 `-32601` 的区别：前者是"能力协商没通过，你该降级"，
 后者是"方法名根本不存在，是编程错误"。
+
+## 安全模型
+
+这条通道被授予的是**编辑器能力**，所以边界要说清楚。
+
+| 防线 | 拦什么 | 拦不住什么 |
+|---|---|---|
+| 只监听 `127.0.0.1` | 局域网、外网 | **本机任何进程**（同用户下的任意程序都够得着） |
+| 256 位随机 token | 猜不到的凭证 | 凭证本身被读到（同用户可读发现文件） |
+| **准入判定**（`link.authorized`） | 不带正确 token 的连接抢走 active 位 | —— |
+| 只读或打开动作 | 改动你代码内容 | —— |
+
+三条诚实的说明：
+
+1. **本机不是安全边界**。token 防的是「本机别的进程冒充编辑器」，不是防「本机进程读你的文件」。
+   同用户下任何进程都能读发现文件拿到 token —— 这是设计上的取舍，不是遗漏。
+2. **首版刻意不做编辑器内容注入**。能读选区、能开文件，但不能往你正在写的文件里写东西。
+3. **洞 3 仍开着**：协议层的响应分支不做 token 校验（见 `phase7-经验手册.md` §5.9 与
+   `phase5-打样日志.md` 阶段 9）。它需要单独一轮设计，不要顺手改。
 
 ## 明确不做
 

@@ -49,11 +49,13 @@ function fakeCtx() {
  *  - 请求（id + method）      → link.handleLine（交给 onRequest 应答）
  *  - 通知（无 id）            → inbox/waiters（hello 等）
  */
-async function fakeEditor(server, { onRequest } = {}) {
+async function fakeEditor(server, { onRequest, bypassToken } = {}) {
   const socket = createConnection({ port: server.port, host: '127.0.0.1' })
   const inbox = []
   const waiters = []
-  const link = connect({ write: (l) => socket.write(l), token: server.token, onRequest })
+  // bypassToken：安全回归用 —— 故意用错 token 连上去，验证「连接在册但不准入」。
+  const token = bypassToken ?? server.token
+  const link = connect({ write: (l) => socket.write(l), token, onRequest })
   const feed = createLineSplitter((line) => {
     const msg = JSON.parse(line)
     const isResponse = msg.id !== undefined && msg.method === undefined
@@ -140,6 +142,105 @@ test('端到端：apply → 服务注册 → 假编辑器连上 → 消费者 vs
   assert.equal(listLiveBridges(discoveryDir(home)).length, 0, '发现文件应在卸载后删除')
   assert.ok(logs.some((l) => l.includes('listening on')))
 
+  rmSync(home, { recursive: true, force: true })
+})
+
+/**
+ * 回归锁（安全审计 洞 2）：**连接建立 ≠ 准入**。
+ *
+ * 曾经的实现是 `links.add(link)` 之后 `_activeLink()` 直接取「最后连上的那个」，
+ * 于是任何本机进程只要裸连端口、什么都不发，就能把 active 位抢走，
+ * 之后 DSH 的 `vscode.*` 请求全被它接走并可伪造结果
+ * （复现脚本 work/scripts/lesson3-hijack.mjs）。
+ *
+ * 现在的口径：server.js 在 authorize 通过第一条 token 正确的消息时才置
+ * `link.authorized = true`；`_activeLink()` 只在 authorized 连接里挑。
+ * 下面三条按「没准入门 → 抢不到」的顺序钉住它。
+ */
+test('安全回归：裸连接（不带 token、不发消息）抢不到 active 位', async () => {
+  const home = tempHome()
+  const ctx = fakeCtx()
+  const handle = apply(ctx, { dshHome: home, connectWaitMs: 50, onLog: () => {} })
+  await handle.boot
+  const svc = ctx.provided.get('dshVscodeKit').v
+
+  // 攻击者：裸 socket，不认识协议库，一个字节都不发
+  const attacker = createConnection({ port: handle.kit.server.port, host: '127.0.0.1' })
+  await new Promise((r, j) => { attacker.once('connect', r); attacker.once('error', j) })
+  await new Promise((r) => setTimeout(r, 60))
+
+  assert.equal(handle.kit.server.links.size, 1, '连接仍应登记（close 要靠它销毁 socket）')
+  const link = [...handle.kit.server.links][0]
+  assert.equal(link.authorized, false, '没通过 token 校验的连接必须是未准入')
+  assert.equal(handle.kit._activeLink(), null, '未准入连接不许当 active')
+
+  // 消费者要能力时应当得到「没有编辑器」，而不是把请求发给攻击者
+  await assert.rejects(
+    svc.request('vscode.getSelection', {}, { waitForEditor: false }),
+    (e) => e.code === ERR.DISCONNECTED,
+  )
+
+  attacker.destroy()
+  ctx.runDisposers()
+  await handle.stopped
+  rmSync(home, { recursive: true, force: true })
+})
+
+test('安全回归：带错 token 的连接也不算准入', async () => {
+  const home = tempHome()
+  const ctx = fakeCtx()
+  const handle = apply(ctx, { dshHome: home, connectWaitMs: 50, onLog: () => {} })
+  await handle.boot
+  const svc = ctx.provided.get('dshVscodeKit').v
+
+  const editor = await fakeEditor(handle.kit.server, { bypassToken: 'not-the-real-token' })
+  // 用错 token 发一条请求：服务端会拒 -32001，但连接本身不断（协议 §3.3）
+  await assert.rejects(
+    editor.link.request('bridge.ping', {}),
+    (e) => e.code === ERR.UNAUTHORIZED,
+  )
+  await new Promise((r) => setTimeout(r, 60))
+
+  const links = [...handle.kit.server.links]
+  assert.equal(links.length, 1)
+  assert.equal(links[0].authorized, false, 'token 错的连接不许被准入')
+  assert.equal(handle.kit._activeLink(), null)
+
+  editor.socket.destroy()
+  ctx.runDisposers()
+  await handle.stopped
+  rmSync(home, { recursive: true, force: true })
+})
+
+test('安全回归：真编辑器准入后抢位失败（active 位只认 token 通过者）', async () => {
+  const home = tempHome()
+  const ctx = fakeCtx()
+  const handle = apply(ctx, { dshHome: home, connectWaitMs: 50, onLog: () => {} })
+  await handle.boot
+  const svc = ctx.provided.get('dshVscodeKit').v
+
+  // 1) 真编辑器先来并报身份 → 准入
+  const editor = await fakeEditor(handle.kit.server, {
+    onRequest: (method) => (method === 'vscode.getSelection' ? { text: 'REAL' } : undefined),
+  })
+  await editor.link.request('bridge.ping', {})
+  assert.equal([...handle.kit.server.links][0].authorized, true, 'token 通过即准入')
+
+  // 2) 攻击者随后裸连 —— 它是「最后连上的」，但没准入
+  const attacker = createConnection({ port: handle.kit.server.port, host: '127.0.0.1' })
+  await new Promise((r, j) => { attacker.once('connect', r); attacker.once('error', j) })
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(handle.kit.server.links.size, 2, '两条连接都在册')
+  assert.equal(handle.kit._activeLink()?.authorized, true, 'active 必须还是已准入的那条')
+
+  // 3) 请求必须落到真编辑器，不能被攻击者截走
+  const sel = await svc.request('vscode.getSelection', {}, { waitForEditor: false })
+  assert.equal(sel.text, 'REAL', '结果必须来自真编辑器')
+
+  attacker.destroy()
+  await editor.close()
+  ctx.runDisposers()
+  await handle.stopped
   rmSync(home, { recursive: true, force: true })
 })
 

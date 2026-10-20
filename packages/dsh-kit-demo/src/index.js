@@ -85,6 +85,11 @@ export function apply(ctx, config = {}) {
         }
       }
       await step('kit.waitReady', () => kit.waitReady?.(5000) ?? true)
+      // delayMs：验证脚本用来在「编辑器已连上」与「发起请求」之间插入事件
+      // （比如挂一条不说话的裸连接，验证它抢不到 active 位）。默认 0。
+      if (config.smoke.delayMs > 0) {
+        await new Promise((r) => setTimeout(r, config.smoke.delayMs))
+      }
       await step('kit.snapshot', async () => kit.snapshot?.() ?? null)
       await step('vscode.openFile', () => openFile(config.smoke.path, { line: 2, column: 1 }))
       await step('vscode.getSelection', () => readSelection())

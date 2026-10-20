@@ -13,14 +13,16 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
 5. **优雅关闭要显式 `socket.destroy()`**，只 `link.close()` 会让 `server.close()` 挂死。
 6. **转义/剥离在边界一次做完**。CRLF 在分帧层剥，1-based→0-based 只在 VSCode API 边界转。
 7. **改完立刻跑 import smoke**：`node -e "import('./src/index.js')"`，比全量测试快。
+8. **连接建立 ≠ 准入**。`links` 里混着"连上了"和"被信任"两种连接；要挑对端必须过滤
+   `authorized === true`（见 §5.9）。出站消息**不许默认附带 token**——凭证只在调用方显式要求时带。
 
 ## 验证门槛（声称完成前必须全绿）
 
 ```bash
-cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 38
-cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 17
+cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 46
+cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 23
 cd packages/dsh-kit-demo   && node --test "test/*.test.js"   # 7
-cd packages/dsh-kit-bridge && node scripts/e2e.mjs           # 11
+cd packages/dsh-kit-bridge && node scripts/e2e.mjs           # 13
 ```
 
 涉及真实宿主语义的改动（服务注册、配置监听、VSCode API 调用）**必须真机验证**，

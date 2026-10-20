@@ -60,9 +60,16 @@ class VscodeKit {
     }
   }
 
-  /** 内部：取当前活跃连接（最新连上的优先，多编辑器仲裁留给后续版本）。 */
+  /**
+   * 内部：取当前活跃连接 —— **只在已准入的连接里挑**。
+   *
+   * ★ 安全（洞 2）：不能简单取「最后连上的」。裸连一个 socket、什么都不发，
+   *   就能把 active 位抢走，之后 DSH 的 vscode.* 请求全被它接走
+   *   （work/scripts/lesson3-hijack.mjs 是复现）。
+   *   准入 = 至少发过一条 token 正确的消息（server.js 的 authorize 里打标）。
+   */
   _activeLink() {
-    const links = [...this.server.links]
+    const links = [...this.server.links].filter((l) => l.authorized === true)
     return links.length ? links[links.length - 1] : null
   }
 
@@ -190,6 +197,12 @@ export function apply(ctx, config = {}) {
 
   /** 服务实例在监听成功后才有；消费者可能早于监听就 inject，故用惰性代理。 */
   let kit = null
+  /**
+   * 监听已起、但 kit 还没装配完的空窗期里通过准入的连接。
+   * 单纯丢掉它们会让「扩展恰好比 kit 快一步」变成一次静默失败，
+   * 所以要记下来、装配完补通知。
+   */
+  const pendingAuthorized = new Set()
   let disposed = false
   /**
    * 监听就绪信号。一次性 Promise：resolve 后 await 它永远立即返回 true。
@@ -286,9 +299,20 @@ export function apply(ctx, config = {}) {
         // 记录连接、唤醒等待编辑器的消费者。
         onConnected: (link) => {
           // 日志是排障的第一手证据：真机上「扩展到底连上没有」不该靠猜。
+          // 注意这是「连上」不是「准入」——准入（token 校验通过）另有日志。
           const peer = link.socket?.remotePort
           log('info', `editor connected (remote port ${peer ?? 'unknown'})`)
-          kit?._notifyConnected(link)
+        },
+        // ★ 安全（洞 2）：只有通过 token 校验的连接才通知等待者。
+        // 未准入的裸连接可能永远不发消息 —— 那种连接不能被当成编辑器。
+        onAuthorized: (link) => {
+          if (kit === null) {
+            // 监听刚起、kit 还没装配完：先记进 pending，装配后补通知。
+            pendingAuthorized.add(link)
+            return
+          }
+          log('info', 'editor authorized (token accepted)')
+          kit._notifyConnected(link)
         },
       })
 
@@ -301,6 +325,16 @@ export function apply(ctx, config = {}) {
 
       // 服务端反向收到的编辑器身份存在 lastEditor（能力降级的判据）。
       // 编辑器连上后也会主动发 bridge.hello 请求，handleInbound 里记录。
+
+      // 补通知空窗期内已准入的连接（它们可能比 kit 装配更早到）。
+      // 这个窗口是真的：startBridgeServer 内部 await 期间端口已在监听，
+      // 扩展正好轮询到就会连上并发消息 —— 那条消息的准入发生在 kit 装配之前。
+      // 不打日志就会在真机上「凭空少一条 authorized」，排障时极易误判。
+      for (const link of pendingAuthorized) {
+        log('info', 'editor authorized during startup (notified after wiring)')
+        kit._notifyConnected(link)
+      }
+      pendingAuthorized.clear()
 
       log('info', `listening on 127.0.0.1:${server.port} (discovery: ${server.discoveryPath})`)
       log('info', `live bridges under ${resolveDshHome(dshHome)}: ${listLiveBridges(discoveryDir(dshHome)).length}`)

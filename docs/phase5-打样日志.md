@@ -391,3 +391,61 @@ demo   7 / 7
 E2E   13 / 13
 合计   68 单测 + 13 E2E 断言
 ```
+
+---
+
+## 阶段 9（安全审计回补）：教学答疑时挖出三个安全缺陷
+
+这不是计划内的阶段。它是「按主人的答案去查证」时意外掉出来的：
+主人问「token 被看到了会怎样」，我去写验证脚本，脚本直接证明 token 是**白送**的。
+
+### 洞 1：`bridge.hello` 白送 token（已修，commit 0268b87）
+
+`server.js` 用 `link.notify('bridge.hello', …)` 打招呼，而 `protocol.js` 的
+`notify()` / `request()` 会给**每一条出站消息**自动附加 token。
+于是任何进程裸连端口，第一条收到的消息里就带着真 token，握手发生在鉴权之前。
+
+实测证据（`work/scripts/lesson3-verify-hello.mjs`）：
+```
+hello 顶层 token：d78eb530…（64 字符）   名片里的真 token：d78eb530…
+两者相同吗？ ★ 是
+用 hello 白拿的 token 发请求 → ✅ 成功 {"pong":true,...}
+```
+
+修法：默认不带凭证，要带必须显式传。`respond`/`respondError` 本来就不带，
+`notify`/`request` 改为只在调用方显式要求时附 token。
+
+### 洞 2：谁最后连上谁就是「编辑器」（已修，本轮）
+
+`links.add(link)` 在**连接建立**时执行（与 token 无关），`_activeLink()` 取
+`links[links.length - 1]`。任何本机进程裸连一个 socket、什么都不发，就抢到了 active 位。
+
+修复见 `docs/phase7-经验手册.md` §5.9（准入标志位 + onAuthorized + pendingAuthorized）。
+复现脚本 `work/scripts/lesson3-hijack.mjs` 现在是**反证**脚本：修复前攻击者能拿到
+请求并返回伪造结果，修复后攻击者收到 0 条消息，且脚本末尾手动把 `authorized = true`
+能让劫持立刻复现 —— 证明这个标志就是那道门。
+
+真机证据（`work/evidence-hole2-realmachine.*`）：
+```
+[dsh-vscode-kit] editor connected (remote port 4664)
+[dsh-vscode-kit] editor authorized (token accepted)     ← 真编辑器
+[dsh-vscode-kit] editor connected (remote port 4666)    ← 攻击者裸连，只有 connected 没有 authorized
+[dsh-kit-demo] smoke PASS
+```
+`smoke-result.json` 里 `connections = 2`，但 `openFile` / `getSelection` 全部落在真编辑器上。
+
+### 洞 3：响应不过鉴权门（未修，已知）
+
+`protocol.js` 的 `isResponse` 分支直接 `entry.resolve(msg.result)`，全程不调 `authorize`。
+与「响应不带 token」是自洽的 —— 自洽地一起错。
+修它要让响应带 token，而 token 附在哪条消息上正是洞 1 的教训，
+所以需要一轮单独设计（不能顺手改），排在下一轮。
+
+### 全量回归（阶段 9 结束时）
+```
+kit   46 / 46   ← 新增 3 条安全回归 + 5 条此前累计
+bridge 23 / 23
+demo   7 / 7
+E2E   13 / 13
+真机   smoke PASS（含裸连接在位时）+ 自检 9/9
+```
