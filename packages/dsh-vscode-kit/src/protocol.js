@@ -170,20 +170,42 @@ export function connect(opts) {
     })
   }
 
-  /** 单向通知，不等待响应（无 id）。 */
-  function notify(method, params) {
+  /**
+   * 单向通知，不等待响应（无 id）。
+   *
+   * ★ 安全边界：**默认不附带 token**。
+   *
+   * 这里的默认值不是风格问题。曾经写成「有 token 就附上」，结果是
+   * `link.notify('bridge.hello', …)` —— 服务端在对方还没证明身份之前发出的
+   * 第一条消息 —— 把整个连接的通行证一起寄了出去。任何人连上端口、什么都不发，
+   * 就能从 hello 里读到 token，然后冒充合法对端（真机实测可劫持调用并伪造返回值）。
+   *
+   * 所以凭据必须是**显式**的：谁要发凭据，谁在调用点写明 `withToken: true`。
+   * 默认不发，写代码的人就不可能"没意识到自己在发凭证"。
+   *
+   * 正常的业务通知本身也不需要 token —— 对方若要求鉴权，会回 -32001 让上层处理。
+   */
+  function notify(method, params, opts) {
     const msg = { jsonrpc: '2.0', method, params: params ?? {} }
-    if (token !== undefined) msg.token = token
+    if (opts?.withToken === true && token !== undefined) msg.token = token
     send(msg)
   }
 
-  /** 应答一个入站请求。 */
-  function respond(id, result) {
-    send({ jsonrpc: '2.0', id, result })
+  /**
+   * 应答一个入站请求。
+   *
+   * ★ 安全边界：**默认不附带 token**，理由同 notify。
+   * 对端若对响应也做鉴权（应当如此），需要显式 `{ withToken: true }`。
+   */
+  function respond(id, result, opts) {
+    const msg = { jsonrpc: '2.0', id, result }
+    if (opts?.withToken === true && token !== undefined) msg.token = token
+    send(msg)
   }
 
   /** 应答一个入站请求（错误）。 */
   function respondError(id, code, message, data) {
+    // 错误响应同样默认不带 token（见 respond 的说明）。
     send({ jsonrpc: '2.0', id, error: new BridgeError(code, message, data).toJSON() })
   }
 

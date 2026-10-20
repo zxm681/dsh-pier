@@ -139,6 +139,82 @@ test('token 自动附加到出站请求', () => {
   assert.equal(lines[0].token, 'secret-token')
 })
 
+// ★ 安全性质：凭据必须是显式的。
+// 曾经 notify() 无条件附加 token，导致服务端在对方证明身份前发出的第一条消息
+// （bridge.hello）把通行证一起寄了出去。真机实测：任何人连上端口、什么都不发，
+// 就能从 hello 里读到 token，然后冒充合法对端劫持调用并伪造返回值。
+test('★ notify 默认不携带 token，必须显式 opts.withToken', () => {
+  const { lines, write } = capture()
+  const c = connect({ write, token: 'secret-token' })
+
+  c.notify('plain.notice', { a: 1 })
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(lines[0], 'token'),
+    '默认通知不许带 token',
+  )
+
+  c.notify('explicit.notice', { a: 2 }, { withToken: true })
+  assert.equal(lines[1].token, 'secret-token', '显式要求时才带')
+})
+
+test('★ respond 默认不携带 token，必须显式 opts.withToken', () => {
+  const { lines, write } = capture()
+  const c = connect({ write, token: 'secret-token' })
+
+  c.respond(1, { ok: true })
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(lines[0], 'token'),
+    '默认响应不许带 token',
+  )
+
+  c.respond(2, { ok: true }, { withToken: true })
+  assert.equal(lines[1].token, 'secret-token', '显式要求时才带')
+})
+
+test('★ respondError 也不携带 token', () => {
+  const { lines, write } = capture()
+  const c = connect({ write, token: 'secret-token' })
+  c.respondError(1, ERR.NOT_FOUND, 'nope')
+  assert.ok(!Object.prototype.hasOwnProperty.call(lines[0], 'token'))
+})
+
+test('★ 真跑一遍：未认证连接收到的 hello 里没有 token', async () => {
+  // 这条不走 capture()，走真实的 server + 真 socket，锁住「握手不泄露凭据」。
+  const { mkdtempSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { createConnection } = await import('node:net')
+  const { startBridgeServer } = await import('../src/server.js')
+
+  const home = mkdtempSync(join(tmpdir(), 'dsh-kit-tok-'))
+  const server = await startBridgeServer({ dshHome: home, sweep: false, dshVersion: '9.9.9' })
+  try {
+    const socket = createConnection({ port: server.port, host: '127.0.0.1' })
+    await new Promise((res, rej) => { socket.once('connect', res); socket.once('error', rej) })
+    const hello = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('no hello')), 2000)
+      let buf = ''
+      socket.on('data', (chunk) => {
+        buf += chunk.toString('utf8')
+        const i = buf.indexOf('\n')
+        if (i < 0) return
+        clearTimeout(timer)
+        resolve(JSON.parse(buf.slice(0, i)))
+      })
+    })
+    assert.equal(hello.method, 'bridge.hello')
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(hello, 'token'),
+      `hello 泄露了 token：${String(hello.token).slice(0, 12)}…`,
+    )
+    // 顺带确认这条连接确实没带 token —— 它就是「纯攻击者视角」
+    socket.destroy()
+  } finally {
+    await server.close()
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
 test('分帧：半行拼接、多行一次 chunk、CRLF 兼容', () => {
   const got = []
   const feed = createLineSplitter((l) => got.push(l))

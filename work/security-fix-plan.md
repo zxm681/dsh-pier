@@ -1,10 +1,17 @@
 # 安全缺陷修复方案（三个洞）
 
-> 状态：**待批准**。三条都是行为变更，不是纯内部重构。
+> 状态：**洞 1 已修（2026-10-21，用户选方案 B：只修洞 1）**；洞 2、洞 3 **待修**。
 > 发现过程见 `docs/教学-从零读懂DSH-Pier.md` 的「第 3 课答疑（第二轮）」。
 > 发现时间 2026-10-21。
+>
+> **实际修法与本方案初稿的差异（重要）**：初稿建议「hello 用裸 `write()` 绕开协议的
+> token 附加」。实际改的是**协议层默认值** —— `notify`/`respond` 默认不再附带 token，
+> 要带必须显式 `{ withToken: true }`。理由：裸 write 只治 hello 这一条消息，下一个人
+> 新增第二条通知时照样会重犯；改默认值是把「凭据必须显式」变成协议层的规则。
+> 代价是行为变更（对端若依赖通知带 token 会收到 -32001），实测两侧业务代码都只走
+> `request()`，无人依赖，故无兼容问题。
 
-## 洞 1：hello 白送 token
+## 洞 1：hello 白送 token —— ✅ 已修
 
 **现状**（`packages/dsh-vscode-kit/src/server.js:130-156`）
 
@@ -31,6 +38,56 @@ write(helloLine)
 ```
 
 **影响面**：`server.test.js:117-135, 264` 的 hello 断言需要改（现在会没有顶层 token）。应用层 `apply.test.js:109` 同理。
+
+### 实际落地（与上面的初稿不同）
+
+改了 `packages/dsh-vscode-kit/src/protocol.js` 的**两条默认值**：
+
+```js
+function notify(method, params, opts) {
+  const msg = { jsonrpc: '2.0', method, params: params ?? {} }
+  if (opts?.withToken === true && token !== undefined) msg.token = token   // ← 默认不发
+  send(msg)
+}
+
+function respond(id, result, opts) {
+  const msg = { jsonrpc: '2.0', id, result }
+  if (opts?.withToken === true && token !== undefined) msg.token = token   // ← 默认不发
+  send(msg)
+}
+// respondError 同理由，现在也不带 token
+```
+
+**为什么不是裸 write**：裸 write 只堵住 hello 这一条消息，下一个人新增第二条通知时照样会重犯。
+改默认值是把「发凭据必须显式」变成协议层的规则 —— 漏写只会「该带的没带」（对端回
+-32001，立刻暴露），不会「不该带的带了」（悄悄泄露）。**安全默认值就该选失败可见的那一侧。**
+
+### 连带修的一处（不改会引入新噪声）
+
+`packages/dsh-kit-bridge/src/connector.js:141` 的入站 `authorize` 原本要求**所有**入站消息带 token。
+hello 现在不带 token 了，于是编辑器侧把它当未认证消息拒掉，E2E 日志出现：
+```
+[editor] conn: protocol: unauthorized notification dropped
+```
+修法（已落地）：
+```js
+authorize: (incoming, method) => method === 'bridge.hello' || incoming === info.token,
+```
+放行 hello 不削弱安全：它不含任何秘密，只作协议版本公告，不触发任何动作。
+
+### 验证（全绿）
+
+| 项目 | 结果 |
+|---|---|
+| kit 单测 | **43/43**（原 38 + 新增 5 条安全断言） |
+| bridge 单测 | 23/23 |
+| demo 单测 | 7/7 |
+| 跨进程 E2E | 13/13，且 `unauthorized notification dropped` 噪声消失 |
+| 真机 hello 探针 | `{"jsonrpc":"2.0","method":"bridge.hello","params":{...}}` —— **无 token 字段** |
+| 真机 smoke | PASS（openFile + getSelection 全通） |
+
+五条新测试里最关键的一条是**真起 server + 真 socket** 那条：它不 mock，锁的是
+「未认证连接收到的 hello 里没有 token」这个安全性质本身。
 
 ---
 
@@ -123,10 +180,18 @@ if (isResponse) {
 
 ## 修复顺序与验证
 
-| 步骤 | 改什么 | 验证 |
-|---|---|---|
-| 1 | 洞 1：hello 不附 token | 跑 `lesson3-verify-hello.mjs`，期望「两者相同吗？ 否」 |
-| 2 | 洞 3：响应附 token + 验 token | 跑 `lesson3-hijack.mjs`，期望「请求失败」或「结果来自真编辑器」 |
-| 3 | 洞 2：身份由 hello 决定 | 跑 `lesson3-hijack.mjs`，期望攻击者的连接完全不登记 |
+| 步骤 | 改什么 | 验证 | 状态 |
+|---|---|---|---|
+| 1 | 洞 1：hello 不附 token | 跑 `lesson3-verify-hello.mjs`，期望「两者相同吗？ 否」 | ✅ **已完成** |
+| 2 | 洞 3：响应附 token + 验 token | 跑 `lesson3-hijack.mjs`，期望「请求失败」或「结果来自真编辑器」 | ⬜ 待做 |
+| 3 | 洞 2：身份由 hello 决定 | 跑 `lesson3-hijack.mjs`，期望攻击者的连接完全不登记 | ⬜ 待做 |
 
-三步都完成后：kit 38 / bridge 23 / demo 7 + E2E 13 必须全绿（测试脚手架需同步改）。
+三步都完成后：kit / bridge / demo 单测 + E2E 必须全绿（测试脚手架需同步改）。
+
+**当前回归基线（修完洞 1 之后）**：kit 43 / bridge 23 / demo 7 / E2E 13。
+
+**注**：洞 1 修完后再跑 `work/scripts/lesson3-hijack.mjs`，劫持**仍然成功** —— 这是预期的，
+因为劫持走的是洞 2（谁最后连上谁就是 active）与洞 3（响应不过鉴权门），两者都还没修。
+洞 1 修完的确切效果是：攻击者从「连上就白拿 token」变成「必须先偷到 token（读名片文件、
+抓包、或先成为 active 连接接走一条请求）」。**这不是修完了，只是提高了门槛。**
+

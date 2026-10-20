@@ -138,7 +138,10 @@ export function createConnector(deps) {
       token: info.token,
       onError: (err) => log(`protocol: ${err?.message ?? err}`, 'warn'),
       // 入站鉴权：DSH 侧发的消息必须带同一个 token（对端被冒名时我们能发现）。
-      authorize: (incoming) => incoming === info.token,
+      // 例外是 bridge.hello：它是 DSH 侧连上后主动打的招呼，发生在双方互相确认之前，
+      // 按协议**不允许携带 token**（曾经携带过，等于把通行证寄给任何连上端口的人）。
+      // 放行它不会削弱安全：hello 里没有任何秘密，且它只作协议版本公告，不触发任何动作。
+      authorize: (incoming, method) => method === 'bridge.hello' || incoming === info.token,
     })
     link.socket = s
 

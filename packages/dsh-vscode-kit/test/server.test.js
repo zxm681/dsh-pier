@@ -127,6 +127,30 @@ test('连接后立刻收到 bridge.hello，带协议版本与能力', async () =
   })
 })
 
+// 回归：真机踩到过 —— hello 走 notify()，而 notify 当时无条件附加 token，
+// 于是服务端在对方证明身份之前就把通行证寄出去了。任何人连上端口、什么都不发，
+// 就能从 hello 里读到 token，再拿去冒充合法对端（实测可劫持调用并伪造返回值）。
+// 这条断言锁的是**安全性质**，不是消息形状：hello 里永远不许出现 token。
+test('★ hello 绝不携带 token（回归：通知默认附 token 导致白送凭证）', async () => {
+  await withServer({}, async (server, { dial }) => {
+    // 用 NO_TOKEN 哨兵模拟「完全未认证的连接」——它同样会收到 hello，
+    // 这正是洞的入口：握手发生在鉴权之前。
+    const c = await dial({ token: NO_TOKEN })
+    const hello = await c.next()
+    assert.equal(hello.method, 'bridge.hello')
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(hello, 'token'),
+      `hello 不许带 token，实际带的是 ${String(hello.token).slice(0, 12)}…`,
+    )
+    // 连 params 里也不许夹带（防止有人换个位置继续泄露）
+    assert.ok(
+      !Object.values(hello.params ?? {}).some((v) => typeof v === 'string' && v === server.token),
+      'hello.params 里不许出现 token 原文',
+    )
+    await c.close()
+  })
+})
+
 test('多条连接互不干扰，各自独立收 hello', async () => {
   await withServer({}, async (server, { dial }) => {
     const a = await dial()
