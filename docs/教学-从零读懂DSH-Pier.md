@@ -1013,3 +1013,224 @@ if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
 ```
 
 不是"警告一下让用户自己决定"，而是**直接拒绝启动**。因为一旦放开，用户不会意识到自己把明文 token 暴露到了局域网。
+
+---
+
+## 第 3 课答疑（第二轮）：查证时挖出三个真洞
+
+### 主人原答案（2026-10-21）
+
+> 攻击者连不上我的内网吧。如果连上了，我们的每次请求后续还会带 token。
+
+### 判定：**对了一半，而且第二半正好踩着 bug**
+
+为了回答这个问题，我写了三个验证脚本去实测：
+
+- `work/scripts/lesson3-verify-hello.mjs` —— 验证 hello 里有没有 token
+- `work/scripts/lesson3-hijack.mjs` —— 验证能不能劫持 DSH 的调用
+- `work/scripts/lesson3-leak.mjs` —— 验证其他攻击面
+
+结果：**我们自己的代码里查出三个真缺陷。**
+
+---
+
+## 3.E 洞 1：hello 白送 token（最严重）
+
+### 实测
+
+```
+=== 验证 1：服务端连上就发的第一条消息，有没有 token？ ===
+  原始消息：
+    {"jsonrpc":"2.0","method":"bridge.hello","params":{...},"token":"d78eb530c2788779b7e0…（共 64 字符）
+  名片里的真 token：d78eb530c2788779b7e0…
+  两者相同吗？ ★ 是 —— token 被白送了
+
+=== 验证 2：用 hello 白拿的 token 能通过鉴权吗？ ===
+  回复：{"jsonrpc":"2.0","id":99,"result":{"pong":true,...}}
+  ★ 成功 —— 攻击者用 hello 白拿的 token 就成了合法对端
+
+=== 验证 3：完全不带 token 的连接，还能收到 hello 吗？ ===
+  收到了：method=bridge.hello
+  里面照样带 token：是
+  → 也就是说，握手发生在鉴权之前。
+```
+
+### 代码原因
+
+`packages/dsh-vscode-kit/src/server.js:130-156`：
+
+```js
+const link = connect({
+  write, onRequest, timeoutMs,
+  token,                                    // ← ① 把 token 交给协议终端
+  authorize: (incoming) => incoming === token,
+})
+...
+link.notify('bridge.hello', { ... })        // ← ② hello 走 notify
+```
+
+`packages/dsh-vscode-kit/src/protocol.js:174-178`：
+
+```js
+function notify(method, params) {
+  const msg = { jsonrpc: '2.0', method, params: params ?? {} }
+  if (token !== undefined) msg.token = token   // ← ③ 所有出站消息一律附加
+  send(msg)
+}
+```
+
+**三条各自都没错，合起来就成了洞**：hello 是连接建立后**第一条**消息，发在**客户端还没证明身份之前**，却已经把通行证一起寄出去了。
+
+### 后果
+
+token 的**全部意义**是"只有真编辑器知道它"。它被白送之后，鉴权等于不存在：
+
+> 任何人只要能连上 127.0.0.1:7410，第一条消息就拿到 token，然后就是合法对端。
+
+### 该记的经验
+
+> **"先打招呼"和"先验身份"不能同时成立。** 任何"连上就主动推一段信息"的协议，都要检查这段信息里有没有凭证——尤其当"推送"和"带凭证"是同一个函数的默认行为时。
+> 默认带凭证很方便，但**默认**意味着写这段代码的人根本没意识到自己在发凭证。
+
+---
+
+## 3.F 洞 2 + 洞 3：能劫持，且伪造的回复会被接受
+
+### 洞 2：谁最后连上，谁就是"编辑器"
+
+`packages/dsh-vscode-kit/src/index.js:64-66`：
+
+```js
+_activeLink() {
+  const links = [...this.server.links]
+  return links.length ? links[links.length - 1] : null   // ← 最后一个
+}
+```
+
+`packages/dsh-vscode-kit/src/server.js:148`：
+
+```js
+links.add(link)   // ← 连接一建立就加，跟 token 对不对无关
+```
+
+### 洞 3：响应不过鉴权门
+
+`packages/dsh-vscode-kit/src/protocol.js:197-210` 的响应分支：
+
+```js
+const isResponse = msg.id !== undefined && msg.method === undefined
+if (isResponse) {
+  const entry = pending.get(msg.id)
+  if (!entry) return
+  pending.delete(msg.id)
+  clearTimeout(entry.timer)
+  if (msg.error !== undefined && msg.error !== null) entry.reject(BridgeError.from(msg.error))
+  else entry.resolve(msg.result)     // ← 直接 resolve，全程没调 authorize
+  return
+}
+```
+
+而 `respond()` 也不带 token（`protocol.js:181-183`）：
+
+```js
+function respond(id, result) {
+  send({ jsonrpc: '2.0', id, result })   // ← 没有 token
+}
+```
+
+**所以"响应不带 token"和"响应不验 token"是自洽的——自洽地一起错。**
+
+### 实测劫持（`lesson3-hijack.mjs`）
+
+```
+=== 场景准备 ===
+  桥：127.0.0.1:7410
+  ① 真编辑器连上并报了身份
+     kit.lastEditor = "real-vscode"
+     在线连接数 = 1
+
+=== 攻击者做了什么？只是连上了。没 token、不认识协议库，就裸 socket。 ===
+     在线连接数 = 2
+     kit.lastEditor 还是 "real-vscode"（身份没被改）
+
+=== 现在 DSH 侧发起一个正常请求：读编辑器选区 ===
+  真编辑器收到请求了吗？ 否 —— 请求发给了别人
+  攻击者收到 DSH 的请求数量：1
+  ★ 请求里附带 token，攻击者现在知道它是：685a52aaced8e9bb61b90528…
+
+  ★★★ DSH 侧拿到的 result：
+      {"text":"FAKE-SELECTION-FROM-ATTACKER","file":"C:\\fake.txt","isEmpty":false}
+  ★★★ 这是攻击者伪造的数据 —— 冒充成功。响应不过鉴权门。
+```
+
+注意攻击者**全程没发过一条带 token 的消息**，只是：
+
+1. `net.createConnection({port})` 连上——就这样就成了"最后一个连接"
+2. 收到 DSH 的请求（里面**带着 token**，等于洞 1 再来一次）
+3. 回一段 JSON，DSH 就信了
+
+### 该记的经验
+
+> **只拦"进"不拦"出"的鉴权，等于没鉴权。** 请求验了 token，响应不验，那攻击者只需要"等"，不需要"猜"。
+> 更根本的一条：**"谁是活跃对端"不该由连接顺序决定，该由身份决定**。连接顺序是网络事实，身份是协议事实，两者混淆就会被抢占。
+
+---
+
+## 3.G 校准主人的答案
+
+### 对的部分
+
+> 「攻击者连不上我的内网吧」
+
+**对**。`127.0.0.1` 只在本机回环接口上监听，外网、局域网都进不来。这一条守住了。
+
+### 需要补的部分
+
+> 「内网」和「本机」不是一回事。
+
+`127.0.0.1` 挡住的是**网络上的别人**，挡不住**本机上的别的进程**。而开发机的本质就是"跑很多来路不明的代码"：
+
+| 本机进程 | 能不能连 127.0.0.1:7410 |
+|---|---|
+| 你自己敲的命令 | ✅ 能 |
+| 某个 npm 包的 postinstall 脚本 | ✅ 能 |
+| 被投毒的依赖 | ✅ 能 |
+| 任何脚本、任何 Electron 应用 | ✅ 能 |
+
+**所以"只监听回环"降低的是"外部攻击"，不是"本机攻击"。** token 存在的意义恰恰是防本机——而它现在不防。
+
+### 需要纠正的部分（关键）
+
+> 「如果连上了，我们的每次请求后续还会带 token」
+
+这句话把 **"带"** 当成了 **"验"**。两件事完全不同：
+
+| 动作 | 谁做 | 保护谁 |
+|---|---|---|
+| **带** token | 发消息的一方 | 不保护任何人 |
+| **验** token | 收消息的一方 | 才构成保护 |
+
+而实际情况是：
+
+1. token 是**被白送的**（洞 1）—— 对方不需要知道，连上就有
+2. **验**只发生在"收到请求"时 —— 收到**响应**时根本不验（洞 3）
+3. 而且验的那个连接，可能根本不是真编辑器（洞 2）
+
+### 精确答案
+
+> **攻击者需要的额外条件只有一个：能在本机跑一个进程。**
+>
+> 有了这个条件，他连上端口就白拿 token，然后能截走 DSH 的调用、伪造返回值。
+> `127.0.0.1` 挡住的是"外面的世界"，挡不住"自己机器上的东西"。
+
+---
+
+## 3.H 三个修法（按优先级）
+
+| # | 修什么 | 改哪里 | 代价 |
+|---|---|---|---|
+| 1 | hello 不带 token | `server.js:151` 改用裸 `write()`，不走 `link.notify()` | 5 行 |
+| 2 | 响应也验 token | `protocol.js` 的 `respond`/`respondError` 附加 token + `isResponse` 分支过 `authorize` | 15 行 + 改若干测试 |
+| 3 | "谁是编辑器"由身份决定 | `server.js` 不再在连接建立时 `links.add`，改为收到带正确 token 的 `bridge.hello` 后才登记 | 30 行 + 改服务器/应用层测试 |
+
+三条都是**行为变更**，不是纯内部重构 —— 尤其第 2、3 条会改变协议语义（响应开始带 token、连接不再等于"已登记对端"）。按工作区约定，这类改动先报告、确认后再动。
