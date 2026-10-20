@@ -48,7 +48,7 @@ VS Code
 
 | 包 | 作用 | 版本 | 测试 |
 |---|---|---|---|
-| `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 46 ✅ |
+| `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 48 ✅ |
 | `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.2.0 | 23 ✅ |
 | `packages/dsh-kit-demo` | 示例消费者，证明零耦合接入 | 0.1.0 | 7 ✅ |
 
@@ -86,7 +86,7 @@ export function apply(ctx) {
 ## 跑测试
 
 ```bash
-cd packages/dsh-vscode-kit   && node --test "test/*.test.js"   # 46
+cd packages/dsh-vscode-kit   && node --test "test/*.test.js"   # 48
 cd packages/dsh-kit-bridge   && node --test "test/*.test.js"   # 23
 cd packages/dsh-kit-demo     && node --test "test/*.test.js"   # 7
 cd packages/dsh-kit-bridge   && node scripts/e2e.mjs           # 13 跨进程

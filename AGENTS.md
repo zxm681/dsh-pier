@@ -15,11 +15,34 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
 7. **改完立刻跑 import smoke**：`node -e "import('./src/index.js')"`，比全量测试快。
 8. **连接建立 ≠ 准入**。`links` 里混着"连上了"和"被信任"两种连接；要挑对端必须过滤
    `authorized === true`（见 §5.9）。出站消息**不许默认附带 token**——凭证只在调用方显式要求时带。
+9. **「测试全绿」不等于「测试在守门」**。每条安全回归都要做一次**变异测试**：故意把 bug 改回去，
+   确认测试变红。成本只有一次 sed + 一次跑，却是唯一能区分「测试在守门」和「测试在睡觉」的办法。
+   （2026-10-21 踩过：新写的两条洞 3 测试第一版都是假测试，硬编码猜 id、断言变量从不被赋值。）
+
+## 动手之前先查先例（用户 2026-10-21 明确要求）
+
+涉及**安全边界、鉴权、凭证、并发、协议状态机**的设计，**先去看成熟项目怎么做，再动手**。
+理由不是「他们一定对」，而是这类问题**每个项目都会遇到一遍**，成熟项目的答案经过了真实攻击检验；
+我们两次踩坑都是「凭直觉设计」的代价 —— 洞 2 独立走对了（socket.io 同思路），
+洞 3 差点走错（准备让响应带 token，而 VS Code 源码明确走的是另一条路）。
+
+**怎么做**：`curl` 拉 GitHub 源码原文，别读博客。源码告诉你「它们到底怎么做的」，
+博客告诉你「作者以为它们怎么做的」。找到结论后连同 commit 时间记进 `docs/先例调研-*.md`。
+
+**什么时候查 / 不查**：
+
+| 该查 | 不该查 |
+|---|---|
+| 安全边界、鉴权、凭证、并发、协议状态机、跨进程通信 | 普通 CRUD、UI 渲染、目录结构、一次性脚本 |
+| 已经踩了两轮还没定论 | 10 分钟能自己验证的小事 |
+| 有「成熟项目一定有这个」的直觉 | 太新、没人做过（自己设计，但必须写清威胁模型） |
+
+已沉淀的调研：`docs/先例调研-鉴权放在哪一层.md`（socket.io / VS Code / Node inspector / Jupyter）。
 
 ## 验证门槛（声称完成前必须全绿）
 
 ```bash
-cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 46
+cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 48
 cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 23
 cd packages/dsh-kit-demo   && node --test "test/*.test.js"   # 7
 cd packages/dsh-kit-bridge && node scripts/e2e.mjs           # 13

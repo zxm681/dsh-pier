@@ -322,3 +322,77 @@ test('token 是 64 位 hex（32 字节熵）', async () => {
     assert.match(server.token, /^[0-9a-f]{64}$/)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 洞 3 的攻击回归：未准入的连接能不能「冒充对端」把别人的请求答掉？
+// 依据 docs/先例调研-鉴权放在哪一层.md §2（VS Code 只在建连时验一次凭证，
+// 之后靠「这条 socket 已被信任」）。这里的假设是：pending 是 per-connect 的
+// 闭包变量，两条 socket 各有一个 connect() 实例，所以响应天然不能串台。
+// 假设必须用测试锁住 —— 把 pending 提到模块级、或让两条 socket 共用
+// handleLine，这两条测试就会红（用变异测试验证过）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('★安全回归（洞 3）：攻击者答不掉服务端发给真编辑器的请求', async () => {
+  await withServer({}, async (server, { dial }) => {
+    const real = await dial()
+    await real.next() // 吃掉 hello
+    // 发一条带正确 token 的请求，让服务端把这条连接标记为准入
+    await real.link.request('noop', {}, { timeoutMs: 200 }).catch(() => {})
+
+    const attacker = await dial({ token: 'f'.repeat(64) })
+    await attacker.next()
+
+    // links 是 Set，保持插入顺序
+    const [realLink, attackerLink] = [...server.links]
+    assert.ok(realLink && attackerLink, '两条连接都应在册')
+    assert.equal(realLink.authorized, true)
+    assert.equal(attackerLink.authorized, false, '错 token 的连接不该被标记为准入')
+
+    // 洞 3 的攻击面：服务端 → 编辑器方向。真编辑器不回包，
+    // 所以这条请求只能超时；期间攻击者用同一个 id 抢答。
+    const pending = realLink.request('vscode.getSelection', {}, { timeoutMs: 250 })
+
+    // ★ 不猜 id：真编辑器确实收到了这条请求，攻击者是「看到」它才谈得上抢答。
+    //   （上一版硬编码 id=2 猜错了，变异测试暴露出那是条假测试。）
+    const outbound = await real.next()
+    assert.equal(outbound.method, 'vscode.getSelection')
+    assert.ok(outbound.id !== undefined, '请求必须带 id')
+
+    attacker.socket.write(JSON.stringify({
+      jsonrpc: '2.0', id: outbound.id, result: { text: 'FAKE-FROM-ATTACKER' },
+    }) + '\n')
+
+    await assert.rejects(pending, (e) => {
+      assert.ok(!JSON.stringify(e.data ?? {}).includes('FAKE'), '拿到了攻击者的伪造结果')
+      return e.code === ERR.TIMEOUT
+    }, '真编辑器的请求被攻击者的伪造响应完成了（洞 3 未闭合）')
+
+    await attacker.close()
+    await real.close()
+  })
+})
+
+test('★安全回归（洞 3）：pending 表是每连接独立的（架构不变量直接断言）', async () => {
+  await withServer({}, async (server, { dial }) => {
+    const a = await dial()
+    await a.next()
+    const b = await dial({ token: 'f'.repeat(64) })
+    await b.next()
+
+    const [linkA, linkB] = [...server.links]
+    assert.ok(linkA && linkB)
+    assert.notEqual(linkA, linkB, '两条连接必须各有独立的协议终端')
+
+    // A 上挂一个请求，B 的 pendingCount 必须仍然是 0 —— 一旦共用 pending 就会相等。
+    // 先挂一个空 catch：断言失败时不留下未处理的 rejection 掩盖真正的错误。
+    const pa = linkA.request('vscode.getSelection', {}, { timeoutMs: 120 })
+    pa.catch(() => {})
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(linkA.pendingCount, 1, 'A 上应有一条挂起请求')
+    assert.equal(linkB.pendingCount, 0, 'B 的 pending 被 A 污染了 —— pending 不是每连接独立的')
+    await assert.rejects(pa, (e) => e.code === ERR.TIMEOUT)
+
+    await b.close()
+    await a.close()
+  })
+})
