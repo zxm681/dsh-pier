@@ -1,7 +1,7 @@
 // 探针：cordis 里一个插件 provide 的服务，兄弟插件能不能 inject 到？
 // 这决定了「协议库」和「消费者插件」这种平级关系能否成立。
 import { createRequire } from 'node:module'
-const require = createRequire('file:///D:/default-workspace/')
+const require = createRequire('file:///D:/code-workspace/')
 const APP = 'C:/Users/zxm/AppData/Local/Programs/DeepSeek Harness/resources/app.asar/dsh/node_modules'
 const { Context } = await import(require('node:url').pathToFileURL(`${APP}/@deepseek-ai/cordis/lib/index.js`).href)
 
