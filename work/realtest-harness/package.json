@@ -1,0 +1,8 @@
+{
+  "name": "dsh-kit-realtest-harness",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "T6 真机验证用的第三方消费者控制探针（测试脚本，非产品代码）；只走 dshVscodeKit 公开 API。",
+  "main": "./src/index.js"
+}

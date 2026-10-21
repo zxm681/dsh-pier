@@ -1,0 +1,19 @@
+# T6 真机验证 overlay：只为验证，**不修改**任何 profile 文件（dsh --patch 覆盖层）。
+#
+# 关键点：两个 name 都用 file:// 指向**工作树里的当前源码**，
+# 而不是 ~/.dsh/profiles/node_modules 下的旧拷贝 ——
+# 那份拷贝是 links/trusted 拆分**之前**的版本（_activeLink 仍遍历 links），
+# 用它做真机验证会验到旧代码，等于白跑。
+- insert:
+    - id: dsh-vscode-kit-t6
+      name: "file:///D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/index.js"
+      config:
+        # 缩短等编辑器连接的时长，让「没有目标」快速结构化失败而不是默默等 3 秒
+        connectWaitMs: 1500
+
+# 第三方消费者控制探针：让外部脚本能对真 DSH 进程按需发起桥接请求。
+- insert:
+    - id: dsh-kit-realtest-harness-t6
+      name: "file:///D:/code-workspace/projects/dsh-vscode-dev/work/realtest-harness/src/index.js"
+      config:
+        port: 3097

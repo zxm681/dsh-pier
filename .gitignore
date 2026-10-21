@@ -5,3 +5,6 @@ work/smoke-result.json
 work/smoke-target.txt
 .DS_Store
 *.log
+work/dshhome-c/
+work/long/
+work/win-*/
