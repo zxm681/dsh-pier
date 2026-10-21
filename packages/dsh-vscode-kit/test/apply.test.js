@@ -5,12 +5,27 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { apply, name, inject } from '../src/index.js'
+import { apply, name, inject, VscodeKit, replayPendingAuthorized } from '../src/index.js'
 import { ERR, connect, createLineSplitter } from '../src/protocol.js'
 import { discoveryDir, listLiveBridges } from '../src/server.js'
 
 function tempHome() {
   return mkdtempSync(join(tmpdir(), 'dsh-kit-apply-'))
+}
+
+/** 轮询等待条件成立（用于等「服务端处理完对端断开」这类事件，不用固定睡眠）。 */
+async function waitFor(predicate, ms = 2000, what = 'condition') {
+  const deadline = Date.now() + ms
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((r) => setTimeout(r, 5))
+  }
+  throw new Error(`waitFor timed out: ${what}`)
+}
+
+/** 用客户端的 localPort 找回服务端那条连接对象（对照同一 TCP 连接的两端）。 */
+function serverLinkFor(server, clientSocket) {
+  return [...server.links].find((l) => l.socket?.remotePort === clientSocket.localPort)
 }
 
 /**
@@ -153,10 +168,136 @@ test('端到端：apply → 服务注册 → 假编辑器连上 → 消费者 vs
  * 之后 DSH 的 `vscode.*` 请求全被它接走并可伪造结果
  * （复现脚本 work/scripts/lesson3-hijack.mjs）。
  *
- * 现在的口径：server.js 在 authorize 通过第一条 token 正确的消息时才置
- * `link.authorized = true`；`_activeLink()` 只在 authorized 连接里挑。
- * 下面三条按「没准入门 → 抢不到」的顺序钉住它。
+ * 现在的口径：server.js 在 authorize 通过 token 后将连接升入 trusted；
+ * `_activeLink()` 只从 trusted 选，authorized 标志不再作为选目标的依据。
+ * 下面的用例按「没准入门 → 抢不到」的顺序钉住它。
  */
+test('安全回归：即使 authorized 标志被误置，目标集合也不含未准入连接', () => {
+  const admitted = { authorized: true, connSeq: 1 }
+  const bare = { authorized: true, connSeq: 2 } // 故意模拟标志被误写；它从未通过 token。
+  const server = { links: new Set([admitted, bare]), trusted: new Set([admitted]) }
+  const kit = new VscodeKit({ server, dshVersion: 'test', connectWaitMs: 0 })
+  assert.equal(kit._activeLink(), admitted, '目标只能从 trusted 选，不能从 links 选')
+  server.trusted.delete(admitted)
+  assert.equal(kit._activeLink(), null, 'trusted 为空时不能回退到混杂的 links')
+})
+
+// 回归锁（评审 R1）：trusted 是**准入**时 add 的，集合顺序 = 准入先后；
+// 挑目标必须按**连接序号**（建连先后），否则两条都合法时目标会漂移。
+test('回归（R1）：目标按连接序号挑，不按 trusted 的插入（准入）顺序', () => {
+  const older = { authorized: true, connSeq: 3 }
+  const newer = { authorized: true, connSeq: 4 }
+  // 故意把新连接放在前：按插入顺序取末项会拿到 older。
+  const server = { links: new Set(), trusted: new Set([newer, older]) }
+  const kit = new VscodeKit({ server, dshVersion: 'test', connectWaitMs: 0 })
+  assert.equal(kit._activeLink(), newer, '必须选连接序号最大的那条')
+  assert.notEqual(kit._activeLink(), [...server.trusted].at(-1), '不能按 trusted 插入顺序取末项')
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 回归（评审 R1）：真 socket 上的「连接先 vs 准入先」交错。
+// 拆分前 links 在建连时 add，取末项 = 最后连接；拆分后 trusted 在准入时 add，
+// 取末项 = 最后准入。connect A → connect B → 先准入 B → 后准入 A 时两者不一致：
+// 旧算法输出 B，只取 trusted 末项输出 A —— 请求会送到另一个编辑器窗口。
+// 这里用行为断言（请求最终打到谁）钉住「赢家恒为最后连接的那条」。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 起一个 apply 实例 + 若干假编辑器；editors 按连接先后排列。 */
+async function withKit(editorTexts) {
+  const home = tempHome()
+  const ctx = fakeCtx()
+  const handle = apply(ctx, { dshHome: home, connectWaitMs: 50, onLog: () => {} })
+  await handle.boot
+  const svc = ctx.provided.get('dshVscodeKit').v
+  const server = handle.kit.server
+  const editors = []
+  for (const text of editorTexts) {
+    const editor = await fakeEditor(server, {
+      onRequest: (method) => (method === 'vscode.getSelection' ? { text } : undefined),
+    })
+    await editor.next() // 吃掉 hello
+    editor.serverLink = serverLinkFor(server, editor.socket)
+    editors.push(editor)
+  }
+  const cleanup = async () => {
+    // 已断开的 socket 不再 close()：close() 等的是 'close' 事件，重放会永久挂住。
+    for (const e of editors) if (!e.socket.destroyed) await e.close().catch(() => {})
+    ctx.runDisposers()
+    await handle.stopped.catch(() => {})
+    rmSync(home, { recursive: true, force: true })
+  }
+  return { svc, server, handle, editors, cleanup }
+}
+
+test('★回归（R1）：A/B 逆序准入时目标仍是后连接的 B（按连接先后）', async () => {
+  const { svc, server, handle, editors, cleanup } = await withKit(['FROM-A', 'FROM-B'])
+  const [a, b] = editors
+  try {
+    assert.ok(a.serverLink && b.serverLink, '两条连接都应在册')
+    assert.ok(b.serverLink.connSeq > a.serverLink.connSeq,
+      `connSeq 必须按建连先后单调递增，实际 A=${a.serverLink.connSeq} B=${b.serverLink.connSeq}`)
+
+    // ★ 逆序准入：B 先、A 后。trusted 的插入顺序因此是 [B, A]。
+    await b.link.request('bridge.ping', {})
+    await a.link.request('bridge.ping', {})
+    assert.equal([...server.trusted].at(-1), a.serverLink,
+      '前置条件：trusted 末项是最后准入的 A（若这里不是 A，用例没造出交错）')
+    assert.equal(handle.kit._activeLink(), b.serverLink,
+      '目标必须是最后连接的 B，不是最后准入的 A')
+
+    // 行为断言：请求真的落到 B，而不只是内部引用相等。
+    const sel = await svc.request('vscode.getSelection', {}, { waitForEditor: false })
+    assert.equal(sel.text, 'FROM-B', 'vscode.* 请求必须送到最后连接的编辑器')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('★回归（R1）：当前目标断开后回退到次新连接（仍按连接序号）', async () => {
+  const { svc, server, handle, editors, cleanup } = await withKit(['FROM-A', 'FROM-B', 'FROM-C'])
+  const [a, b, c] = editors
+  try {
+    // 三条全准入，顺序无所谓：目标只认 connSeq。
+    for (const e of [c, a, b]) await e.link.request('bridge.ping', {})
+    assert.equal(handle.kit._activeLink(), c.serverLink, '目标应是最后连接的 C')
+    assert.equal((await svc.request('vscode.getSelection', {}, { waitForEditor: false })).text, 'FROM-C')
+
+    await c.close()
+    await waitFor(() => !server.trusted.has(c.serverLink), 2000, 'C 断开后应移出 trusted')
+    assert.equal(handle.kit._activeLink(), b.serverLink, 'C 断开后应回退到次新的 B')
+    assert.equal((await svc.request('vscode.getSelection', {}, { waitForEditor: false })).text, 'FROM-B')
+
+    await b.close()
+    await waitFor(() => !server.trusted.has(b.serverLink), 2000, 'B 断开后应移出 trusted')
+    assert.equal(handle.kit._activeLink(), a.serverLink, 'B 断开后应回退到最早的 A（仍按序号，不是轮转）')
+    assert.equal((await svc.request('vscode.getSelection', {}, { waitForEditor: false })).text, 'FROM-A')
+
+    await a.close()
+    await waitFor(() => !server.trusted.has(a.serverLink), 2000, 'A 断开后应移出 trusted')
+    assert.equal(handle.kit._activeLink(), null, '全部断开后不得回退到 links 里的残留连接')
+  } finally {
+    await cleanup()
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 回归（评审 S1）：启动空窗期准入、随后又断线的连接不能唤醒等待者。
+// src/index.js 的 pendingAuthorized 补通知分支无法通过公开 API 稳定复现
+// （listen 到 kit 装配之间只有微任务，测试进程插不进去），所以该分支被提取成
+// 可单测的 replayPendingAuthorized；删掉 `trusted.has` 判断或删掉 clear() 都会红。
+// ─────────────────────────────────────────────────────────────────────────────
+test('回归（S1）：启动空窗期准入后断线的连接被跳过，pending 仍清空', () => {
+  const stillAlive = { connSeq: 1 }
+  const droppedDuringStartup = { connSeq: 2 }
+  const server = { trusted: new Set([stillAlive]) } // 断线者已被移出 trusted
+  const pendingAuthorized = new Set([stillAlive, droppedDuringStartup])
+  const notified = []
+  replayPendingAuthorized(server, pendingAuthorized, (link) => notified.push(link))
+
+  assert.deepEqual(notified, [stillAlive], '断线连接不许被唤醒（消费者会拿到死连接）')
+  assert.equal(pendingAuthorized.size, 0, 'pendingAuthorized 必须清空，不能留到下次装配')
+})
+
 test('安全回归：裸连接（不带 token、不发消息）抢不到 active 位', async () => {
   const home = tempHome()
   const ctx = fakeCtx()
@@ -231,7 +372,13 @@ test('安全回归：真编辑器准入后抢位失败（active 位只认 token 
   await new Promise((r, j) => { attacker.once('connect', r); attacker.once('error', j) })
   await new Promise((r) => setTimeout(r, 60))
   assert.equal(handle.kit.server.links.size, 2, '两条连接都在册')
-  assert.equal(handle.kit._activeLink()?.authorized, true, 'active 必须还是已准入的那条')
+  const [realLink, attackerLink] = handle.kit.server.links
+  assert.deepEqual([...handle.kit.server.trusted], [realLink], '目标集合必须只含真实准入者')
+  assert.equal(handle.kit._activeLink(), realLink, 'active 必须是已准入的那条')
+  // 即使有人误把诊断标志位改成 true，也不能让连接进入目标集合。
+  attackerLink.authorized = true
+  assert.equal(handle.kit._activeLink(), realLink, '目标选择不能依赖可写的 authorized 标志')
+  assert.equal(handle.kit.server.trusted.has(attackerLink), false)
 
   // 3) 请求必须落到真编辑器，不能被攻击者截走
   const sel = await svc.request('vscode.getSelection', {}, { waitForEditor: false })
@@ -239,6 +386,8 @@ test('安全回归：真编辑器准入后抢位失败（active 位只认 token 
 
   attacker.destroy()
   await editor.close()
+  assert.equal(handle.kit.server.trusted.size, 0, '编辑器断开后须移出目标集合')
+  assert.equal(handle.kit._activeLink(), null)
   ctx.runDisposers()
   await handle.stopped
   rmSync(home, { recursive: true, force: true })

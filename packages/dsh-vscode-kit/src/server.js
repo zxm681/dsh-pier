@@ -95,7 +95,7 @@ async function listenOnFreePort(host, range, createBridgeFor, onConnection) {
  * @param {(err) => void} [opts.onError]
  * @param {number}  [opts.timeoutMs]
  * @param {boolean} [opts.sweep]       启动时清扫死 pid，默认 true
- * @returns {Promise<{port, token, pid, links: Set, close, server, discoveryPath, broadcast}>}
+ * @returns {Promise<{port, token, pid, links: Set, trusted: Set, close, server, discoveryPath, broadcast}>}
  */
 export async function startBridgeServer(opts = {}) {
   const {
@@ -120,25 +120,30 @@ export async function startBridgeServer(opts = {}) {
   if (sweep) sweepDiscoveryDir(dir)
 
   const token = randomBytes(32).toString('hex')
-  /** 每条连接一个协议终端 */
+  /** 所有活 socket：只供关闭时资源回收，不可用来挑请求或广播目标。 */
   const links = new Set()
+  /** 已通过 token 校验的活连接：唯一可选请求目标。 */
+  const trusted = new Set()
+  /**
+   * 单调递增的**连接序号**：建连时赋值一次，与准入先后无关。
+   *
+   * ★ 回归（评审 R1）：`trusted` 是在**首次准入**时 add 的，所以集合顺序是
+   *   「准入先后」；而拆分前的实现（`[...links].filter(authorized).at(-1)`）
+   *   里 `links` 在建连时 add，取末项是「连接先后」。两者都合法时目标会漂移：
+   *   connect A → connect B → 先准入 B → 后准入 A，旧算法给 B，只取 trusted 末项给 A，
+   *   于是 vscode.openFile 之类的请求会送到另一个编辑器窗口 —— 属于意外的契约变更。
+   *   现在目标统一按 connSeq 最大者挑选，行为与旧实现一致（见 index.js _activeLink）。
+   */
+  let connSeq = 0
 
   const makeLink = (socket) => {
     const write = (line) => {
       if (socket.destroyed || !socket.writable) return
       socket.write(line)
     }
-    // ★ 安全：连接建立 ≠ 准入。
-    //
-    // TCP 连上只证明「有个进程够得着这个端口」，不证明它是合法编辑器。
-    // 所以这里先打成未准入，只有通过 token 校验的入站消息才把它升为准入连接。
-    // 上层（index.js 的 _activeLink）只在准入连接里挑 active —— 否则任何一个
-    // 本机进程裸连上来、什么都不发，靠「最后连上的赢」就能截走 DSH 的调用
-    // （安全审计 洞 2；work/scripts/lesson3-hijack.mjs 是它的复现）。
-    //
-    // 注意：仍要照常 links.add(link)，因为 close() 靠这个集合销毁底层 socket
-    // （踩过：只 close 协议终端不断 TCP，server.close() 会永久挂住）。
-    // 「准入」是另一个维度，用标志位表达，不要和「连接存在」混为一谈。
+    // ★ 安全：连接建立 ≠ 准入。links 收纳全部 socket 以便 close() 销毁；
+    // trusted 只收经过 token 校验的活连接，_activeLink() 不遍历 links。
+    // authorized 仍保留供旧诊断使用，但不再承担目标选择的安全边界。
     let link
     link = connect({
       write,
@@ -150,9 +155,9 @@ export async function startBridgeServer(opts = {}) {
       authorize: (incoming) => {
         if (incoming !== token) return false
         // 第一条通过校验的消息即为准入时刻。此后这条连接才有资格当 active。
-        if (link.authorized !== true) {
+        if (!trusted.has(link) && links.has(link) && !socket.destroyed) {
+          trusted.add(link) // 先升格，再同步通知；回调内即可安全挑 active。
           link.authorized = true
-          // 准入是「异步才可能发生」的事件，必须在这里通知，不能靠连接建立。
           try { onAuthorized?.(link) } catch (err) { onError?.(err) }
         }
         return true
@@ -164,10 +169,13 @@ export async function startBridgeServer(opts = {}) {
     socket.on('data', (chunk) => {
       try { feed(chunk) } catch (err) { onError?.(err); socket.destroy() }
     })
-    socket.on('close', () => { link.close('peer disconnected'); links.delete(link) })
-    socket.on('error', (err) => { onError?.(err); link.close(err.message); links.delete(link) })
+    socket.on('close', () => { link.close('peer disconnected'); trusted.delete(link); links.delete(link) })
+    socket.on('error', (err) => { onError?.(err); link.close(err.message); trusted.delete(link); links.delete(link) })
     // 允许进程在只剩空闲连接时也能退出（测试与 CLI 场景都需要）
     socket.unref?.()
+    // 连接序号在 links.add 的同一处赋值：一条连接一个序号，建连那一刻定死，
+    // 之后「第几条准入」不再影响目标选择。_activeLink() 按它挑最后连接的那条。
+    link.connSeq = ++connSeq
     links.add(link)
     // 协议 §3.4：hello 必须是每条连接的第一条消息，由服务端主动下发。
     // 这属于协议层行为，放 server 本体；onConnected 只是插件层的附加钩子。
@@ -208,6 +216,7 @@ export async function startBridgeServer(opts = {}) {
       try { link.socket?.destroy() } catch { /* ignore */ }
     }
     links.clear()
+    trusted.clear()
     removeDiscoveryFile(dir, process.pid)
   }
 
@@ -231,9 +240,9 @@ export async function startBridgeServer(opts = {}) {
     })
   }
 
-  /** 向所有已连接的对端广播通知（不等待响应）。 */
+  /** 有意收紧的契约变更：通知只发给已准入连接；未认证者收内容属洞 1 同类外泄。 */
   function broadcast(method, params) {
-    for (const link of links) link.notify(method, params)
+    for (const link of trusted) link.notify(method, params)
   }
 
   return {
@@ -242,6 +251,7 @@ export async function startBridgeServer(opts = {}) {
     pid: process.pid,
     server,
     links,
+    trusted,
     discoveryPath,
     capabilities,
     onConnected,

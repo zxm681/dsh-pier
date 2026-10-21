@@ -61,16 +61,35 @@ class VscodeKit {
   }
 
   /**
-   * 内部：取当前活跃连接 —— **只在已准入的连接里挑**。
+   * 内部：取当前活跃连接 —— **只在已准入的连接里挑，且按连接序号挑**。
    *
    * ★ 安全（洞 2）：不能简单取「最后连上的」。裸连一个 socket、什么都不发，
    *   就能把 active 位抢走，之后 DSH 的 vscode.* 请求全被它接走
    *   （work/scripts/lesson3-hijack.mjs 是复现）。
-   *   准入 = 至少发过一条 token 正确的消息（server.js 的 authorize 里打标）。
+   *   准入 = 至少发过一条 token 正确的消息（server.js 的 authorize 升格到 trusted）。
+   *   不遍历 links：即使以后忘写 authorized 过滤，也不会选中未准入 socket。
+   *
+   * ★ 回归（评审 R1）：目标必须按**连接先后**（server.js 的 connSeq），不是准入先后。
+   *   trusted 在首次准入时 add，取集合末项等于「最后准入优先」；拆分前的实现是
+   *   「最后连接优先」（links 在建连时 add）。两条都合法时两种口径会选出不同连接，
+   *   connect A → connect B → 先准入 B → 后准入 A：旧算法给 B，取末项给 A。
+   *   所以这里扫 trusted 取 connSeq 最大者 —— 与旧行为一致，且不回退到 links。
    */
   _activeLink() {
-    const links = [...this.server.links].filter((l) => l.authorized === true)
-    return links.length ? links[links.length - 1] : null
+    let best = null
+    let bestSeq = -Infinity
+    for (const link of this.server.trusted) {
+      // 未带序号的连接（白盒/旧对象）排在所有带序号的连接之后；
+      // 同序号时保留先遇到的那条，结果稳定可测。
+      const seq = typeof link.connSeq === 'number' ? link.connSeq : -Infinity
+      if (best !== null && seq <= bestSeq) continue
+      // 活连接才可当目标：socket 已销毁但 'close' 事件还没派发的那一下不选它，
+      // 否则请求会写进一条死 socket。
+      if (link.socket?.destroyed) continue
+      best = link
+      bestSeq = seq
+    }
+    return best
   }
 
   /** 内部：等编辑器连上，最多等 waitMs；超时返回 null。 */
@@ -330,11 +349,10 @@ export function apply(ctx, config = {}) {
       // 这个窗口是真的：startBridgeServer 内部 await 期间端口已在监听，
       // 扩展正好轮询到就会连上并发消息 —— 那条消息的准入发生在 kit 装配之前。
       // 不打日志就会在真机上「凭空少一条 authorized」，排障时极易误判。
-      for (const link of pendingAuthorized) {
+      replayPendingAuthorized(server, pendingAuthorized, (link) => {
         log('info', 'editor authorized during startup (notified after wiring)')
         kit._notifyConnected(link)
-      }
-      pendingAuthorized.clear()
+      })
 
       log('info', `listening on 127.0.0.1:${server.port} (discovery: ${server.discoveryPath})`)
       log('info', `live bridges under ${resolveDshHome(dshHome)}: ${listLiveBridges(discoveryDir(dshHome)).length}`)
@@ -401,6 +419,31 @@ export function apply(ctx, config = {}) {
     /** 等 server.close() 完成（测试/CLI 用）。 */
     get stopped() { return disposedPromise },
   }
+}
+
+/**
+ * 内部：补通知「启动空窗期」内已准入的连接给等待中消费者。
+ *
+ * 这个窗口是真的：startBridgeServer 内部 await 期间端口已在监听，扩展正好轮询到
+ * 就会连上并发消息 —— 那条消息的准入发生在 kit 装配之前。单纯丢掉它们会让
+ * 「扩展恰好比 kit 快一步」变成一次静默失败，所以要记下来、装配完补通知。
+ *
+ * ★ 必须先查 `server.trusted` 再通知：空窗期准入后又断线的连接已不在 trusted，
+ *   唤醒等待者会让消费者拿一条死连接发请求。`pendingAuthorized` 无论跳过几条都必须清空，
+ *   否则装配完成后它还会留在集合里，下次再也清不掉。
+ *
+ * @internal 导出仅为单测直接守门这条分支：该时间窗无法通过公开 API 稳定复现
+ *   （listen 到 kit 装配之间只有微任务，测试进程插不进去）。不属于稳定 API。
+ * @param {{trusted: Set<any>}} server
+ * @param {Set<any>} pendingAuthorized
+ * @param {(link: any) => void} notify
+ */
+export function replayPendingAuthorized(server, pendingAuthorized, notify) {
+  for (const link of pendingAuthorized) {
+    if (!server.trusted.has(link)) continue // 空窗期断线后不能唤醒等待者。
+    notify(link)
+  }
+  pendingAuthorized.clear()
 }
 
 /** 读 DSH 版本，失败返回 'unknown'（绝不因为版本探测失败影响插件加载）。 */

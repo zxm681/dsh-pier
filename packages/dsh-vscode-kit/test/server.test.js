@@ -23,6 +23,25 @@ function tempHome() {
 /** 哨兵：dial({token: NO_TOKEN}) 表示「本次连接不带 token」。 */
 const NO_TOKEN = Symbol('no-token')
 
+/** 等 socket 的 'close' 事件；用于断言 close() 真的断开了对端连接。 */
+function onceClosed(socket) {
+  return new Promise((resolve) => {
+    if (socket.destroyed) { resolve('already-destroyed'); return }
+    socket.once('close', () => resolve('closed'))
+  })
+}
+
+/** 给「等某件事发生」的断言加超时，避免「永远不关闭」被当成通过。 */
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      const timer = setTimeout(() => reject(new Error(message)), ms)
+      timer.unref?.()
+    }),
+  ])
+}
+
 /** 起一个 server 并返回一个已握手的客户端 link。 */
 async function withServer(opts, fn) {
   const home = tempHome()
@@ -181,16 +200,41 @@ test('出站请求能拿到服务端 onRequest 的返回值', async () => {
   })
 })
 
-test('服务端可向所有连接广播通知', async () => {
-  await withServer({}, async (server, { dial }) => {
+test('服务端向两个已准入连接广播通知', async () => {
+  await withServer({ onRequest: () => ({ ok: true }) }, async (server, { dial }) => {
     const a = await dial()
     const b = await dial()
     await a.next(); await b.next()
+    await a.link.request('ping', {})
+    await b.link.request('ping', {})
+    assert.equal(server.trusted.size, 2)
     server.broadcast('vscode.selectionChanged', { text: 'hi' })
     const [na, nb] = await Promise.all([a.next(), b.next()])
     assert.equal(na.method, 'vscode.selectionChanged')
     assert.deepEqual(nb.params, { text: 'hi' })
     await a.close(); await b.close()
+  })
+})
+
+test('安全回归：未准入静默连接收不到广播内容（同连接收包栅栏，不靠固定窗口）', async () => {
+  await withServer({ onRequest: () => ({ ok: true }) }, async (server, { dial }) => {
+    const real = await dial()
+    const bare = await dial({ token: NO_TOKEN })
+    await real.next(); await bare.next() // 建连 hello 不含 token，不能算准入。
+    await real.link.request('ping', {})
+    assert.equal(server.links.size, 2)
+    assert.equal(server.trusted.size, 1)
+    server.broadcast('vscode.selectionChanged', { text: 'private-selection' })
+    assert.deepEqual((await real.next()).params, { text: 'private-selection' })
+
+    // ★ 栅栏（评审 S1）：以前用「bare.next(80) 必须超时」做负断言 —— 80ms 是固定
+    //   观察窗，调度抖动时可能假绿。改成在**裸连接自己那条 socket** 上等一条已知消息：
+    //   bare 发一条错 token 请求，服务端必定回 -32001。同 socket 是 FIFO，
+    //   所以广播若曾写给 bare，必然排在这条拒绝之前，处理完请求后 inbox 就不可能为空。
+    await assert.rejects(bare.link.request('ping', {}), (e) => e.code === ERR.UNAUTHORIZED)
+    assert.equal(bare.inbox.length, 0,
+      `未准入的静默 socket 收到了广播内容：${JSON.stringify(bare.inbox.map((m) => m.method))}`)
+    await real.close(); await bare.close()
   })
 })
 
@@ -314,6 +358,72 @@ test('带正确 token 的请求通过鉴权', async () => {
     await c.next()
     assert.deepEqual(await c.link.request('ping', {}), { ok: true })
     await c.close()
+  })
+})
+
+test('trusted 在同步准入回调前升格，断开与关闭时均清空', async () => {
+  const seen = []
+  let activeServer
+  await withServer({
+    onAuthorized: (link) => {
+      // 回调同步触发；等回调后才 add 会使此处可见集合仍为空。
+      assert.equal(activeServer.trusted.has(link), true)
+      seen.push(link)
+    },
+    onRequest: () => ({ ok: true }),
+  }, async (server, { dial }) => {
+    activeServer = server
+    const real = await dial()
+    const bare = await dial({ token: 'wrong' })
+    await real.next(); await bare.next() // hello 已送达才可断言服务端收纳了两条连接。
+    assert.equal(server.links.size, 2)
+    assert.equal(server.trusted.size, 0)
+    await assert.rejects(bare.link.request('ping', {}), (e) => e.code === ERR.UNAUTHORIZED)
+    assert.equal(server.trusted.size, 0)
+    await real.link.request('ping', {})
+    assert.deepEqual([...server.trusted], seen, '准入通知和目标集合必须指向同一连接')
+    assert.equal(seen.length, 1)
+
+    // ★ 守门（评审 S1）：close() 时**同时**留下一条已准入连接和一条裸连接。
+    //   旧写法先 real.close() 再 close()，届时 trusted 已空 —— 于是把 cleanup 里的
+    //   trusted.clear() 删掉也能过，这条测试其实在睡觉。
+    const closedBoth = Promise.all([onceClosed(real.socket), onceClosed(bare.socket)])
+    const closing = server.close()
+    // cleanup() 是在 close() 的 Promise 执行体里同步跑完的；此刻 socket 的 'close'
+    // 事件还没派发，所以集合必须已被**显式**清空（只靠 close 事件兜底在这里过不去）。
+    assert.equal(server.trusted.size, 0, 'close() 必须同步清空 trusted，不能只靠 socket close 事件')
+    assert.equal(server.links.size, 0, 'close() 必须同步清空 links')
+    await closing
+    assert.deepEqual(
+      await withTimeout(closedBoth, 2000, 'close() 没有关闭服务端已准入/裸连接的 socket'),
+      ['closed', 'closed'],
+    )
+    assert.equal(server.closed, true)
+  })
+})
+
+test('socket error 路径把连接同时移出 links 与 trusted', async () => {
+  const errors = []
+  await withServer({
+    onRequest: () => ({ ok: true }),
+    onError: (err) => errors.push(err),
+  }, async (server, { dial }) => {
+    const real = await dial()
+    await real.next()
+    await real.link.request('ping', {})
+    assert.equal(server.trusted.size, 1)
+    assert.equal(server.links.size, 1)
+
+    const link = [...server.trusted][0]
+    // 真机上这条分支由 ECONNRESET 触发；这里直接触发服务端 socket 的 'error'
+    // 分支，避开「对端进程被杀」这种不可控时序。
+    const reset = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })
+    link.socket.emit('error', reset)
+
+    assert.equal(server.trusted.size, 0, 'error 路径必须把连接移出 trusted')
+    assert.equal(server.links.size, 0, 'error 路径必须把连接移出 links')
+    assert.deepEqual(errors.map((e) => e.code), ['ECONNRESET'], 'onError 必须收到原始错误')
+    await real.close().catch(() => {})
   })
 })
 
