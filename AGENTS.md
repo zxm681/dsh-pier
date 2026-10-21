@@ -13,8 +13,14 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
 5. **优雅关闭要显式 `socket.destroy()`**，只 `link.close()` 会让 `server.close()` 挂死。
 6. **转义/剥离在边界一次做完**。CRLF 在分帧层剥，1-based→0-based 只在 VSCode API 边界转。
 7. **改完立刻跑 import smoke**：`node -e "import('./src/index.js')"`，比全量测试快。
-8. **连接建立 ≠ 准入**。`links` 里混着"连上了"和"被信任"两种连接；要挑对端必须过滤
-   `authorized === true`（见 §5.9）。出站消息**不许默认附带 token**——凭证只在调用方显式要求时带。
+8. **连接建立 ≠ 准入，准入 ≠ 选目标**。`links` 只做存活登记与 `close()` 时销毁底层 socket
+   （server.js:124、213-219）；挑对端**只遍历 `trusted`**（server.js:126），不许从 `links` 挑、
+   **不许回退 `links`**（`index.js` 的 `_activeLink()`，78-93）。活跃目标取 `trusted` 里 `connSeq`
+   **最大**的**活**连接；口径是「连接先后」，不是「最后准入」（server.js:127-137、178；
+   逆序握手时两种口径会选出不同窗口，这是已修的真实回归）。`broadcast()` 只发给已准入连接
+   （server.js:243-246，有意收紧的契约变更：未准入连接不该收到可能含选区文本的通知）。
+   `link.authorized` 仅留作诊断/兼容，**不再承担安全边界**（§5.9 里的 `links.filter(authorized)`
+   是拆分前写法，已过时，以代码为准）。出站消息**不许默认附带 token**——凭证只在调用方显式要求时带。
 9. **「测试全绿」不等于「测试在守门」**。每条安全回归都要做一次**变异测试**：故意把 bug 改回去，
    确认测试变红。成本只有一次 sed + 一次跑，却是唯一能区分「测试在守门」和「测试在睡觉」的办法。
    （2026-10-21 踩过：新写的两条洞 3 测试第一版都是假测试，硬编码猜 id、断言变量从不被赋值。）
@@ -42,7 +48,7 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
 ## 验证门槛（声称完成前必须全绿）
 
 ```bash
-cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 48
+cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 56
 cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 23
 cd packages/dsh-kit-demo   && node --test "test/*.test.js"   # 7
 cd packages/dsh-kit-bridge && node scripts/e2e.mjs           # 13

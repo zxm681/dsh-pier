@@ -88,7 +88,11 @@ export class BridgeError extends Error {
  * @param {(method: string, params: any, ctx: {id: any, token?: string}) => any|Promise<any>} [opts.onRequest]
  *        处理对端发来的请求；抛 BridgeError 会转成 error 响应。
  * @param {number} [opts.timeoutMs]
- * @param {string} [opts.token] 每个出站请求自动附带（协议 §3.3 顶层 token 字段）
+ * @param {string} [opts.token] 连接级凭据（协议 §3.3 顶层 token 字段）。**出站附带规则按消息类型区分**：
+ *        `request()` **自动附带**（`if (token !== undefined) msg.token = token`，见 request）；
+ *        `notify()` / `respond()` **默认不带**，调用点显式 `{withToken: true}` 才带（见各自「安全边界」段）；
+ *        `respondError()` **恒不带** —— 它没有 withToken 通道（见其 JSDoc 的已知限制）。
+ *        换句话说：本字段是「凭据来源」，不是「所有出站消息都带 token」的总开关。
  * @param {(err: Error) => void} [opts.onError] 协议层内部异常（解析失败等）观察点
  * @param {(token: string|undefined, method: string) => boolean} [opts.authorize]
  *        入站请求/通知的鉴权钩子。返回 false → 请求方收到 -32001（通知则静默丢弃并上报）。
@@ -141,6 +145,12 @@ export function connect(opts) {
 
   /**
    * 发起请求，等待响应。
+   *
+   * ★ 凭据：构造时给了 `token` 就**自动附带**（见下方 msg 组装那两行）。
+   * 这是本函数与 `notify()` / `respond()` 的**默认不发**之间唯一的差异，
+   * 它描述的是"出站消息怎么组装"，不是"请求免于鉴权"——授权判定在入站侧
+   * （`handleMessage` 里的 authorize 调用），与本函数的出站附带无关。
+   *
    * @returns {Promise<any>} 成功时 resolve result；失败 reject BridgeError。
    */
   function request(method, params, reqOpts = {}) {
@@ -203,9 +213,20 @@ export function connect(opts) {
     send(msg)
   }
 
-  /** 应答一个入站请求（错误）。 */
+  /**
+   * 应答一个入站请求（错误）。
+   *
+   * ★ 已知限制：**没有 `withToken` 通道**，错误响应恒不带 token。
+   * 也就是 `respond()` 能显式送凭据、`respondError()` 不能 —— 这是接口不对称，
+   * 不是文档矛盾；要补就得给签名加 opts，属接口变更，不顺手做。
+   *
+   * 不对称不构成风险：响应不参与本协议鉴权（`handleMessage` 先把 isResponse 分流，
+   * 之后才走 authorize），所以不带 token 的错误响应不会被对端拒收。
+   * **尤其是未认证者收到的 -32001 绝不附送凭据** —— 那条响应本身就是对「凭证无效」的回答，
+   * 给它带上 token 等于把通行证发给刚被拒绝的一方。
+   */
   function respondError(id, code, message, data) {
-    // 错误响应同样默认不带 token（见 respond 的说明）。
+    // 错误响应恒不带 token：本函数没有 withToken 通道，见上方「已知限制」。
     send({ jsonrpc: '2.0', id, error: new BridgeError(code, message, data).toJSON() })
   }
 

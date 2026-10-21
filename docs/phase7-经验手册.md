@@ -314,28 +314,51 @@ const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw  // 分帧层统一剥
 修法：把「连接在册」和「准入」拆成两个维度。
 
 ```js
-// server.js：连接建立时先打成未准入
-link.authorized = false
-// authorize 通过第一条 token 正确的消息那一刻才升格
-authorize: (incoming) => {
-  if (incoming !== token) return false
-  if (link.authorized !== true) { link.authorized = true; onAuthorized?.(link) }
-  return true
+// server.js:124 —— links 只管「活着的 socket」，close() 靠它销毁底层 socket（server.js:213-219）
+const links = new Set()
+// server.js:126 —— trusted 才装了「过了 token 准入」的连接，是唯一可选的请求目标
+const trusted = new Set()
+
+// server.js:137、178 —— 连接序号在建连那一刻定死，和「第几条准入」完全无关
+link.connSeq = ++connSeq
+links.add(link)          // 仍要照常登记，close() 靠这个集合回收 socket
+
+// server.js:243-246 —— 广播口径同步收紧：只发给已准入连接
+function broadcast(method, params) {
+  for (const link of trusted) link.notify(method, params)
 }
 
-// index.js：只在准入连接里挑 active
-const links = [...this.server.links].filter((l) => l.authorized === true)
+// index.js:78-93 —— _activeLink() 只扫 trusted，取 connSeq 最大的「活」连接，绝不回退 links
+let best = null
+let bestSeq = -Infinity
+for (const link of this.server.trusted) {
+  const seq = typeof link.connSeq === 'number' ? link.connSeq : -Infinity
+  if (best !== null && seq <= bestSeq) continue
+  if (link.socket?.destroyed) continue   // socket 已销毁但 close 事件还没派发的那一下也不选
+  best = link
+  bestSeq = seq
+}
+return best
 ```
 
-三条要一起记住：
+四条要一起记住：
 
 1. **仍要照常 `links.add(link)`**。`close()` 靠这个集合销毁底层 socket，
-   不登记就会回到 §5.3 的 `server.close()` 挂死。准入是另一个维度，用标志位，不要混。
+   不登记就会回到 §5.3 的 `server.close()` 挂死。准入是另一个维度，用另一个集合（`trusted`），不要混。
+   `link.authorized` 这块标志位只留给旧诊断（`server.js:146`、160、166），**不再承担安全边界**。
 2. **准入是异步事件，不能在连接建立时通知**。`onConnected` 只打日志，
    唤醒消费者的是 `onAuthorized`。
 3. **要处理「准入早于装配」的空窗期**。`startBridgeServer` 内部 `await` 期间端口已在监听，
    扩展正好轮询到并发了 token 正确的消息 —— 那次准入发生在 kit 装配之前。
    用 `pendingAuthorized` Set 暂存、装配后补通知；不打日志就会在真机上「凭空少一条 authorized」。
+4. **别在集合顺序上偷懒，必须显式记 `connSeq`**（★ 已踩过的回归，评审 R1 抓出）：
+   最初 `_activeLink()` 写成取 `trusted` 的末项（`[...trusted].at(-1)`），等价于
+   **「最后准入」**；而拆分前的语义是**「最后连接」**。集合 `trusted` 是在首次准入时
+   `add` 的，所以它的顺序是准入先后，不是连接先后。逆序握手
+   （A 先连、B 后连、B 先准入、A 后准入）时两种口径选出**不同窗口**：
+   旧语义给 A（后准入），取末项给 B（先准入）—— `vscode.openFile` 这类请求会送到另一个窗口，
+   属于没打招呼的契约变更。现在目标口径 = `trusted` 里 `connSeq` **最大**的活连接，
+   与拆分前一致；`connSeq` 在执行 `links.add()` 的同一处赋值（`server.js:176-179`）。
 
 真机验证（`work/evidence-hole2-realmachine.*`）：攻击者裸连后日志只有
 `editor connected (remote port 4666)`，**没有** `editor authorized`；
@@ -421,6 +444,48 @@ bash 的 PATH 里没有。跨 shell 调用要显式用 pwsh。
 | 长期运行稳定性 | 只跑分钟级 | 中（泄漏、重连风暴） |
 | cordis 内部 API 稳定性 | 依赖 `ctx.provide/get/effect/on` 四个原语 | 低（都是公开文档面） |
 | 宿主 loader hook 的行为 | 我们没用，但它是第三方插件 import `@deepseek-ai/*` 的唯一途径 | 中（未公开契约） |
+
+### 8.1 优雅关窗后有约 90ms 过渡期 `[实测，真机]`
+
+**现象**：目标窗口正常关闭后，在扩展宿主真正退出前的那一小段时间里，旧窗口仍可能应答请求。
+DSH 侧看到的是「关掉之后还成功了一次」。
+
+**为什么**：`window.close` 走优雅关闭，socket 的 `close` 事件还没派发、`trusted` 里那条 link 仍在，
+`_activeLink()`（`packages/dsh-vscode-kit/src/index.js:78-93`）此刻仍会选中它。
+**这是优雅关闭必然的过渡期，不是仲裁失效。**
+
+**后果**：不会丢数据，但「关掉窗口后立刻调用」的表现不稳定——同一串操作有时打给旧窗口、有时打给新目标。
+
+**现状**：不修。要等的是 socket 的 `close` 事件，压不到零；`_activeLink()` 里
+`if (link.socket?.destroyed) continue` 只能兜住「已销毁但 close 未派发」那一下。
+证据：`work/长尾验证-5a-Windows.md` §1.5。
+
+### 8.2 扩展宿主被 VS Code 自动重启后，目标会「跳回」 `[实测，真机]`
+
+**现象**：崩溃 / 重载后 VS Code 会重启扩展宿主，它以**新的 `connSeq`** 重连，
+于是「`connSeq` 最大者」的选取规则会把目标切回这个新连接——**即使另一个窗口才是用户刚用的那个**。
+
+**为什么**：`connSeq` 在建连时赋值一次（`packages/dsh-vscode-kit/src/server.js:178`，`link.connSeq = ++connSeq`），
+口径是「连接先后」而不是「准入先后」（AGENTS.md 铁律 8）。扩展宿主重启 = 新连接 = 新序号。
+
+**后果**：多窗口场景下用户会感到「焦点跟着重启跑」，反直觉但语义自洽。
+
+**现状**：有意保留——改它就是改铁律 8 的契约。只有扩展宿主崩后自动重启才会出现，
+正常开窗关窗不会。证据：`work/长尾验证-5a-Windows.md` §1.4、§1.5。
+
+### 8.3 换 `DSH_HOME` 起的实例，扩展侧发现不了 `[实测，真机]`
+
+**现象**：用不同 `DSH_HOME` 起的第二个 DSH 实例，VS Code 编辑器**永远看不到它**。
+
+**为什么**：发现名片写到 `<DSH_HOME>/dsh-vscode-kit/<pid>.json`，而扩展侧只轮询 `~/.dsh/dsh-vscode-kit/`——
+`packages/dsh-kit-bridge/src/connector.js:178` 的 `discoveryDir(dshHome)` 在没有显式 `DSH_HOME` 时回落到
+`join(homedir(), '.dsh')`（`packages/dsh-vscode-kit/src/discovery.js:30`）。**两侧的根不一致。**
+
+**后果**：多实例场景下表现为「我起了两个实例，编辑器只认一个」。除非给 VS Code 进程也设同名 `DSH_HOME`。
+
+**现状**：这是发现协议的既有契约，不修。**要用多实例，必须共用同一个 `DSH_HOME`**——
+同一个 HOME 下靠 `<pid>.json` 分文件共存，端口在 7410–7419 区间顺序探测
+（`packages/dsh-vscode-kit/src/server.js:30`）。证据：`work/长尾验证-5a-Windows.md` §2.5。
 
 ---
 
