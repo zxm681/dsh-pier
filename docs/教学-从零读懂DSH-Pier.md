@@ -5,14 +5,18 @@
 
 ## 课表
 
-| 课 | 主题 | 一句话 |
-|---|---|---|
-| 1 | 为什么需要"桥" | 两个进程为什么不能直接调用 |
-| 2 | 消息怎么"说话" | JSON-RPC、id、通知、错误码 |
-| 3 | 怎么"找到对方" | 发现文件、端口、token、loopback |
-| 4 | DSH 插件系统 | cordis 的 provide / inject / effect |
-| 5 | VS Code 扩展模型 | 扩展宿主、activate、为什么不能直接 import |
-| 6 | 分层与解耦 | 零依赖、传输无关、消费者透明 |
+| 课 | 主题 | 一句话 | 状态 |
+|---|---|---|---|
+| 1 | 为什么需要"桥" | 两个进程为什么不能直接调用 | ✅ 已完成 |
+| 2 | 消息怎么"说话" | JSON-RPC、id、通知、错误码 | ✅ 已完成 |
+| 3 | 怎么"找到对方" | 发现文件、端口、token、loopback | ✅ 已完成 |
+| 4 | DSH 插件系统 | cordis 的 provide / inject / effect | ✅ 本次补齐 |
+| 5 | VS Code 扩展模型 | 扩展宿主、activate、为什么不能直接 import | ✅ 本次补齐 |
+| 6 | 分层与解耦 | 零依赖、传输无关、消费者透明 | ✅ 本次补齐 |
+
+> 进度：第 1–3 课（含三次答疑）此前已写完；**第 4、5、6 课于 2026-10-22 补齐**。
+> 第 4 课的 cordis 探针脚本是临时解包 DSH 发行包后跑的（未入库），输出原样贴在课里；
+> 第 5、6 课的 `node -e` / `npm view` / `node --test` / `node scripts/e2e.mjs` 输出都是当场跑的原样结果。
 
 ---
 
@@ -1234,3 +1238,1118 @@ function respond(id, result) {
 | 3 | "谁是编辑器"由身份决定 | `server.js` 不再在连接建立时 `links.add`，改为收到带正确 token 的 `bridge.hello` 后才登记 | 30 行 + 改服务器/应用层测试 |
 
 三条都是**行为变更**，不是纯内部重构 —— 尤其第 2、3 条会改变协议语义（响应开始带 token、连接不再等于"已登记对端"）。按工作区约定，这类改动先报告、确认后再动。
+
+---
+
+# 第 4 课：DSH 的插件系统 —— 为什么是"登记表 + 生命周期"，而不是直接 import 一个函数
+
+> 本课关于 cordis 行为的结论，都在下面贴了原样输出。探针脚本是临时写的
+> （`/tmp/probe-check.mjs`、`/tmp/probe-check2.mjs`、`/tmp/probe-effect2.mjs`），**没有入库**
+> —— 它们要读的 cordis 源码在 DSH 发行包的 `app.asar` 里面，普通 `node` 读不到，
+> 得先解包才能跑（见 4.5 的说明）。项目自己的验收命令随时可跑，见第 5、6 课。
+
+## 4.1 问题先行：直接 import 别人的函数，会出什么事？
+
+第 1 课说过：DSH 想让 VS Code 打开一个文件，不能自己调，得找中间人。
+中间人写好了，最省事的用法看起来是这样：
+
+```js
+// 想象中：DSH 插件直接 import 中间人的函数
+import { openFile } from 'dsh-vscode-kit'
+await openFile({ path: 'package.json' })
+```
+
+本项目**没有**这么做。它的用法长这样（`packages/dsh-kit-demo/src/index.js:18`）：
+
+```js
+export const inject = ['dshVscodeKit']
+```
+
+用的时候（`packages/dsh-kit-demo/src/index.js:26`）：
+
+```js
+const kit = ctx.get('dshVscodeKit')
+```
+
+只多了一句声明、一个 `ctx.get`。为什么值得绕这一下？因为直接 `import` 有四个绕不过去的坑：
+
+| # | 问题 | 具体会怎么坏 |
+|---|---|---|
+| 1 | **加载顺序没人管** | A 插件用 B 插件的功能，谁先加载全靠运气；`import` 只能拿到"模块被加载那一刻"的值 |
+| 2 | **能力是会上下线的** | 编辑器没开、桥没连上、扩展被用户禁用 —— 功能这一刻在、下一刻不在。`import` 拿到的是**死值**，不会跟着变 |
+| 3 | **宿主看不见依赖图** | 谁依赖谁是一句 `import`，宿主无从得知，卸载 / 热重载时没法按正确顺序处理 |
+| 4 | **实现被写死了** | 测试时想换成假实现？`import` 走的路径是硬编码的 |
+
+四条合起来是一句话：**`import` 把"依赖"写成了代码，而代码是宿主看不见、也改不动的。**
+
+插件系统要做的，就是把这层关系从"代码"里挖出来，变成宿主能读的**数据**。
+
+## 4.2 最小模型：插件 = 三样东西
+
+本项目的插件长这样（`packages/dsh-vscode-kit/src/index.js:18`、`:26`、`:196`）：
+
+```js
+export const name = 'dsh-vscode-kit'      // ① 我叫什么
+export const inject = []                  // ② 我需要谁（这里：谁都不需要）
+export function apply(ctx, config = {}) { // ③ 我被叫起来时干什么
+```
+
+就这三样。没有基类、没有装饰器、没有 `import cordis`。
+
+> **打比方**：插件系统像单位门口的**登记簿**。
+> 你进门先写三行：我叫什么（`name`）、我必须等谁到场才开工（`inject`）、我开工干什么（`apply`）。
+> 前台（宿主）拿这本簿子就能算出**谁该先上班**，而不是让每个员工自己去别人工位上抓人（直接 `import`）。
+
+`inject` 是空数组这件事本身有信息量 —— 原文注释在 `packages/dsh-vscode-kit/src/index.js:26` 附近：
+
+> `export const inject = []` 空数组是**刻意**的：本插件不依赖任何 DSH 内部服务，
+> 这样就不会因为"某个内部服务缺失"被连带卸载掉。
+
+换句话说：**依赖越少，越不容易被别人拖死。** 这条规律在第 6 课会变成整个项目的设计铁律。
+
+### 三个原语的分工（本课地图）
+
+| 原语 | 一句话 | 打比方 | 本项目位置 |
+|---|---|---|---|
+| `ctx.provide(name, value)` | 把能力挂到公共柜子上 | 东西放进柜子、贴上标签 | `packages/dsh-vscode-kit/src/index.js:300` |
+| `inject: [...]` | 声明"没有这个我不开工" | 门上贴"没工牌不开门" | `packages/dsh-vscode-kit/src/index.js:26` |
+| `ctx.effect(fn)` | 登记"我走的时候要收拾什么" | 领用登记表 | `packages/dsh-vscode-kit/src/index.js:396-397` |
+
+## 4.3 原语一：`ctx.provide` —— 重点在"提供的东西长什么样"
+
+调用只有一行（`packages/dsh-vscode-kit/src/index.js:300`）：
+
+```js
+ctx.provide('dshVscodeKit', facade)
+```
+
+真正值得学的是 `facade` **为什么长这样**。先看形状（`packages/dsh-vscode-kit/src/index.js:245-258`）：
+
+```js
+const vscode = {
+  openFile: (params, opts) => (kit
+    ? kit.vscode.openFile(params, opts)
+    : notReady('vscode.openFile')),
+  getSelection: (params, opts) => (kit ? ... : notReady('vscode.getSelection')),
+  getDiagnostics: (params, opts) => (kit ? ... : notReady('vscode.getDiagnostics')),
+  listOpenEditors: (params, opts) => (kit ? ... : notReady('vscode.listOpenEditors')),
+}
+```
+
+（上面 `...` 是本文为省地方做的缩写，真实文件里是完整转发。）
+
+注意两件事：
+
+1. **四个方法名"固定存在"**，不管桥连没连上。没连上时它们返回一个被拒绝的 Promise，而不是 `undefined`。
+2. **每个方法都是转发**（`(params, opts) => kit ? ... : ...`），不是把底层 `kit.vscode` 直接交出去。
+
+为什么不直接把底层的交出去？源码注释留着答案（`packages/dsh-vscode-kit/src/index.js:236-241`）：
+
+> ★ 早期写成 `get vscode() { return kit?.vscode ?? {} }`，真机上出过两类问题：
+> ① 监听没起来时消费者拿到 `{}`，调用得 `kit.vscode.openFile is not a function`
+> （裸 TypeError，没有错误码、没有原因，最糟的失败形态）；
+> ② 消费者把方法**解构**出去后（`const { bind } = kit.vscode`），就算监听后来就绪，
+> 解构出来的已经是 `undefined`，永远好不了。
+> 所以糖衣方法必须是**稳定存在**的转发函数，只在调用时检查就绪状态。
+
+这是 `AGENTS.md` 的**铁律 2**：服务返回的东西必须稳定存在，不许在未就绪时返回 `{}` 或 `null`。
+
+> 判断标准：**"暂时不能用"要表现为一个带错误码的拒绝，而不是 `undefined`。**
+> 前者调用方看得懂、能降级；后者是一颗裸 TypeError，还会被"解构"放大成永久故障。
+
+"没连上"这个错误长这样（`packages/dsh-vscode-kit/src/index.js:242`）：
+
+```js
+const notReady = (method) => Promise.reject(new BridgeError(ERR.DISCONNECTED,
+  'dsh-vscode-kit is not listening yet', { method, reason: 'server-not-ready' }))
+```
+
+其中 `ERR.DISCONNECTED` 是 `-32007`，定义在 `packages/dsh-vscode-kit/src/protocol.js:26`。
+
+## 4.4 原语二：`inject` —— 依赖是数据，不是 import
+
+消费者一侧（`packages/dsh-kit-demo/src/index.js:18`）：
+
+```js
+export const inject = ['dshVscodeKit']
+```
+
+旁边注释（`packages/dsh-kit-demo/src/index.js:16`）写得很清楚：
+
+> 注意这是**字符串数组**，纯声明，不需要 import cordis。
+
+一个字符串，指向前一间屋子 `ctx.provide('dshVscodeKit', ...)` 里的名字。就靠**名字**对上号，
+两边没有任何代码互相 import。这是第 6 课"零耦合"的地基。
+
+宿主规则简单说：**`inject` 里列的服务全部到位，才调你的 `apply`。** 服务没到位就等着。
+
+"等着"这两个字，正是下一节那口坑的来源。
+
+## 4.5 本项目最贵的坑：`check` 谓词不是"就绪通知"
+
+### 当时的想法（听起来完全合理）
+
+`ctx.provide` 有第三个参数。既然桥要过一会儿才连上，那就告诉宿主
+"我这个能力是**有条件**的，条件没满足时别给消费者"：
+
+```js
+// ❌ 真机上把消费者永久卡死的写法
+ctx.provide('dshVscodeKit', facade, () => kit !== null)
+```
+
+意图是："`kit` 没就绪时消费者先别启动；等它就绪了，谓词变真，消费者自然就起来了。"
+
+**这个"自然就起来了"不存在。** 这是本项目代价最大的一次误判。
+
+### 真实机制
+
+cordis（本项目用的插件框架，版本 4.0.5）里，`check` 只在**有人来取（get）这个东西的时候**被求值；
+求值为假，它做的事是**把这个值从仓库里删掉**：
+
+```js
+// cordis 的 lib/index.js:1306-1315（_checkImpl 的原文逻辑）
+if (!impl) return delete this._store[name]
+try {
+  if (impl.check && !impl.check.call(getTraceable(this.ctx, impl.value)))
+    return delete this._store[name]
+} catch (error) { ... return delete this._store[name] }
+```
+
+（同一段源码，`docs/phase7-经验手册.md` §3.3 也引过，路径行号一致。本课的引用是我解包
+DSH 发行包里的 cordis 后逐行核对过的。）
+
+关键词是 **delete**：不是"暂缓发放"，是"当它不存在"。
+
+### 我自己跑出来的三条对照
+
+最小探针只做三件事：注册一个带 `check` 的服务、让一个消费者 `inject` 它、看消费者有没有被叫起来。
+三个场景原样输出：
+
+```
+[A-no-check] provided
+[A-no-check] consumer active; svc = world
+[A-no-check] => consumerRan=true
+
+[B-check-false-then-true] provided
+[B-check-false-then-true] => consumerRan=false
+
+[C-check-true] provided
+[C-check-true] consumer active; svc = world-true
+[C-check-true] => consumerRan=true
+```
+
+| 场景 | check | 消费者起来了没 |
+|---|---|---|
+| A | 不传 check | ✅ 起来了 |
+| B | 一开始 `false`，之后变 `true` | ❌ **永远没起来** |
+| C | 恒为 `true` | ✅ 起来了 |
+
+B 这一格就是那个坑：谓词后来确实变真了，消费者**没有**被叫醒。
+
+把时间轴放大，看 B 到底怎么卡住的：
+
+```
+[provider] provided（check = () => ready，此刻 ready = false）
+① ready=false 时 consumer 激活了吗？ false
+② ready=false 时 root.get 拿得到吗？ { hello: [Function: hello] }
+③ 把 ready 改成 true 了 —— 现在等 300ms 看消费者会不会自己醒……
+④ consumer 激活了吗？ false ← false 就是永久 pending（没有任何机制重发通知）
+⑤ 但下一次 get / 或插件重新加载，谓词会被重新求值。root.get 现在： 拿得到值
+```
+
+把 ① 和 ⑤ 并排读一遍，这是全课最重要的一处对比：
+
+- **⑤ 说：后来 `get` 拿得到值。**（谓词重新求值，通过了）
+- **①④ 说：早就等在门口的那个消费者，永远不会醒。**
+
+结论不是"值坏了"，而是：**`check` 是门禁，不是门铃。**
+
+> **打比方**：`check` 像闸机上的刷卡验证 —— 每次有人要进，它当场验一下卡；
+> 验不过，就把这个人**从名册上划掉**。但它**没有**"条件变好了就敲门通知排队的人"这个功能。
+> 你指望它当门铃，等的人就永远站在门外。
+
+### 真机上的样子
+
+`docs/phase7-经验手册.md` §3.3 记录了当时的原始输出：
+
+```
+dsh: warning: 1 entry did not activate
+dsh-kit-demo-realtest (dsh-kit-demo): pending (waiting for services: unknown)
+```
+
+`waiting for services: unknown` —— 连"在等哪个服务"都说不出来。这就是谓词为假、值被删掉之后
+等待者眼里的世界：这个服务根本不存在。
+
+> 诚实说明：这两行 warning 来自 DSH 的 loader，不在 cordis 里（我 grep 过 cordis 的
+> `lib/index.js`，`did not activate` / `waiting for services` 零命中）。所以我能给的证据是
+> **手册里的历史记录 + 我自己复现的"永久 pending"机制**，而不是我当场又看到了这两行 warning。
+
+### 修法（现在是铁律 1）
+
+两句话：
+
+1. **`ctx.provide` 不传 `check`** —— 注释在 `packages/dsh-vscode-kit/src/index.js:291-299`，
+   实际调用在 `:300`。
+2. **需要等的人自己等** —— 用 `facade.waitReady(ms)`（`packages/dsh-vscode-kit/src/index.js:277-286`）：
+
+```js
+waitReady: async (timeoutMs = 5000) => {
+  if (kit !== null) return true
+  if (!(timeoutMs > 0)) return false
+  ...
+  const ok = await Promise.race([readySignal, timeout])
+  clearTimeout(timer)
+  return ok
+},
+```
+
+它的三个设计细节都是被坑教出来的：
+
+| 细节 | 为什么 |
+|---|---|
+| 返回 `boolean`，**不抛** | 调用方自己决定怎么降级（"等不到就明说等不到"） |
+| 有超时 | 永远等不到的东西不该让调用方挂死 |
+| 一旦就绪，后续调用**立即**返回 `true` | 底层是一次性 Promise（`packages/dsh-vscode-kit/src/index.js:231`），已结算就不再等 |
+
+配套的 `ready` 是普通 getter（`packages/dsh-vscode-kit/src/index.js:261`）：
+`get ready() { return kit !== null }` —— 状态如实报告，不兼职"门禁"。
+
+> 判断标准：**你要的到底是"别让他拿到"，还是"让他知道什么时候能拿到"？**
+> 前者是 `check`（会永久卡住消费者），后者是 `waitReady`（有超时、有布尔结果）。
+> 本项目选后者，并写进了 `AGENTS.md` 铁律 1。
+
+## 4.6 原语三：`ctx.effect` —— 登记"我走的时候要收拾什么"
+
+本项目怎么用（`packages/dsh-vscode-kit/src/index.js:396-397`）：
+
+```js
+if (typeof ctx.effect === 'function') {
+  ctx.effect(() => () => {
+    disposed = true
+    settleReady(false)
+    for (const waiter of [...(kit?.waiters ?? [])]) waiter(null)
+    ...
+  })
+}
+```
+
+**是两个箭头，别数成三个。** 外面那层 `() => ...` 是"现在就执行的登记动作"，
+它返回的里面那层 `() => {...}` 才是"将来卸载时执行的清理动作"。
+
+### cordis 的契约原文
+
+```js
+// cordis 的 lib/index.js:1142-1143
+const effect = runner.execute.call(this);
+if (typeof effect === "function") return runner.collect(effect);
+```
+
+翻译：**先调用你传的函数；如果它返回了一个函数，就把这个返回值收集起来当 disposer。**
+
+```
+ctx.effect(fn)  →  立刻执行 fn()，把 fn 的返回值当"卸载时要调用的清理函数"
+```
+
+| 你写的 | 发生什么 |
+|---|---|
+| `ctx.effect(() => { setup(); return () => cleanup() })` | ✅ 注册时跑 `setup`，卸载时跑 `cleanup` |
+| `ctx.effect(() => () => cleanup())` | ✅ 同上（只有清理，没有 setup） |
+| `ctx.effect(() => cleanup)` | ⚠️ 注册时什么都不做，**卸载时才第一次调用** `cleanup`（见下） |
+
+### 实测
+
+一个插件用正确写法，一个用"把 `fn` 当 disposer"的写法，然后卸载两个插件。原样输出：
+
+```
+[正确写法] fn 立刻执行（注册时就跑了）
+[错误写法] 注册完，等一下看有没有东西被当场打印
+--- 现在卸载两个插件 ---
+[正确写法] disposer 被调用（卸载时）
+[错误写法] 有人调用了这个函数
+--- 结束 ---
+```
+
+第二行到第三行之间**没有任何输出** —— 错误写法在注册时真的什么都没干。
+它的"清理函数"只在卸载时才第一次被调用，而那时它要"清理"的东西从来没被建立过。
+
+### 这条写错一次，代价是一整轮排查
+
+`docs/phase7-经验手册.md` §2.3 与 §9.3 记了同一件事：写测试用的假 `ctx` 时，
+把 `fn` 本身当成 disposer 收集了。于是：
+
+- 卸载后资源没释放（真正的清理函数从没被登记）
+- `await stopped` **永久挂起**（没人 resolve）
+
+两条加起来，症状看起来和"产品有 bug"一模一样。这类**假 bug 比真 bug 更贵**：
+真 bug 至少是真问题，假 bug 会让你去改没坏的代码。手册的结论是「白查两轮」。
+
+> 判断标准：**`effect(fn)` 的意思是"现在做，并把做完后要回收的东西交给我"，
+> 不是"以后再做"。** 返回值才是契约的另一半。
+
+## 4.7 本课要带走的几句话
+
+> 1. **插件不是"被 import 的函数库"，而是"登记表 + 开工函数"**：`name` / `inject` / `apply`。
+> 2. **依赖要写成数据**（`inject: ['dshVscodeKit']`）而不是写成 `import` ——
+>    宿主才排得出启动顺序，卸载时也才拆得干净。
+> 3. **`provide` 出去的对象必须"永远有那几个方法"**：未就绪时返回带错误码的拒绝，
+>    不许返回 `{}` 或 `null`（铁律 2）。
+> 4. **`check` 是门禁，不是门铃** —— 不传它；要等就自己 `waitReady(ms)`（铁律 1）。
+> 5. **`effect(fn)` 里 `fn` 立刻执行，`fn` 的返回值才是 disposer**。
+
+## 第 4 课练习题
+
+> **问 1：如果把 `ctx.provide('dshVscodeKit', facade)` 改成
+> `ctx.provide('dshVscodeKit', facade, () => kit !== null)`，会发生什么？
+> 为什么"谓词后来变真了，等在门口的消费者还是醒不过来"？**
+
+提示：想两件事 —— ① `check` 是在**什么时候**被求值的？② 值被"删掉"之后，
+**谁负责**通知那些已经在等的人？
+
+> **问 2：`ctx.effect(() => () => console.log('bye'))` 里，`console.log('bye')` 什么时候打印？
+> 如果写成 `ctx.effect(() => console.log('bye'))`，又是什么时候打印？**
+
+提示：数一下箭头函数的层数；再想一句话 —— "返回值"在这里扮演什么角色。
+
+---
+
+# 第 5 课：VS Code 扩展模型 —— 一个只能活在别人进程里的程序
+
+> 本课的代码引用全部来自 `packages/dsh-kit-bridge/`；两处命令实测（`npm view vscode`、
+> `node -e "require.resolve('vscode')"`）与端到端测试的输出，都原样贴在下面。
+
+## 5.1 问题先行：DSH 为什么不能自己调 VS Code 的 API？
+
+第 1 课的老问题，这一课要把它钉死。
+
+"当前选区里的文字""打开了哪几个文件""这个文件有没有报错" —— 这三样东西**只存在于 VS Code 里**。
+DSH 是另一个进程（跑在 Node 里），它没有编辑器、没有文档模型，它连"哪个文件被选中了"这个问题都无从回答。
+
+所以必然有一侧要**去问** VS Code。问题只剩一个：**问的方式是什么？**
+
+最省事的方式当然是：
+
+```js
+import * as vscode from 'vscode'
+const sel = vscode.window.activeTextEditor.selection
+```
+
+本项目里，这行代码确实存在（`packages/dsh-kit-bridge/src/extension.js:9`、`packages/dsh-kit-bridge/src/vscode-host.js:11`），
+但它**只存在于扩展里**，绝不出现在 DSH 那一侧。原因不是风格洁癖，而是一个硬事实：
+
+> **`vscode` 这个模块，在磁盘上不存在。** 它是 VS Code 在加载扩展时"塞"给扩展代码的。
+
+下一节先把周边讲清，5.3 再上实测。
+
+## 5.2 extension host 是什么，`activate` 什么时候被调用
+
+### 三句话版本
+
+1. VS Code 打开时，除了画界面那个进程，还会另外拉起一个**独立的 Node.js 进程**，
+   专门跑所有扩展的代码。这个进程叫 **extension host**（扩展宿主）。
+2. 扩展不是"一直活着"的：VS Code 认为某个扩展该干活了，才调用它的入口函数 `activate`。
+3. 入口函数返回之后，扩展就回到"待命"状态 —— 它靠**注册的回调**（命令、事件）被再次唤醒。
+
+> 诚实边界：上面这三条是 VS Code 扩展模型的公开设计（官方文档级别的常识），
+> **本项目里没有可跑的命令能"验证进程数"**。本课能给你实测证据的是后面几节：
+> 模块从哪来、入口函数怎么写、为什么必须打成 CJS 单文件。
+
+### 本项目落在这套模型里的哪几处
+
+| 模型里的概念 | 本项目的代码 | 说明 |
+|---|---|---|
+| 扩展清单 | `packages/dsh-kit-bridge/package.json:26` `"main": "./out/extension.cjs"` | 告诉 VS Code 入口文件在哪 |
+| 最低版本 | `packages/dsh-kit-bridge/package.json:20-22` `"engines": { "vscode": "^1.91.0" }` | 低于这个版本不装 |
+| 什么时候叫我 | `packages/dsh-kit-bridge/package.json:27-29` `"activationEvents": ["onStartupFinished"]` | VS Code 启动完成后叫我一次 |
+| 入口 | `packages/dsh-kit-bridge/src/extension.js:132` `export function activate(context)` | 被叫起来时执行 |
+| 关闭 | `packages/dsh-kit-bridge/src/extension.js:233` `export function deactivate()` | VS Code 要走时执行 |
+| 收拾动作 | `packages/dsh-kit-bridge/src/extension.js:172-227` `context.subscriptions.push(...)` | 交出去的每样东西都会在停用时被 dispose |
+
+`activate` 里做的事极少（`packages/dsh-kit-bridge/src/extension.js:133-159`）：
+
+```js
+const output = vscode.window.createOutputChannel('DSH Kit Bridge')
+const cfg = readConfig()
+if (!cfg.enabled) return { disabled: true }
+const { dispatch, capabilities } = createDispatcher(output)
+const connector = createConnector({ dispatch, log, ... })
+connector.start()
+```
+
+建日志通道 → 读配置 → 建能力分派 → 起连接器 → 把要收拾的东西登记进 `context.subscriptions`。
+**没有一句 `await` 卡在这里**，也没有"等连接成功再返回"。连接是后台轮询的
+（`packages/dsh-kit-bridge/src/connector.js:196-202`，`setTimeout` 递归 —— 不是 `while` 死循环）。
+
+### 为什么扩展代码不能随便"长跑阻塞"
+
+扩展宿主是**一个共用的 Node 进程**，所有扩展都在里面。JS 是单线程的：
+一段同步的 `while (true)` 或一次几十秒的同步计算，会把整个扩展宿主卡住 —— **包括别的扩展**。
+
+这条规则在本项目里留下了自己的现场证据（`packages/dsh-kit-bridge/src/extension.js:210-226`）：
+
+```js
+// 配置变化：只有影响连接构建的键才需要重启扩展宿主。
+// 曾经的写法是「任何 dshKit.* 变更都 reloadWindow」，那会在用户只是点开一个
+// 检查框、或自检临时开关时把正在执行的命令连根拔掉（真机自检就是这么被杀的）。
+const needsRestart = RESTART_KEYS.some((k) => e.affectsConfiguration(`dshKit.${k}`))
+```
+
+`RESTART_KEYS` 只有两个键（`packages/dsh-kit-bridge/src/extension.js:21`）：
+
+```js
+const RESTART_KEYS = ['dshHome', 'pollIntervalMs']
+```
+
+翻译成人话：改"连接怎么建立"才值得重启整个扩展宿主；改其它开关不该重启 ——
+**因为"重启扩展宿主"这个动作会把正在跑的活儿一起掐死。** 真机上确实掐死过一次自检。
+
+> 判断标准：**扩展宿主不是你一个人的进程。** 你在里面做的每个"等一下"，都是别人在陪等。
+
+## 5.3 为什么 `vscode` 不能直接 import（实测）
+
+### 实测一：在普通 node 里根本找不到这个模块
+
+在项目根目录跑：
+
+```
+$ node -e "try{console.log(require.resolve('vscode'))}catch(e){console.log('require.resolve 失败：', e.code)}"
+require.resolve 失败： MODULE_NOT_FOUND
+```
+
+`MODULE_NOT_FOUND` —— 不是"装了但版本不对"，是**磁盘上就没有这个东西**。
+
+### 实测二：npm 上那个 `vscode` 是个空壳
+
+```
+$ npm view vscode version description
+version = '1.1.37'
+description = '## ⚠️ Deprecated, use @types/vscode and vscode-test instead ⚠️'
+```
+
+它停更在 `1.1.37`，官方描述直接写了 Deprecated（"请改用 `@types/vscode` 和 `vscode-test`"）。
+而且它**没有 `main` 字段**（`npm view vscode main` 什么都不输出）——
+也就是说：就算你 `npm i vscode`，`require('vscode')` 也找不到可加载的入口。
+
+`@types/vscode` 是什么？是**类型声明**（给编辑器用的"说明书"），里面没有一行可执行代码。
+所以"装个包不就有了"这条路是死的。
+
+### 那 `import * as vscode from 'vscode'` 为什么能跑？
+
+因为**扩展宿主在加载扩展前，把这个模块注入进去了**。扩展代码里 `require('vscode')` 拿到的
+是一个由 VS Code 自己创建的、活的 API 对象 —— 里面挂着 `workspace`、`window`、`commands` 等等。
+
+本项目把这件事写在了打包脚本的注释里（`packages/dsh-kit-bridge/scripts/build.mjs:29-30`）：
+
+```js
+// vscode 由扩展宿主注入，绝不能打包
+external: ['vscode'],
+```
+
+`external` 的意思是"这个 import 原样留着，别试图解析它"。如果真去解析，构建会失败 —— 因为磁盘上没有。
+
+### 这条事实推出的两个结论（全项目最重要的一步推理）
+
+| 结论 | 为什么 |
+|---|---|
+| **能力实现必须放在扩展里** | 只有扩展宿主里能拿到 `vscode` 这个对象，别的地方拿不到 |
+| **DSH 侧只能"发消息"** | DSH 拿不到 `vscode`，它能做的只有：把"我要打开这个文件"写成一个请求，送过去 |
+
+这就是整座"桥"存在的根本原因 —— 回看第 1 课，那条链子的起点在这里。
+
+同一个事实还解释了另外两件事：
+
+1. **为什么自检非得跑在真机上**（`packages/dsh-kit-bridge/src/extension.js:34-39` 的注释）：
+
+   > 单测用的是假 host，E2E 用的是假 host，两者都证明不了 `vscode-host.js` 里那几行真实 API
+   > 调用是对的（`showTextDocument` 的参数、`env.openExternal` 的返回值、`activeTextEditor` 的形状）。
+
+2. **为什么自检结果要写到文件**（`packages/dsh-kit-bridge/src/extension.js:121-128`）：
+   写到 `~/.dsh/dsh-vscode-kit/selftest-<pid>.json`。人在 VS Code 里跑一遍，DSH 侧再去读文件 ——
+   因为**两个进程没有别的共同语言**。
+
+## 5.4 怎么让"只能活在扩展里的能力"变得可单测
+
+这是本项目最漂亮的一处设计。一句话：**把"vscode 长什么样"这个知识，关进一个文件。**
+
+### 只有 `vscode-host.js` 知道 vscode
+
+`packages/dsh-kit-bridge/src/vscode-host.js:1-6`：
+
+```js
+/**
+ * VS Code 宿主适配器：把 vscode API 包成 capabilities/connector 需要的形状。
+ *
+ * 隔离目的很实在：能力实现与连接管理都不 import 'vscode'，因此能在 node:test 里
+ * 用假 host 跑真 TCP 端到端。**只有这个文件**知道 vscode 长什么样。
+ */
+```
+
+它做的事：把一堆 `vscode.*` 调用包成普通函数，凑成一个**普通对象**返回
+（`packages/dsh-kit-bridge/src/vscode-host.js:128-139`）：
+
+```js
+return {
+  fileExists: (p) => { ... },
+  resolvePath,
+  workspaceRoots,
+  isTrusted: () => vscode.workspace.isTrusted,
+  openTextDocument,
+  openExternalFile,
+  activeEditor,
+  collectDiagnostics,
+  listEditors,
+  log,
+}
+```
+
+这个对象的形状（谁调用、参数、返回值）就是**接口**。有了接口，就能有两份实现：
+真的那份用 `vscode`，假的那份用手写数据。
+
+### 能力层：`capabilities.js` 一行 `vscode` 都没有
+
+`packages/dsh-kit-bridge/src/capabilities.js:1-12` 的头注释：
+
+```
+ * 设计要点：
+ *  - **不直接 import 'vscode'**，全部经 `host` 注入 —— 这样能在 node:test 里单测，
+ *    不必起 Electron / 扩展宿主。
+ *  - 每个能力先做三项前置检查（信任 / 可用性 / 参数），再做实际动作。
+ *  - 失败一律抛 BridgeError 带稳定错误码，让 DSH 侧拿到结构化原因而不是字符串。
+ *  - 坐标约定：协议对外一律 **1-based**
+```
+
+它唯一的 import 是协议库（`packages/dsh-kit-bridge/src/capabilities.js:14`）：
+
+```js
+import { BridgeError, ERR } from '../../dsh-vscode-kit/src/protocol.js'
+```
+
+能力清单（`packages/dsh-kit-bridge/src/capabilities.js:17-22`）：
+
+```js
+export const CAPABILITIES = [
+  'vscode.openFile',
+  'vscode.getSelection',
+  'vscode.getDiagnostics',
+  'vscode.listOpenEditors',
+]
+```
+
+创建方式（`packages/dsh-kit-bridge/src/capabilities.js:68`）：
+
+```js
+export function createCapabilities(host) {
+```
+
+`host` 就是 5.4 开头那个普通对象。**依赖从外面递进来**，不自己去拿。
+
+### "三项前置检查"长什么样
+
+以 `openFile` 为例（`packages/dsh-kit-bridge/src/capabilities.js:84-112`，摘关键几行）：
+
+```js
+async function openFile(params) {
+  assertTrusted('vscode.openFile')                       // ① 信任检查
+  const raw = params?.path
+  if (typeof raw !== 'string' || raw.trim() === '') {     // ② 参数检查
+    throw new BridgeError(ERR.INVALID_PARAMS, 'params.path must be a non-empty string', ...)
+  }
+  const abs = host.resolvePath(raw)
+  if (!host.fileExists(abs)) {                            // ③ 可用性检查
+    throw new BridgeError(ERR.NOT_FOUND, `file not found: ${abs}`, ...)
+  }
+  ...
+}
+```
+
+三种失败，三个稳定错误码：
+
+| 检查 | 失败时 | 错误码 |
+|---|---|---|
+| 工作区没被信任 | `untrusted-workspace` | `-32006`（`packages/dsh-vscode-kit/src/protocol.js:25`） |
+| 参数不合法 | `invalid-params` | `-32602`（`packages/dsh-vscode-kit/src/protocol.js:17`） |
+| 文件不存在 | `not-found` | `-32003`（`packages/dsh-vscode-kit/src/protocol.js:22`） |
+
+还没实现的方法呢？分派器给的是 `-32005`，**不是**标准 JSON-RPC 的 `-32601`
+（`packages/dsh-kit-bridge/src/capabilities.js:229-235`）：
+
+```js
+async function dispatch(method, params) {
+  const handler = handlers[method]
+  if (!handler) {
+    throw new BridgeError(ERR.UNSUPPORTED, `capability not implemented: ${method}`, { method })
+  }
+  return handler(params)
+}
+```
+
+注释解释了为什么：**让 DSH 侧能区分"对端不支持这个能力"（可以降级）和"你方法名写错了"（是 bug）。**
+第 6 课末尾会看到这条设计的实际效果。
+
+### 一项"看着无所谓、其实救了命"的细节
+
+`packages/dsh-kit-bridge/src/capabilities.js:48-51`：
+
+```js
+function canonicalPath(p) {
+  if (typeof p !== 'string') return p
+  return /^[a-z]:/.test(p) ? p[0].toUpperCase() + p.slice(1) : p
+}
+```
+
+就是把 Windows 盘符统一成大写。为什么值得单独写个函数？看它的注释（`packages/dsh-kit-bridge/src/capabilities.js:42-46`）：
+
+> 真机自检抓到的坑：同一个文件，`vscode.openFile` 回传的是调用方传入的 `C:\Users\...`，
+> 而 `vscode.getSelection` / `listOpenEditors` 回传的是 VSCode URI 的 `fsPath`，在 Windows 上
+> 盘符被小写化成 `c:\Users\...`。消费者若按字符串比较（`list.some(e => e.file === p)`）会静默失败。
+
+这个坑是**假 host 永远测不出来**的 —— 假 host 里路径是你自己写的字符串，当然一致。
+又一次印证 5.3 的结论。
+
+## 5.5 `connector.js`：把"发现 / 连接 / 握手 / 重连"和 vscode 隔开
+
+扩展里第二个有分量的文件。它负责第 3 课讲的那套找对方的过程，但**它也不 import vscode**
+（`packages/dsh-kit-bridge/src/connector.js:1-11`）：
+
+```
+ * 刻意**不碰 vscode**：所有宿主能力经 `deps` 注入，因此可以用真 TCP + 假宿主跑单测。
+ * 这一层是「薄扩展」里唯一有状态的部件，其余文件都是纯函数。
+ *
+ * 状态机：
+ *   idle → connecting → ready → (断开) → idle → ……
+ *             ↓ 失败
+ *          idle（等下一次轮询）
+```
+
+它用的依赖（`packages/dsh-kit-bridge/src/connector.js:13-19`）：
+
+```js
+import { createConnection } from 'node:net'
+import { BridgeError, ERR, PROTOCOL_VERSION, connect, createLineSplitter }
+  from '../../dsh-vscode-kit/src/protocol.js'
+import { discoveryDir, listLiveBridges } from '../../dsh-vscode-kit/src/discovery.js'
+import { CAPABILITIES } from './capabilities.js'
+```
+
+全是 Node 内置模块 + 协议库 + 能力清单。**没有任何 `vscode`。**
+
+### 四个阶段，各自在哪几行
+
+| 阶段 | 代码 | 一句话 |
+|---|---|---|
+| 轮询 | `packages/dsh-kit-bridge/src/connector.js:196-202` | `setTimeout` 递归，间隔 `pollIntervalMs`（默认 2000，见 `packages/dsh-kit-bridge/src/connector.js:41`） |
+| 找目标 | `packages/dsh-kit-bridge/src/connector.js:176-194` | `listLiveBridges(dir)`，取 `bridges[0]`（**多实例仲裁：连 `startedAt` 最新的那个**，注释在 `:182`） |
+| 连接 | `packages/dsh-kit-bridge/src/connector.js:102-129` | `createConnection` + 超时（`connectTimeoutMs` 默认 3000），超时回 `ERR.TIMEOUT`、失败回 `ERR.DISCONNECTED` |
+| 握手 | `packages/dsh-kit-bridge/src/connector.js:132-173` | 建协议终端 → 主动发 `bridge.hello` 报自己的能力清单 |
+
+握手那一段有个安全细节值得单看（`packages/dsh-kit-bridge/src/connector.js:140-144`）：
+
+```js
+// 入站鉴权：DSH 侧发的消息必须带同一个 token（对端被冒名时我们能发现）。
+// 例外是 bridge.hello：它是 DSH 侧连上后主动打的招呼，发生在双方互相确认之前，
+// 按协议**不允许携带 token**（曾经携带过，等于把通行证寄给任何连上端口的人）。
+authorize: (incoming, method) => method === 'bridge.hello' || incoming === info.token,
+```
+
+和第 3 课答疑里那三个洞是同一条线的：**"连接建立"不等于"已鉴定身份"**。
+
+### 一个"顺序写错、功能全废"的坑
+
+`packages/dsh-kit-bridge/src/connector.js:90-99`：
+
+```js
+function handleInbound(method, params, ctx) {
+  const fn = inbound[method]
+  if (fn) return fn(params)
+  if (onRequest) {
+    const custom = onRequest(method, params, ctx)
+    if (custom !== undefined) return custom
+  }
+  // 未实现的能力由 capabilities.dispatch 回 -32005（可与「协议层方法不存在」区分）。
+  return dispatch(method, params)
+}
+```
+
+注释（`packages/dsh-kit-bridge/src/connector.js:86-88`）说了代价：
+
+> 顺序很重要：先认协议层方法（ping/hello），**其余一律交给能力分派**。
+> 早期版本忘了最后这一步 fallthrough，结果 vscode.* 全被当成未知方法回 -32601 ——
+> 端到端测试当场抓到。
+
+这就是第 2 课"错误码要说清是哪一层的事"的实际价值：`-32601`（方法不存在）和
+`-32005`（对端不支持）看起来都是"失败了"，含义完全不同。
+
+### 停止时要"两层都关"
+
+`packages/dsh-kit-bridge/src/connector.js:221-232`：
+
+```js
+stop() {
+  stopped = true
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null }
+  if (link) link.close('connector stopped')
+  if (socket) {
+    // 与 DSH 侧同一个教训：协议层 close ≠ 传输层 close。
+    try { socket.destroy() } catch { /* ignore */ }
+  }
+```
+
+`link.close()` 只是"我这个协议终端不玩了"，socket 还开着。必须再 `socket.destroy()`
+才能真正断开 —— 否则对方（DSH）那边会以为连接还在，`server.close()` 会挂住（`AGENTS.md` 铁律 5）。
+
+## 5.6 为什么最后打成一个 CJS 单文件
+
+`packages/dsh-kit-bridge/package.json:26` 指向 `./out/extension.cjs` —— 一个构建产物，
+不是源码。构建脚本只有 37 行（`packages/dsh-kit-bridge/scripts/build.mjs`），
+理由是两条（`packages/dsh-kit-bridge/scripts/build.mjs:4-9`）：
+
+> **为什么是 CJS**：VS Code 扩展宿主对 ESM 扩展的支持要 1.94+ 且仍有边界情况；
+> CJS 是 1.91 起就没问题的稳妥选择。源码本身仍写 ESM，打包转换即可。
+>
+> **为什么 bundle 而不是 tsc**：kit 的 protocol.js/discovery.js 是跨包相对 import，
+> 不打包的话 vsix 里就得塞 node_modules 或 ../dsh-vscode-kit，两个都不干净。
+> 打包后 vsix 只有一个 extension.cjs，零安装依赖。
+
+也就是说：
+
+| 麻烦 | 不打包的后果 | 打包后 |
+|---|---|---|
+| `import { connect } from '../../dsh-vscode-kit/src/protocol.js'` | vsix 里得带上 `../dsh-vscode-kit` 这个**兄弟目录**（安装到用户机器上根本不存在） | 代码被"复印"进 `extension.cjs` |
+| 依赖别的 npm 包 | vsix 里要塞 `node_modules`（几十 MB、版本漂移） | 零安装依赖 |
+
+"零安装依赖"到什么程度？看 `packages/dsh-kit-bridge/package.json:80-82`：
+
+```json
+"devDependencies": {
+  "esbuild": "^0.28.2"
+}
+```
+
+`esbuild` 是**构建时**用的（`devDependencies`），装出来的扩展里没有运行时依赖。
+
+### 那 `@deepseek-ai/*` 呢？
+
+协议库**规定不许 import** 它们（`packages/dsh-vscode-kit/src/protocol.js:5`）：
+
+> 零依赖：只用 Node 内置模块，绝 import @deepseek-ai/*（ERR_MODULE_NOT_FOUND 前科）。
+
+原因：那些是 DSH 宿主内部的包，扩展这个包里根本没有它们；一旦 import，
+打包时解析不到（`ERR_MODULE_NOT_FOUND`），或者更糟 —— 硬塞进去，然后在用户机器上版本对不上。
+这条规则的完整道理放到第 6 课讲。
+
+### 一处实测：打包出来的东西能不能真的跨进程干活
+
+`packages/dsh-kit-bridge` 有个端到端脚本 `scripts/e2e.mjs`：**真 TCP + 假宿主**，
+把两个进程（DSH 侧协议库 ↔ 扩展侧 connector/capabilities）真连起来跑一轮。跑一遍：
+
+```
+$ cd packages/dsh-kit-bridge && node scripts/e2e.mjs
+PASS vscode.openFile 跨进程成功 — {"opened":true,"path":"/ws/e2e/target.txt","mode":"text"}
+PASS 编辑器侧真的执行了打开动作
+PASS vscode.getSelection 跨进程成功 — {"text":"selected-text","file":"/ws/e2e.js","start":{"line":5,"column":1},"end":{"line":5,"column":14},"isEmpty":false}
+PASS 选区坐标 1-based — {"line":5,"column":1}
+PASS vscode.getDiagnostics 跨进程成功 — {"total":1,"files":[{"file":"/ws/e2e.js","diagnostics":[{"severity":"error","line":2,"column":4,"message":"e2e-err","source":"e2e"}]}],"truncated":false}
+PASS vscode.listOpenEditors 跨进程成功 — {"editors":[{"file":"/ws/e2e.js","isActive":true,"isDirty":false,"languageId":"javascript"},{"file":"/ws/other.js","isActive":false,"isDirty":true}],"total":2,"truncated":false}
+PASS 未实现能力回 -32005 — {"code":-32005,"message":"editor does not advertise capability for \"vscode.diff\""}
+PASS DSH 重启后编辑器自动重连
+
+=== 13/13 passed ===
+```
+
+（上面是节选，原输出 13 条全绿。）注意最后两条：一条证明"未实现能力回 `-32005`"这个设计真的生效，
+一条证明**DSH 重启后扩展会自己连回来** —— 也就是 5.5 里那个 `idle → connecting → ready` 状态机在工作。
+
+再看它的单测（同一套代码，`node --test`）：
+
+```
+$ cd packages/dsh-kit-bridge && node --test "test/*.test.js"
+ℹ tests 23
+ℹ pass 23
+ℹ fail 0
+```
+
+23 条测试**全是假宿主**，一条都没起 VS Code。这就是 5.4 那套"host 注入"直接换来的东西。
+
+## 5.7 本课要带走的几句话
+
+> 1. **扩展跑在 extension host 里，是"被叫醒"的**（`activate`），不是常驻服务；
+>    它是共用的单线程进程，别在里面长跑阻塞。
+> 2. **`vscode` 不是 npm 包，是扩展宿主注入的模块**。磁盘上没有（`MODULE_NOT_FOUND`），
+>    npm 上那个 `vscode` 是停更的空壳（无 `main`）。
+> 3. **因为上一条，能力实现只能在扩展里，DSH 侧只能发消息** —— 这就是桥的存在理由。
+> 4. **把"宿主长什么样"关进一个文件**（`vscode-host.js`），其余代码靠注入拿能力，
+>    于是 23 条单测能用假宿主跑，13 条 E2E 能跑真 TCP。
+> 5. **打包成单个 CJS bundle、`external: ['vscode']`、零运行时依赖** —— 装出来的扩展
+>    不需要用户 `npm install` 任何东西。
+
+## 第 5 课练习题
+
+> **问 1：为什么 `import * as vscode from 'vscode'` 在扩展里能跑，而你在 node 里跑就报
+> `MODULE_NOT_FOUND`？这个模块到底是谁提供的？**
+
+提示：想两件事 —— ① `npm view vscode` 出来的那个包，跟"你电脑上的 VS Code 本体"是不是同一个东西；
+② 如果它是"被注入的"，那么注入的人是谁、在什么时候注入。
+
+> **问 2：`capabilities.js` 为什么不 `import 'vscode'`，而是等 `host` 传进来？
+> 如果不这么做，本项目那些 `node --test` 单测会变成什么样？**
+
+提示：想"假 host"三个字；再想为什么 5.6 的 E2E 能在**没有 VS Code 的终端里**跑通真 TCP。
+
+---
+
+# 第 6 课：分层与解耦 —— 这个项目的设计收口
+
+> 本课有两处"自己动手"的实测：第 6.3 节的两条 `grep` 和三个包的测试都原样贴了输出。
+> 这些命令你现在就能在自己的终端里跑。
+
+## 6.1 问题先行：加一个功能，要动几个文件？
+
+想象明天要给这个桥加一个新能力：`vscode.diff`（把两个文件并排对比）。
+
+一个设计得好不好，有个非常朴素的检验方法：**数改动点。**
+
+| 改动点数量 | 会带来什么 |
+|---|---|
+| 1–3 个文件，且都在同一层 | 加十个功能是十次小手术 |
+| 每加一个功能都要碰协议解析、消息分帧、连接管理 | 加十个功能是十次大手术，第十次一定出事 |
+| 加功能要同步改消费者 | **不认识你的第三方插件也得跟着改** —— 最贵 |
+
+所以本课的问题就是一句话：**这个项目加一个能力，要碰几层？**
+
+答案是：**一层，加两行测试。** 下面看这条路是怎么修出来的。
+
+## 6.2 四段式链路：谁不知道谁
+
+第 1、2、3 课分别讲了三段，第 5 课讲了扩展那一侧。拼起来是一条四段式链路：
+
+```
+① 消费者（任何 DSH 插件）        例：packages/dsh-kit-demo
+      │  只用 ctx.get('dshVscodeKit') 拿到的方法
+      ▼
+② 协议库（DSH 侧，零依赖）        packages/dsh-vscode-kit
+      │  消息：JSON-RPC over ndjson
+      ▼
+③ loopback TCP（127.0.0.1 + token）
+      │
+      ▼
+④ 薄扩展（VS Code 侧）            packages/dsh-kit-bridge
+      │  connector（连接）+ capabilities（能力）+ vscode-host（唯一懂 vscode 的）
+      ▼
+⑤ 官方 API：vscode.*
+```
+
+**这张表真正的内容是"谁不知道谁"：**
+
+| 角色 | 不知道什么 | 证据 |
+|---|---|---|
+| 消费者（①） | 不知道 TCP、端口、发现文件、token 的存在；也不知道 `vscode` | `packages/dsh-kit-demo/src/index.js:5` 的注释 + 6.3 的 grep |
+| 协议库（②） | 不知道 VS Code 的 API 长什么样；不 import 任何 `vscode` | `packages/dsh-kit-bridge/src/vscode-host.js` 是唯一 import 它的文件 |
+| 扩展（④） | 不知道 DSH 内部服务；不 import `@deepseek-ai/*` | `packages/dsh-vscode-kit/src/protocol.js:5` |
+| 双方共同知道的东西 | **只有消息的形状**（方法名、参数、错误码、分帧） | `packages/dsh-vscode-kit/src/protocol.js` |
+
+注意最后一行的分量：**共享的只有"协议"这一份文本，不是对方的代码。**
+这就是"解耦"的准确定义 —— 不是"没有关系"，是"只共享一份双方都同意的契约"。
+
+> **打比方**：像打电话办业务。你（消费者）只知道总机号码和"我要办什么"（协议）；
+> 你不知道对方在哪个楼、用什么系统、柜台怎么排（实现）。**你要动的事，永远只在"总机的接线规则"里。**
+
+## 6.3 零耦合的证据（自己跑的 grep）
+
+### 先跑任务书里那条"看起来该零命中"的命令
+
+```
+$ grep -rin "tcp\|port\|token\|discovery\|vscode\." packages/dsh-kit-demo/
+packages/dsh-kit-demo/src/index.js:5: *  - 只 import 协议库的公开 API，**不知道** TCP / 端口 / 发现文件 / token 的存在；
+packages/dsh-kit-demo/src/index.js:6: *  - 不改 DSH 核心，不 import cordis，不碰 VSCode；
+packages/dsh-kit-demo/src/index.js:12:export const name = 'dsh-kit-demo'
+packages/dsh-kit-demo/src/index.js:16: * 注意这是**字符串数组**，纯声明，不需要 import cordis（见打样日志 §1.1 实测）。
+packages/dsh-kit-demo/src/index.js:18:export const inject = ['dshVscodeKit']
+packages/dsh-kit-demo/src/index.js:24:export function apply(ctx, config = {}) {
+packages/dsh-kit-demo/src/index.js:38:      const sel = await kit.vscode.getSelection()
+packages/dsh-kit-demo/src/index.js:52:      const r = await kit.vscode.openFile({ path, ...position })
+packages/dsh-kit-demo/src/index.js:94:      await step('vscode.openFile', () => openFile(config.smoke.path, { line: 2, column: 1 }))
+packages/dsh-kit-demo/src/index.js:95:      await step('vscode.getSelection', () => readSelection())
+packages/dsh-kit-demo/src/index.js:98:        const { writeFileSync, mkdirSync } = await import('node:fs')
+packages/dsh-kit-demo/src/index.js:99:        const { dirname } = await import('node:path')
+packages/dsh-kit-demo/test/index.test.js:4: * 这些测试**不启动真 TCP**，只验解耦度与降级行为 ——
+```
+
+**命中了一堆，不是零命中。** 这恰恰是这一课最值得学的地方 —— 逐条看它们是什么：
+
+| 命中来源 | 实际是什么 | 算耦合吗 |
+|---|---|---|
+| `port` 命中的那些行（`:12`、`:16`、`:18`、`:24`、`:98`、`:99` …） | 全部是 `im`**`port`** 这个词里的三个字母 | ❌ 假命中 |
+| `tcp` / `token` 各 1 行（`:5`） | 一句注释，说的是"**不知道** TCP / token 的存在" | ❌ 是"声明不知道" |
+| `vscode.` 4 行（`:38`、`:52`、`:94`、`:95`） | `kit.vscode.openFile(...)` —— **服务对象上的一个属性**，不是 `import 'vscode'` | ❌ 公开 API |
+| `test/index.test.js:4` | 注释："这些测试**不启动真 TCP**" | ❌ 是注释 |
+
+### 再把 grep 收紧，只问"有没有真的碰基础设施"
+
+```
+$ grep -rinE "\b(tcp|port|token|discovery|selftest)\b|node:net|vscode\.workspace|vscode\.window|127\.0\.0\.1" packages/dsh-kit-demo/src/
+packages/dsh-kit-demo/src/index.js:5: *  - 只 import 协议库的公开 API，**不知道** TCP / 端口 / 发现文件 / token 的存在；
+```
+
+只剩 1 行，而且这一行本身就是**在说"我不知道"**。`node:net`（TCP 的入口）、
+`vscode.workspace` / `vscode.window`（真 VS Code API）—— **零命中**。
+
+再看它到底 import 了什么：
+
+```
+$ grep -n "import" packages/dsh-kit-demo/src/index.js
+98:        const { writeFileSync, mkdirSync } = await import('node:fs')
+99:        const { dirname } = await import('node:path')
+```
+
+全文只有两处 import，都在一个默认关闭的 smoke 分支里，而且都是 Node 内置模块。
+**没有 `import 'vscode'`、没有 `import '@deepseek-ai/cordis'`、也没有 import 协议库。**
+
+> 判断标准：**"耦合"的不是"出现过某个词"，而是"你的代码里写死了对方的实现细节"。**
+> 知道方法名（`vscode.openFile`）是契约；知道"消息从 127.0.0.1:7410 走、token 在哪个文件里"
+> 才是耦合。前者换实现不用改，后者换实现就得改。
+
+### 第二个证据：协议库自己没有依赖
+
+`packages/dsh-vscode-kit/package.json` 里**没有 `dependencies` 字段**（这是重点），
+只有 `peerDependencies`（`:22-29`）：
+
+```json
+"peerDependencies": {
+  "@deepseek-ai/dsh": ">=0.2.1-0 <0.3.0"
+},
+"peerDependenciesMeta": {
+  "@deepseek-ai/dsh": { "optional": true }
+}
+```
+
+而且是 `optional` —— 意思是"宿主里通常有，但不强求"。所以安装这个库，**不会顺带拉进任何第三方包**。
+
+它对外暴露的入口也只有一个（`packages/dsh-vscode-kit/package.json:7-11`）：
+
+```json
+"exports": {
+  ".": "./src/index.js",
+  "./protocol": "./src/protocol.js",
+  "./package.json": "./package.json"
+}
+```
+
+界面上就这三个门，"内部文件"没被暴露出去 —— 换内部实现时外面不会崩。
+
+## 6.4 为什么"零依赖、不 import `@deepseek-ai/*`"是铁律
+
+这条规则写在 `packages/dsh-vscode-kit/src/protocol.js:5`，一句话：
+
+> 零依赖：只用 Node 内置模块，绝 import @deepseek-ai/*（**ERR_MODULE_NOT_FOUND 前科**）。
+
+"前科"两个字很关键。为什么明明能 import 却禁止？因为**它是能跑的**：
+
+- DSH 装上之后，那些包在宿主的 `node_modules` 里**是能 resolve 的**（第 4 课我为了读 cordis
+  源码，就是从 DSH 发行包里把它们挖出来的）
+- 所以 import 一下"能跑"，测试也可能是绿的
+
+那问题在哪？
+
+> **它们是宿主的内部实现，不是给你用的公开 API。** 你现在 import 的每一处，
+> 都是在依赖"宿主今天恰好长这样"。宿主的装载器（loader）某天换了实现、改了内部模块布局，
+> 你这条 import 就断了 —— 而且断在用户机器上，不在你的测试里。
+
+`packages/dsh-vscode-kit/src/index.js:5` 的注释说得更直白：
+
+> 零依赖：不 import '@deepseek-ai/cordis'。服务用 `ctx.provide(name, 普通对象)` 注册……
+
+也就是说：插件系统需要的能力（`provide` / `inject` / `effect`），**用普通对象和约定就能拿到**，
+根本不需要 import 框架本体。第 4 课的内容正好是这条规则的落地方式。
+
+> 判断标准：**"能 import 到"不等于"可以 import"。** 公开 API 和内部实现的区别，
+> 往往要等宿主升级那天才显形 —— 那时候已经晚了。
+
+## 6.5 收口：耦合点的数量决定改动成本
+
+把前五节压成一句可迁移的判断：
+
+> **一个系统加功能有多贵，等于"这件事要穿过几个耦合点"。**
+> 所以好的设计不是"没有耦合"，而是**把耦合点集中到最少、最稳定的那一层。**
+
+本项目正是这么分的：
+
+| 层 | 加一个能力要改吗 | 为什么 |
+|---|---|---|
+| 协议层（`protocol.js` / `server.js`） | ❌ **不动** | 消息的形状（JSON-RPC、id、分帧、错误码）跟具体能力无关 |
+| 发现 / 连接（`discovery.js` / `connector.js`） | ❌ 不动 | 它们只管"找到并连上"，不管连上之后干什么 |
+| 能力层（`capabilities.js`） | ✅ **改这里** | "打开文件""读选区"这些事本来就只有这一层知道 |
+| 糖衣（`src/index.js` 的 `facade`） | ✅ 加一行转发 | 让消费者能通过服务对象调到新能力 |
+
+`AGENTS.md` 把这件事写成"**加新能力的三步**"：
+
+1. `packages/dsh-kit-bridge/src/capabilities.js` 加 `CAPABILITIES` 条目 + handler
+   （不加 `import 'vscode'`，走 `host` 注入）；
+2. `packages/dsh-vscode-kit/src/index.js` 的 `facade.vscode` 加一行转发；
+3. 两侧各加单测、跑 E2E、真机验一次。
+
+**协议层 `protocol.js` / `server.js` 不需要改。** 原文还有一句更硬的：
+**"要改说明能力设计有问题。"**
+
+这句话的意思是：如果加能力时你发现"得动消息格式"，那不是能力的问题，是**抽象层次划错了**。
+这时候正确的动作是回头改设计，而不是在协议里打补丁 —— 因为协议一改，所有消费者都得跟着改，
+改动成本就从"2 个文件"变成"无穷"。
+
+### 一个看得见的例子
+
+`vscode.diff` 这个能力本项目**没实现**。但系统对它不是"崩掉"，而是**结构化地拒绝**。
+E2E 实测里就有这一条（第 5 课贴过，这里再看一眼它的含义）：
+
+```
+PASS 未实现能力回 -32005 — {"code":-32005,"message":"editor does not advertise capability for \"vscode.diff\""}
+```
+
+消费者拿到的不是一个空值、不是 `undefined`，而是：**"这个编辑器没声明支持这个能力"**。
+它可以选择降级（比如改成 `openFile` 打开其中一个文件），也可以明确告诉用户"做不到"。
+
+> 判断标准：**"做不到"也要分层说清是哪一种做不到。**
+> 是协议不认识这个方法（bug）？还是对端不支持这个能力（可以降级）？两种走的路完全不同。
+
+### 顺带看三个包的测试（现跑）
+
+```
+$ cd packages/dsh-vscode-kit && node --test "test/*.test.js"
+ℹ tests 56      ℹ pass 56      ℹ fail 0
+
+$ cd packages/dsh-kit-bridge && node --test "test/*.test.js"
+ℹ tests 23      ℹ pass 23      ℹ fail 0
+
+$ cd packages/dsh-kit-demo && node --test "test/*.test.js"
+ℹ tests 7       ℹ pass 7       ℹ fail 0
+```
+
+三个包各自独立可测：协议库不用起扩展，扩展不用起 VS Code，消费者不用起 DSH。
+**能各自独立测试，是"分层划对了"最实际的证据。**
+
+## 6.6 本课要带走的几句话（以及全课收口）
+
+> 1. **四段式链路**：消费者 → 协议库 → loopback TCP → 薄扩展 → 官方 API。
+>    每一段都**不知道**下一段的实现细节，只共享一份协议。
+> 2. **"零耦合"不是"没有关系"，是"只共享契约"**：消费者知道 `vscode.openFile` 这个方法名（契约），
+>    但不知道端口、token、发现文件（实现）。前者随便改实现都不用动它。
+> 3. **协议库零依赖、不 import `@deepseek-ai/*`**：那些是宿主内部实现，能跑不代表能用，
+>    宿主升级就断。
+> 4. **加能力只改能力层 + 一行转发，协议层不动。** 要动协议层 = 抽象划错了。
+> 5. **判断规则（可迁移）**：**耦合点的数量决定改动成本。**
+>    设计时先问"这件事要穿过几个耦合点"，再问"能不能把耦合点挪到更稳的那一层"。
+
+### 一句话总结（整门课）
+
+> **两个进程要合作，就得有人当中间人；中间人要好用，就得把"我知道的"压到最少 ——
+> 少到只剩一份协议，少到加一个功能不用惊动任何人。**
+
+## 第 6 课练习题
+
+> **问 1：`grep -rin "port" packages/dsh-kit-demo/` 会命中好几行，但为什么它们不算"耦合"？
+> 那到底什么才算耦合？**
+
+提示：想两件事 —— ① `import` 这个词里面藏着哪三个字母；② "耦合"耦合的是代码字面，
+还是"对别人实现的知识和假设"。
+
+> **问 2：明天要加一个 `vscode.diff` 能力。按"加新能力的三步"，你需要改哪几个文件？
+> 哪些文件**不该**动？如果发现必须动协议层，说明什么？**
+
+提示：正文 6.5 有那张四层的表；另外注意"改动成本"是从哪一步开始变贵的。
