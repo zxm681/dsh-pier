@@ -48,14 +48,14 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
 ## 验证门槛（声称完成前必须全绿）
 
 ```bash
-cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 80
+cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 100
 cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 32
 cd packages/dsh-kit-demo   && node --test "test/*.test.js"   # 7
 cd packages/dsh-kit-bridge && node scripts/e2e.mjs           # 13
 ```
 
 条数是**实跑的 `pass` 计数**（2026-10-22 复跑；四条全绿），不是历史快照 —— 加测试就得回来改这几行。
-其中 kit 的 80 含工作树里尚未提交的 N1 广播门回归；兼容门那个提交（`2fbd6b9`）当时代码是 74。
+kit 的 100 里含 `-32009` 响应校验的 20 条（`test/response-contract.test.js`）；不含它时的基线是 80。
 
 涉及真实宿主语义的改动（服务注册、配置监听、VSCode API 调用）**必须真机验证**，
 单测和 E2E 都用假宿主，证明不了那半边。步骤见 `docs/phase6-验收报告.md` §6。
