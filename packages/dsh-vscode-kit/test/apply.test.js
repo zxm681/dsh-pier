@@ -126,6 +126,13 @@ test('端到端：apply → 服务注册 → 假编辑器连上 → 消费者 vs
   assert.equal(hello.method, 'bridge.hello')
   assert.equal(hello.params.protocolVersion, 1)
 
+  // 1b) 编辑器回报身份**必须带 protocolVersion**（契约 §4.1：版本门只认 hello 里的 ptv，
+  //     缺它就等于「未知版本」→ 业务能力一律 -32008，见 test/compat-gate.test.js）。
+  await editor.link.request('bridge.hello', {
+    client: 'fake-editor', extensionVersion: '0.1.0',
+    protocolVersion: 1, capabilities: ['vscode.getSelection'],
+  })
+
   // 2) 编辑器 → DSH 方向：bridge.ping 由 handleInbound 应答
   const pong = await editor.link.request('bridge.ping', { x: 1 })
   assert.equal(pong.pong, true)
@@ -139,10 +146,8 @@ test('端到端：apply → 服务注册 → 假编辑器连上 → 消费者 vs
   const sel2 = await svc.vscode.getSelection()
   assert.deepEqual(sel2, sel)
 
-  // 5) 编辑器报身份 → lastEditor 记录（能力降级判据）
-  await editor.link.request('bridge.hello', {
-    client: 'fake-editor', extensionVersion: '0.1.0', capabilities: ['vscode.getSelection'],
-  })
+  // 5) 编辑器报身份 → lastEditor 记录（兼容判据 + 能力降级判据）
+  await announce(editor)
   assert.equal(handle.kit.lastEditor.client, 'fake-editor')
 
   // 6) 能力未声明的方法 → -32005（不崩溃，结构化降级）
@@ -229,6 +234,19 @@ async function withKit(editorTexts) {
   return { svc, server, handle, editors, cleanup }
 }
 
+/**
+ * 让假编辑器「报身份」：带协议版本 + 能力清单。
+ *
+ * 兼容门（契约 §4.1）只认 hello 里的 `protocolVersion`：不报 = 未知版本 = 业务能力
+ * 一律 -32008。所以凡是要发 `vscode.*` 的用例都得先 announce。
+ * 刻意不放进 withKit —— 报身份会顺带完成准入，会打乱「准入顺序」类用例的前置条件。
+ */
+async function announce(editor, { ptv = 1, capabilities = ['vscode.getSelection'] } = {}) {
+  const params = { client: 'fake-editor', extensionVersion: '0.1.0', capabilities }
+  if (ptv !== undefined) params.protocolVersion = ptv
+  return editor.link.request('bridge.hello', params)
+}
+
 test('★回归（R1）：A/B 逆序准入时目标仍是后连接的 B（按连接先后）', async () => {
   const { svc, server, handle, editors, cleanup } = await withKit(['FROM-A', 'FROM-B'])
   const [a, b] = editors
@@ -245,6 +263,11 @@ test('★回归（R1）：A/B 逆序准入时目标仍是后连接的 B（按连
     assert.equal(handle.kit._activeLink(), b.serverLink,
       '目标必须是最后连接的 B，不是最后准入的 A')
 
+    // 过版本门：两条连接都报 v1（契约 §4.1）。放在准入断言之后，
+    // 免得报身份顺带完成准入、破坏上面「逆序准入」的前置条件。
+    await announce(a)
+    await announce(b)
+
     // 行为断言：请求真的落到 B，而不只是内部引用相等。
     const sel = await svc.request('vscode.getSelection', {}, { waitForEditor: false })
     assert.equal(sel.text, 'FROM-B', 'vscode.* 请求必须送到最后连接的编辑器')
@@ -259,6 +282,7 @@ test('★回归（R1）：当前目标断开后回退到次新连接（仍按连
   try {
     // 三条全准入，顺序无所谓：目标只认 connSeq。
     for (const e of [c, a, b]) await e.link.request('bridge.ping', {})
+    for (const e of [c, a, b]) await announce(e) // 过版本门（都声明 v1）
     assert.equal(handle.kit._activeLink(), c.serverLink, '目标应是最后连接的 C')
     assert.equal((await svc.request('vscode.getSelection', {}, { waitForEditor: false })).text, 'FROM-C')
 
@@ -366,6 +390,10 @@ test('安全回归：真编辑器准入后抢位失败（active 位只认 token 
   })
   await editor.link.request('bridge.ping', {})
   assert.equal([...handle.kit.server.links][0].authorized, true, 'token 通过即准入')
+  // 报身份带协议版本：否则兼容门按「未知版本」拒绝，这条用例要验的是抢位不是版本门。
+  await editor.link.request('bridge.hello', {
+    client: 'real-editor', extensionVersion: '0.1.0', protocolVersion: 1, capabilities: [],
+  })
 
   // 2) 攻击者随后裸连 —— 它是「最后连上的」，但没准入
   const attacker = createConnection({ port: handle.kit.server.port, host: '127.0.0.1' })

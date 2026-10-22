@@ -12,7 +12,9 @@
  */
 
 import { startBridgeServer, listLiveBridges, discoveryDir, resolveDshHome } from './server.js'
-import { BridgeError, ERR, PROTOCOL_VERSION, hasCapability } from './protocol.js'
+import {
+  BridgeError, ERR, PROTOCOL_VERSION, SUPPORTED_PROTOCOL, hasCapability, judgeProtocolVersion,
+} from './protocol.js'
 
 /** cordis 插件名，必须与 package.json 的 name 一致。 */
 export const name = 'dsh-vscode-kit'
@@ -32,22 +34,36 @@ const INBOUND_CAPABILITIES = ['bridge.ping']
 const DEFAULT_CONNECT_WAIT_MS = 3_000
 
 /**
+ * 默认等待对端 hello（拿协议版本）的时间。
+ *
+ * hello 之前没有对端版本 —— 契约 §4.1 ① 第 3 行 + §7 #3 要求「未知版本保守处理」，
+ * 即不得推断成 v1。所以先等一小段（扩展连上后立刻会报 hello），等不到就 fail-closed。
+ */
+const DEFAULT_HELLO_WAIT_MS = 1_000
+
+/**
  * 消费者拿到的服务对象。
  *
  * 只暴露两个入口：request（万能）与 vscode（糖衣）。其余字段以 `_` 前缀标为内部，
  * 消费者插件不该碰，但排障时可读。
  */
 class VscodeKit {
-  constructor({ server, dshVersion, connectWaitMs, onLog }) {
+  constructor({ server, dshVersion, connectWaitMs, helloWaitMs, onLog }) {
     this.server = server
     this.dshVersion = dshVersion
     this.connectWaitMs = connectWaitMs
+    this.helloWaitMs = helloWaitMs ?? DEFAULT_HELLO_WAIT_MS
     this.onLog = onLog
 
-    /** 最近一次收到 hello 的编辑器信息（诊断用，也是「有没有编辑器在」的判据）。 */
-    this.lastEditor = null
+    // 这里**故意没有** lastEditor 槽：对端身份（协议版本 / 能力清单）挂在
+    // 「这条连接」自己身上（`link.editor`，由 protocol.js 的 `ctx.link` 落位），
+    // `lastEditor` 只是读当前目标连接那一份的只读视图。
+    // 双源是评审 F1 的根因：全局槽记「最后一次 hello」，而目标按 connSeq 挑，
+    // 目标切换/交错时两者不是同一条连接 → 门拿 A 的背书放行了 B 的包。
     /** 等待连接时的等待者队列。 */
     this.waiters = new Set()
+    /** 等对端 hello（拿协议版本）的等待者队列。 */
+    this.helloWaiters = new Set()
 
     // 糖衣方法族。新增能力只在这里加一行，协议层不改。
     // 注意两个参数都要往下传：早期写成 `openFile: (params) => this.request(m, params)`
@@ -86,10 +102,24 @@ class VscodeKit {
       // 活连接才可当目标：socket 已销毁但 'close' 事件还没派发的那一下不选它，
       // 否则请求会写进一条死 socket。
       if (link.socket?.destroyed) continue
+      // 协议层已关掉的连接同理（评审 F1 回归 ②：目标窗口关掉后必须回退到**另一条**，
+      // 而不是继续选它；connSeq 更大的死连接会被跳过）。
+      if (link.closed === true) continue
       best = link
       bestSeq = seq
     }
     return best
+  }
+
+  /**
+   * 当前目标连接上报的身份（诊断用）。**只是视图，不是事实源**。
+   *
+   * 事实源只有一处：目标连接自己的 `link.editor`（由 hello 写入、随连接回收）。
+   * 所以 `kit.lastEditor` 与兼容门读的必然是同一份 —— 这正是 F1 要求的「同源读法」。
+   * @returns {object|null} 目标连接没报过 hello（或没有目标）时为 null
+   */
+  get lastEditor() {
+    return this._activeLink()?.editor ?? null
   }
 
   /** 内部：等编辑器连上，最多等 waitMs；超时返回 null。 */
@@ -118,13 +148,116 @@ class VscodeKit {
   }
 
   /**
+   * 内部：某条连接报了自己的 hello（协议版本）时唤醒等待者。
+   *
+   * 只唤醒等**这条连接**的等待者（`_waitForHello(link, …)` 里的 waiter 会比对 link）——
+   * 别的连接的 hello 不得给它的等待者「解围」，那正是 F1 的 fail-open 入口。
+   */
+  _notifyHello(link) {
+    for (const waiter of [...this.helloWaiters]) waiter(link ?? null)
+  }
+
+  /**
+   * 内部：等**指定连接**的 hello（协议版本）到达。
+   *
+   * hello 之前没有对端版本 = 契约里的「未知版本」，不得推断为 v1
+   * （§4.1 ① 第 3 行、§7 #3「hello 前必须按未知版本保守处理」）。
+   *
+   * ★ 评审 F1：以前是「等任意一条连接的 hello」（读全局槽 `this.lastEditor`），
+   *   多窗口时 A 的 hello 会给 B 的目标位背书。现在只认传进来的这条。
+   *
+   * @param {object|null} link 目标连接
+   * @param {number} waitMs 上限
+   * @returns {Promise<boolean>} 该连接是否在时限内报过 hello
+   */
+  _waitForHello(link, waitMs) {
+    if (!link) return Promise.resolve(false)
+    if (link.editor) return Promise.resolve(true)
+    if (!(waitMs > 0)) return Promise.resolve(false)
+    return new Promise((resolve) => {
+      const finish = (ok) => {
+        clearTimeout(timer)
+        this.helloWaiters.delete(waiter)
+        resolve(ok)
+      }
+      const timer = setTimeout(() => finish(false), waitMs)
+      if (typeof timer.unref === 'function') timer.unref()
+      const waiter = (who) => {
+        if (who === link) finish(true)
+      }
+      this.helloWaiters.add(waiter)
+    })
+  }
+
+  /**
+   * 协议兼容门（契约 §4.1 ②：「DSH 侧 kit = 权威判定层」）。
+   *
+   * 判定表见 `judgeProtocolVersion`：整数且落在 `SUPPORTED_PROTOCOL` 区间内才放行；
+   * 整数越界 / 缺失 / 非整数 / 非数字一律按**不兼容**处理（不得推断为 v1）。
+   * 必须跑在能力预检**之前**、发包**之前** —— 不兼容时一个业务方法都不执行，
+   * 连「旧方法」也不放行（§4.1 硬规则 + 「先过门、再谈降级」）。
+   *
+   * 豁免 `bridge.*` 协议层方法（ping/hello）：它们不是业务能力，不受版本门约束 ——
+   * 否则版本不兼容时连「问一句对方是几版」都做不到。业务能力（`vscode.*`）没有豁免。
+   *
+   * @throws {BridgeError} -32008，data = { required:{min,max}, peer, peerType, reason, helloReceived, method, side:'dsh' }
+   * @param {string} method
+   * @param {object|null} [link] 判定与发包必须是**同一条连接**；省略时取当前目标
+   */
+  _assertProtocolCompatible(method, link) {
+    if (typeof method === 'string' && method.startsWith('bridge.')) return
+    // ★ 评审 F1：判据只取这一条连接自己上报的版本（`link.editor`），不再有全局槽。
+    //   调用方（request/notify）已经选好了 link 并会用它发包，所以「判的」=「发的」。
+    const target = link ?? this._activeLink()
+    const editor = target?.editor ?? null
+    const verdict = judgeProtocolVersion(editor ? editor.protocolVersion : undefined)
+    if (verdict.compatible) return
+
+    const [min, max] = SUPPORTED_PROTOCOL
+    throw new BridgeError(
+      ERR.PROTOCOL_INCOMPATIBLE,
+      `protocol version incompatible: peer protocolVersion is ${verdict.reason}`
+        + ` (supported ${min}..${max}); refusing to send "${method}"`,
+      {
+        required: { min, max },
+        peer: verdict.peer,
+        peerType: verdict.peerType,
+        reason: verdict.reason,
+        helloReceived: editor !== null,
+        method,
+        side: 'dsh',
+      },
+    )
+  }
+
+  /**
+   * 能力降级预检（协议 §7）：只认**这条连接**在 hello 里声明的能力清单。
+   *
+   * 空清单 / 未声明 = 不预检（旧扩展不报 capabilities，不能因此全拒）。
+   * `bridge.*` 与入站能力族不受约束（前者是协议层，后者是编辑器发给我们调的）。
+   *
+   * @throws {BridgeError} -32005 不支持
+   */
+  _assertCapability(method, link) {
+    if (typeof method === 'string' && method.startsWith('bridge.')) return
+    const caps = (link ?? this._activeLink())?.editor?.capabilities
+    if (Array.isArray(caps) && caps.length > 0 && !hasCapability(caps, method)
+        && !INBOUND_CAPABILITIES.includes(method)) {
+      throw new BridgeError(ERR.UNSUPPORTED,
+        `editor does not advertise capability for "${method}"`,
+        { method, capabilities: caps })
+    }
+  }
+
+  /**
    * 发起一次桥接请求。
    *
    * @param {string} method 形如 'vscode.openFile'，方法名即能力命名空间。
    * @param {object} [params]
    * @param {{timeoutMs?: number, waitForEditor?: boolean}} [opts]
    * @returns {Promise<any>}
-   * @throws {BridgeError} -32001 未授权 / -32003 不存在 / -32004 超时 / -32005 不支持 / -32007 未连接
+   * @throws {BridgeError} -32001 未授权 / -32003 不存在 / -32004 超时 / -32005 不支持
+   *   / -32007 未连接 / -32008 协议版本不兼容（契约 §4.1，发包前就拒）
    */
   async request(method, params = {}, opts = {}) {
     if (typeof method !== 'string' || method === '') {
@@ -143,40 +276,63 @@ class VscodeKit {
       )
     }
 
-    // 能力降级：编辑器在 hello 里声明的能力清单决定能不能发（协议 §7）。
-    const caps = this.lastEditor?.capabilities
-    if (Array.isArray(caps) && caps.length > 0 && !hasCapability(caps, method)
-        && !INBOUND_CAPABILITIES.includes(method) && !method.startsWith('bridge.')) {
-      throw new BridgeError(ERR.UNSUPPORTED,
-        `editor does not advertise capability for "${method}"`,
-        { method, capabilities: caps })
+    // ── 协议兼容门（契约 §4.1 ②）：跑在能力预检之前、发包之前 ──
+    // hello 之前没有对端版本，属于「未知版本」：先等一小段（扩展连上后立刻报 hello），
+    // 等不到就按不兼容处理 —— 绝不把「还没报」推断成 v1。
+    // ★ 评审 F1：等的是**这条连接**的 hello，判的也是这条连接，发还是这条连接。
+    //   以前读全局槽，A 的 hello 会给 B 的目标位背书（探针 B/D 实测 fail-open）。
+    if (!link.editor && waitForEditor && this.helloWaitMs > 0) {
+      await this._waitForHello(link, Math.min(this.helloWaitMs, waitMs))
     }
+    this._assertProtocolCompatible(method, link)
+    this._assertCapability(method, link)
 
-    try {
-      return await link.request(method, params, opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : undefined)
-    } catch (err) {
-      // 连接断了：清掉 lastEditor，让后续请求重新等连接
-      if (err?.code === ERR.DISCONNECTED) this.lastEditor = null
-      throw err
-    }
+    // 断线不清任何「版本槽」：版本事实挂在连接上，连接没了自然失效。
+    // （旧实现这里清全局 lastEditor，会导致下一条连接继承/丢失判定，见 F1。）
+    return link.request(method, params, opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : undefined)
   }
 
-  /** 单向通知（不等待响应）。 */
+  /**
+   * 单向通知（不等待响应）。
+   *
+   * ★ 评审 F2：业务方法同样过版本门 + 能力预检 —— 单向不等于可以绕过判定，
+   *   否则不兼容对端照样收到业务帧（探针 C：notify 业务方法 threw=null、对端增量 1）。
+   *   `bridge.*` 继续豁免（协商通道不能被自己堵死，见上一轮裁决）。
+   *   不改成 request：那会把「发了就算」变成「等回执」，改变语义与阻塞行为；
+   *   判定失败时抛错，错误契约与 request 一致。
+   */
   notify(method, params = {}) {
+    if (typeof method !== 'string' || method === '') {
+      throw new BridgeError(ERR.INVALID_PARAMS, 'method must be a non-empty string')
+    }
     const link = this._activeLink()
     if (!link) throw new BridgeError(ERR.DISCONNECTED, 'no editor connected', { method })
+    this._assertProtocolCompatible(method, link)
+    this._assertCapability(method, link)
     link.notify(method, params)
   }
 
-  /** 诊断快照：排障时打印用，不属于稳定 API。 */
+  /**
+   * 诊断快照：排障时打印用，不属于稳定 API。
+   *
+   * `protocolCompatible` / `lastEditor` 与兼容门**同源**：都从当前目标连接的
+   * `link.editor` 取（评审 F1：snapshot 不得另算一份）。
+   */
   snapshot() {
+    const editor = this.lastEditor
     return {
       port: this.server.port,
       pid: process.pid,
       dshVersion: this.dshVersion,
       protocolVersion: PROTOCOL_VERSION,
+      // 兼容区间（契约 §4.1 ①）与对端判定结果都放进诊断快照：
+      // snapshot 不属于稳定 API，增删字段不算破坏性变更。
+      supportedProtocol: SUPPORTED_PROTOCOL,
+      protocolCompatible: editor ? editor.protocolCompatible : false,
+      // 没有目标 / 目标没报 hello 时给出原因，排障不用猜（与评审 F4 同精神）。
+      protocolReason: editor ? editor.protocolReason : 'no-target',
       connections: this.server.links.size,
-      lastEditor: this.lastEditor,
+      lastEditor: editor,
       discoveryPath: this.server.discoveryPath,
     }
   }
@@ -190,6 +346,7 @@ class VscodeKit {
  * @param {number[]} [config.portRange]  默认 [7410, 7419]
  * @param {string}   [config.dshHome]    覆盖 DSH_HOME（测试用）
  * @param {number}   [config.connectWaitMs] 请求前等编辑器连接的时长，默认 3000
+ * @param {number}   [config.helloWaitMs]   请求前等对端 hello（协议版本）的时长，默认 1000
  * @param {boolean}  [config.enabled]    置 false 则只注册服务不监听（便于排障）
  * @param {(level: string, msg: string, extra?: any) => void} [config.onLog]
  */
@@ -198,6 +355,7 @@ export function apply(ctx, config = {}) {
     portRange,
     dshHome,
     connectWaitMs = DEFAULT_CONNECT_WAIT_MS,
+    helloWaitMs = DEFAULT_HELLO_WAIT_MS,
     enabled = true,
     onLog,
   } = config ?? {}
@@ -331,6 +489,10 @@ export function apply(ctx, config = {}) {
             return
           }
           log('info', 'editor authorized (token accepted)')
+          // ★ 新准入对端 = 新身份：上一轮 hello 的版本/能力不得为它背书（契约 §4.1）。
+          //   这一步现在是**结构上自动成立**的：身份挂在连接自己身上（`link.editor`），
+          //   新连接生来没有 hello 记录，不需要（也不再允许）去清一个全局槽。
+          //   （旧实现是 `kit.lastEditor = null`，那正是评审 F1 的双源。）
           kit._notifyConnected(link)
         },
       })
@@ -339,6 +501,7 @@ export function apply(ctx, config = {}) {
         server,
         dshVersion: readDshVersion(),
         connectWaitMs,
+        helloWaitMs,
         onLog: log,
       })
 
@@ -371,18 +534,44 @@ export function apply(ctx, config = {}) {
     switch (method) {
       case 'bridge.ping':
         return { pong: true, at: Date.now(), echo: params }
-      case 'bridge.hello':
+      case 'bridge.hello': {
         // 编辑器主动报身份（本协议服务端先发 hello，这里兜住对端也发的情况）。
-        // 记录编辑器的能力清单——request() 的能力降级判据。
+        // 记录**协议版本**与能力清单：版本是 §4.1 兼容门的唯一判据（只认 hello 携带的 ptv），
+        // 能力清单是能力预检的判据。
         if (kit && params && typeof params === 'object') {
-          kit.lastEditor = {
+          // 「没有这个字段」和「有字段但值非法」必须能分开 —— 前者绝不补成 1。
+          const present = Object.prototype.hasOwnProperty.call(params, 'protocolVersion')
+          const ptv = present ? params.protocolVersion : undefined
+          const verdict = judgeProtocolVersion(ptv)
+          const editor = {
             client: params.client ?? 'unknown',
             extensionVersion: params.extensionVersion ?? null,
+            protocolVersion: ptv,
+            protocolVersionPresent: present,
+            protocolCompatible: verdict.compatible,
+            protocolReason: verdict.reason,
             capabilities: Array.isArray(params.capabilities) ? params.capabilities : [],
             seenAt: Date.now(),
           }
+          // ★ 评审 F1：写在**这条连接**身上（`ctx.link`，protocol.js 提供），
+          //   不再写全局槽。这样「谁报的 hello」与「包发给谁」永远是同一条连接。
+          if (msgCtx?.link) {
+            msgCtx.link.editor = editor
+            kit._notifyHello(msgCtx.link)
+          } else {
+            // 理论上到不了：协议层给每次分派都带 ctx.link。真到了就 fail-closed ——
+            // 不记身份等于「这条连接版本未知」，业务方法会被门拒，不会误放行。
+            log('warn', 'bridge.hello without link context; peer identity not recorded '
+              + '(business calls will fail-closed with -32008)')
+          }
+          if (!verdict.compatible) {
+            log('warn', `editor protocol incompatible (${verdict.reason}: `
+              + `ptv=${JSON.stringify(verdict.peer)} present=${present}); `
+              + 'business capabilities fail-closed with -32008')
+          }
         }
         return { ok: true, protocolVersion: PROTOCOL_VERSION, dshVersion: readDshVersion() }
+      }
       default:
         throw new BridgeError(ERR.METHOD_NOT_FOUND, `unsupported inbound method "${method}"`,
           { method })
@@ -452,18 +641,15 @@ function readDshVersion() {
   return process.env.DSH_VERSION || 'unknown'
 }
 
-/**
- * 编辑器连上时由 server 回调（server.js 里调用）。
- * 单独导出便于单测直接触发。
- */
-export function onEditorConnected(kit, link) {
-  if (!kit) return
-  // hello 已在 server.onConnected 里发出；这里只记录身份与唤醒等待者。
-  kit._notifyConnected(link)
-}
+// 注：曾有 `export function onEditorConnected(kit, link)` —— 全仓零调用方的死代码，
+// 且它维护的是已删除的全局 lastEditor 槽（评审 F5）。与会话状态有关的两件事现在各有
+// 明确归属：唤醒等待者由 `apply()` 的 onAuthorized / replayPendingAuthorized 做，
+// 对端身份由 hello 写到 `link.editor`。删掉不影响任何消费者（无导入点、无文档引用）。
 
 export { VscodeKit }
-export { BridgeError, ERR, PROTOCOL_VERSION, hasCapability } from './protocol.js'
+export {
+  BridgeError, ERR, PROTOCOL_VERSION, SUPPORTED_PROTOCOL, hasCapability,
+} from './protocol.js'
 export {
   startBridgeServer, listLiveBridges, discoveryDir, resolveDshHome,
   writeDiscoveryFile, sweepDiscoveryDir, isProcessAlive, DEFAULT_PORT_RANGE,

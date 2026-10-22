@@ -13,7 +13,8 @@
 import { createConnection } from 'node:net'
 
 import {
-  BridgeError, ERR, PROTOCOL_VERSION, connect, createLineSplitter,
+  BridgeError, ERR, PROTOCOL_VERSION, SUPPORTED_PROTOCOL, connect, createLineSplitter,
+  judgeProtocolVersion,
 } from '../../dsh-vscode-kit/src/protocol.js'
 import { discoveryDir, listLiveBridges } from '../../dsh-vscode-kit/src/discovery.js'
 import { CAPABILITIES } from './capabilities.js'
@@ -52,7 +53,9 @@ export function createConnector(deps) {
   const inbound = {
     'bridge.ping': (params) => ({ pong: true, at: Date.now(), echo: params }),
     'bridge.hello': (params) => {
-      // DSH 侧极少主动 hello（协议约定由 DSH 先发），但兜住：对端若发，回自己的身份。
+      // DSH 连上后主动 hello（协议 §3.4：每条连接的第一条消息由服务端下发）。
+      // 扩展侧在这里做**对等自检**（契约 §4.1 ②）：判 DSH 的 ptv，不兼容就地降级。
+      recordPeerHello(params)
       return {
         ok: true,
         client: CLIENT_ID,
@@ -75,6 +78,82 @@ export function createConnector(deps) {
   /** 已自动重连的次数（诊断用） */
   let attempts = 0
 
+  /**
+   * 对端（DSH）协议版本协商结果 —— 扩展侧对等自检层（契约 §4.1 ②）。
+   *
+   * 状态：`pending`（还没收到 DSH 的 hello，版本未知）→ `compatible` / `incompatible`。
+   * 只有 `compatible` 才允许执行业务能力：未知与不兼容一律 fail-closed（-32008）。
+   * @type {{status: 'pending'|'compatible'|'incompatible',
+   *         protocolVersion: unknown, present: boolean, reason: string,
+   *         echo: number|string|boolean|null, peerType: string,
+   *         client?: string, seenAt?: number}}
+   */
+  let peer = pendingPeer()
+
+  function pendingPeer() {
+    return {
+      status: 'pending', protocolVersion: undefined, present: false,
+      reason: 'awaiting-hello', echo: null, peerType: 'undefined',
+    }
+  }
+
+  /**
+   * 构造 `-32008 protocol-incompatible`（契约 §4.1 ③ 的 data 形状，side 固定 'extension'）。
+   * @param {string} [method] 业务方法名；hello 阶段没有方法名就不带（契约里 method? 是可选的）。
+   */
+  function incompatibleError(method) {
+    const [min, max] = SUPPORTED_PROTOCOL
+    return new BridgeError(
+      ERR.PROTOCOL_INCOMPATIBLE,
+      `protocol version incompatible: peer protocolVersion is ${peer.reason}`
+        + ` (supported ${min}..${max}); business capabilities fail-closed`,
+      {
+        required: { min, max },
+        peer: peer.echo,
+        peerType: peer.peerType,
+        reason: peer.reason,
+        helloReceived: peer.status !== 'pending',
+        ...(method === undefined ? {} : { method }),
+        side: 'extension',
+      },
+    )
+  }
+
+  /**
+   * 就地判定 DSH 的 hello（对等自检）。不兼容时**不得**再呈现为可用：
+   * 旧写法只 log 一句、状态仍是 ready —— 那正是契约点名的隐患（「ready 不代表兼容」）。
+   */
+  function recordPeerHello(params) {
+    const hasPtv = !!params && typeof params === 'object'
+      && Object.prototype.hasOwnProperty.call(params, 'protocolVersion')
+    const ptv = hasPtv ? params.protocolVersion : undefined
+    const verdict = judgeProtocolVersion(ptv)
+    peer = {
+      status: verdict.compatible ? 'compatible' : 'incompatible',
+      protocolVersion: ptv,
+      present: hasPtv,
+      reason: verdict.reason,
+      echo: verdict.peer,
+      peerType: verdict.peerType,
+      client: (params && params.client) || 'unknown',
+      seenAt: Date.now(),
+    }
+    if (verdict.compatible) return
+
+    const err = incompatibleError()
+    // ★ 评审 F4：状态里补 `reason` —— 状态栏原来是 `s.reason ?? '无'`，不给就显示
+    //   「原因 无」，排障时等于没信息。这里与 hello 判定的 reason 同源（'missing' /
+    //   'out-of-range' / 'not-a-number' …），不是另起一套词表。
+    setState('incompatible', {
+      port: state.port, pid: state.pid, dshVersion: state.dshVersion,
+      reason: verdict.reason,
+      error: { code: err.code, message: err.message, data: err.data },
+    })
+    log(`protocol-incompatible: DSH protocolVersion is ${verdict.reason}`
+      + ` (ptv=${JSON.stringify(verdict.peer)}, present=${hasPtv},`
+      + ` supported ${SUPPORTED_PROTOCOL.join('..')}); business capabilities disabled`, 'warn')
+  }
+
   function setState(next, patch = {}) {
     state = { state: next, since: Date.now(), ...patch }
     try { onStateChange(state) } catch { /* 观测点异常不许影响连接 */ }
@@ -90,6 +169,14 @@ export function createConnector(deps) {
   function handleInbound(method, params, ctx) {
     const fn = inbound[method]
     if (fn) return fn(params)
+    // ★ 协议兼容门（契约 §4.1 硬规则）：版本未知/不兼容时**不得执行任何业务能力**。
+    //   ★ 评审 F3：这一层必须跑在 `onRequest` 注入点**之前** —— 注入点可以把任意业务
+    //   方法接走（`custom !== undefined` 直接 return），门若在它后面，将来往注入点挂
+    //   业务方法就绕过了判定。此时既不能执行，也不能把原因说成 -32005（方法缺失）。
+    //   协议层方法（bridge.*）豁免：否则连「问对方是几版」都做不到。
+    if (!String(method).startsWith('bridge.') && peer.status !== 'compatible') {
+      throw incompatibleError(method)
+    }
     if (onRequest) {
       const custom = onRequest(method, params, ctx)
       if (custom !== undefined) return custom
@@ -131,6 +218,8 @@ export function createConnector(deps) {
   /** 接上一条 socket，装配协议终端。 */
   function attach(s, info) {
     socket = s
+    // 新连接 = 新一轮协商：上一轮的版本判定不得为新对端背书。
+    peer = pendingPeer()
     link = connect({
       write: (line) => { if (!s.destroyed && s.writable) s.write(line) },
       onRequest: handleInbound,
@@ -159,6 +248,9 @@ export function createConnector(deps) {
     s.on('error', (err) => { log(`socket: ${err?.message ?? err}`, 'warn') })
     s.unref?.()
 
+    // 注意语义：这里的 ready 只表示「链路通了」，**不代表版本兼容**。
+    // 版本判定要等 DSH 的 hello 到达；不兼容时状态随即被降为 'incompatible'
+    // （见 recordPeerHello），业务能力从此 fail-closed。
     setState('ready', { port: info.port, pid: info.pid, dshVersion: info.dshVersion })
     log(`connected to DSH pid=${info.pid} port=${info.port} dsh=${info.dshVersion ?? 'unknown'}`)
 
@@ -174,7 +266,10 @@ export function createConnector(deps) {
 
   /** 一次轮询：没连上就找最新的实例连；已连上就检查对端是否还活着。 */
   async function tick() {
-    if (stopped || state.state === 'ready' || state.state === 'connecting') return
+    // 'incompatible' 也在此列：连接还在，重连不会让对端升级，只会刷日志。
+    // 真正的恢复点是断线（socket close → idle → 下一轮重连重新协商）。
+    if (stopped || state.state === 'ready' || state.state === 'connecting'
+        || state.state === 'incompatible') return
     const dir = discoveryDir(dshHome)
     const bridges = listLiveBridges(dir)
     if (bridges.length === 0) return
@@ -232,12 +327,19 @@ export function createConnector(deps) {
     },
     get state() { return state },
     get connected() { return state.state === 'ready' },
+    /** 对端版本协商结果（诊断/测试用；不属于协议契约字段）。 */
+    get peer() { return peer },
     get attempts() { return attempts },
     /** 供测试/扩展调用 DSH 侧方法。 */
     request(method, params, opts) {
       if (!link) {
         return Promise.reject(new BridgeError(ERR.DISCONNECTED, 'not connected to DSH',
           { method, reason: 'not-connected' }))
+      }
+      // 出站业务请求同样过门（契约 §4.1：不兼容时一个业务方法都不发）。
+      // bridge.* 豁免：握手本身必须先能发出去，否则版本永远协商不出来。
+      if (!String(method).startsWith('bridge.') && peer.status !== 'compatible') {
+        return Promise.reject(incompatibleError(method))
       }
       return link.request(method, params, opts)
     },

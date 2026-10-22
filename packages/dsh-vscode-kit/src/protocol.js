@@ -24,6 +24,12 @@ export const ERR = Object.freeze({
   UNSUPPORTED: -32005,
   UNTRUSTED_WORKSPACE: -32006,
   DISCONNECTED: -32007,
+  /**
+   * 协议版本不兼容（契约 §4.1）。**新增**码位，不破坏既有契约：
+   * 旧端不会遇到它，它只在兼容门内产生。
+   * 不许拿 -32005（方法缺失）/ -32601（协议层写错）/ -32007（未就绪）代替。
+   */
+  PROTOCOL_INCOMPATIBLE: -32008,
 })
 
 /** 错误码 → 稳定诊断串（日志与测试断言都用它，改动即破坏契约）。 */
@@ -40,10 +46,68 @@ export const ERR_NAME = Object.freeze({
   [ERR.UNSUPPORTED]: 'unsupported',
   [ERR.UNTRUSTED_WORKSPACE]: 'untrusted-workspace',
   [ERR.DISCONNECTED]: 'disconnected',
+  [ERR.PROTOCOL_INCOMPATIBLE]: 'protocol-incompatible',
 })
 
-/** 协议版本。扩展与 DSH 侧双向校验，不匹配即拒绝连接（阶段4 §7）。 */
+/**
+ * 协议版本（本端声明值）。
+ *
+ * 注意：这个常量只是「我这边是第几版」，**不是判据**。能不能和对端通话只看
+ * 对端 hello 携带的 `protocolVersion` 是否落在 `SUPPORTED_PROTOCOL` 区间内（契约 §4.1 ①）。
+ */
 export const PROTOCOL_VERSION = 1
+
+/**
+ * 协议兼容区间 `[min, max]`（契约 §4.1 ①：形状必须是**区间**，不是单值）。
+ *
+ * 今天等于 `[1, 1]`——只认 v1。值由 `PROTOCOL_VERSION` 派生，避免「版本号升了、
+ * 区间忘了改」这种静默不兼容；真要放宽到同时兼容多版，必须在这里显式写区间。
+ */
+export const SUPPORTED_PROTOCOL = Object.freeze([PROTOCOL_VERSION, PROTOCOL_VERSION])
+
+/**
+ * 契约 §4.1 ① 判定表：对端 `ptv`（hello 里的 `protocolVersion`）是否兼容。
+ *
+ * | 对端 ptv | 判定 |
+ * |---|---|
+ * | 整数且 `min ≤ ptv ≤ max` | 放行 |
+ * | 整数但越界 | 不兼容 → fail-closed |
+ * | 缺失 / 非整数 / 非数字 | 不兼容（**不得推断为 v1**） |
+ *
+ * 两侧共用这一份判定（DSH 侧权威判定 + 扩展侧对等自检），避免各写一份之后漂移。
+ *
+ * @param {unknown} peer 对端声明的 protocolVersion（字段缺失时传 undefined）
+ * @returns {{compatible: boolean,
+ *            reason: 'ok'|'missing'|'not-a-number'|'not-an-integer'|'out-of-range',
+ *            peer: number|string|boolean|null,
+ *            peerType: string}}
+ *   `peer` 只回显**原始标量**（NaN / 对象 / 函数统一归一为 null，避免把任意结构塞进
+ *   错误 data —— 那会导致序列化失败或把无关内容发到对端）；
+ *   `peerType` 保留类型信息，用来区分「没有这个字段」与「有字段但值非法」。
+ */
+export function judgeProtocolVersion(peer) {
+  const [min, max] = SUPPORTED_PROTOCOL
+  const peerType = peer === null ? 'null' : typeof peer
+  const echo = (typeof peer === 'number' && Number.isFinite(peer))
+    || typeof peer === 'string'
+    || typeof peer === 'boolean'
+    ? peer
+    : null
+
+  if (peer === undefined || peer === null) {
+    return { compatible: false, reason: 'missing', peer: null, peerType }
+  }
+  if (typeof peer !== 'number' || !Number.isFinite(peer)) {
+    return { compatible: false, reason: 'not-a-number', peer: echo, peerType }
+  }
+  if (!Number.isInteger(peer)) {
+    return { compatible: false, reason: 'not-an-integer', peer: echo, peerType }
+  }
+  if (peer < min || peer > max) {
+    return { compatible: false, reason: 'out-of-range', peer: echo, peerType }
+  }
+  return { compatible: true, reason: 'ok', peer: echo, peerType }
+}
 
 /** 默认请求超时。 */
 export const DEFAULT_TIMEOUT_MS = 30_000
@@ -85,8 +149,11 @@ export class BridgeError extends Error {
  *
  * @param {object} opts
  * @param {(line: string) => void} opts.write 写入一行（不含换行，本类补）
- * @param {(method: string, params: any, ctx: {id: any, token?: string}) => any|Promise<any>} [opts.onRequest]
+ * @param {(method: string, params: any, ctx: {id: any, token?: string, link: object}) => any|Promise<any>} [opts.onRequest]
  *        处理对端发来的请求；抛 BridgeError 会转成 error 响应。
+ *        `ctx.link` 是**这条连接**的终端对象（`connect()` 的返回值本体），
+ *        上层靠它把「对端在这条连接上上报的身份」绑到连接上 —— 多连接时
+ *        判定必须落到「将要收包的那条连接」，不能落在全局槽（评审 F1）。
  * @param {number} [opts.timeoutMs]
  * @param {string} [opts.token] 连接级凭据（协议 §3.3 顶层 token 字段）。**出站附带规则按消息类型区分**：
  *        `request()` **自动附带**（`if (token !== undefined) msg.token = token`，见 request）；
@@ -260,7 +327,10 @@ export function connect(opts) {
       return
     }
 
-    const ctx = { id: msg.id, token: msg.token }
+    // ctx.link 是**这条连接**的终端本体：上层把对端上报的身份（协议版本/能力）
+    // 挂在它上面，判定与收包因此永远是同一条连接。缺了它，上层只能记「最后一次
+    // hello」，多编辑器窗口时会把业务请求发给声明不兼容版本的对端（评审 F1）。
+    const ctx = { id: msg.id, token: msg.token, link: self }
 
     // 鉴权先于一切业务分派（协议 §6.3）。token 不在连接建立时校验，而是每条消息，
     // 这样连接本身不泄露「token 对不对」，且断线重连不必重开 socket。
@@ -319,7 +389,9 @@ export function connect(opts) {
     handleMessage(msg)
   }
 
-  return {
+  // 连接终端本体。先起名再返回，是为了让 handleMessage 能把 ctx.link 指向**这条连接**
+  // ——上层据此把对端身份（协议版本/能力）存成「本连接的属性」，而不是一个全局槽。
+  const self = {
     request,
     notify,
     respond,
@@ -327,6 +399,9 @@ export function connect(opts) {
     handleLine,
     handleMessage,
     close,
+    // 对端身份（协议版本/能力/客户端名），由上层在收到 hello 时写入**这条连接**。
+    // null = 这条连接还没报过 hello。协议层不解释它，只保证「每条连接各有一份」。
+    editor: null,
     get closed() {
       return closed
     },
@@ -334,6 +409,7 @@ export function connect(opts) {
       return pending.size
     },
   }
+  return self
 }
 
 /**
