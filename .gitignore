@@ -8,3 +8,5 @@ work/smoke-target.txt
 work/dshhome-c/
 work/long/
 work/win-*/
+# 判卷临时产物（独立评委的探针脚本、变异备份、一次性夹具，可随时重建，不入库）
+work/t25-*/

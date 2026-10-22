@@ -24,6 +24,12 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
 9. **「测试全绿」不等于「测试在守门」**。每条安全回归都要做一次**变异测试**：故意把 bug 改回去，
    确认测试变红。成本只有一次 sed + 一次跑，却是唯一能区分「测试在守门」和「测试在睡觉」的办法。
    （2026-10-21 踩过：新写的两条洞 3 测试第一版都是假测试，硬编码猜 id、断言变量从不被赋值。）
+10. **写入必须经绑定门**。写类方法的**目标连接由 grant 记录决定**（`grants[session].link` 对象引用），
+    **不许**用「活跃编辑器」（`_activeLink()` 的 argmax）代替 —— 那是读路径的口径，拿它挑写目标
+    等于把授权退化成「谁最后连上就写给谁」。同一份判定只许有一处实现（`grant.js` 的 `judgeGrant`，
+    DSH 发送前与扩展执行前共用），各抄一份必然漂移。另外 **`notify` / `broadcast` 对写入类方法一律
+    拒绝**（`assertWritableNotNotified`）：单向消息没有回执，发送前门判完也证明不了对端存下了，
+    写入只能走 `request`。
 
 ## 动手之前先查先例（用户 2026-10-21 明确要求）
 
@@ -48,14 +54,16 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
 ## 验证门槛（声称完成前必须全绿）
 
 ```bash
-cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 100
-cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 32
+cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 139
+cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 63
 cd packages/dsh-kit-demo   && node --test "test/*.test.js"   # 7
 cd packages/dsh-kit-bridge && node scripts/e2e.mjs           # 13
 ```
 
 条数是**实跑的 `pass` 计数**（2026-10-22 复跑；四条全绿），不是历史快照 —— 加测试就得回来改这几行。
-kit 的 100 里含 `-32009` 响应校验的 20 条（`test/response-contract.test.js`）；不含它时的基线是 80。
+kit 的 139 里含两道新门禁的条目：`-32009` 响应校验 20 条（`test/response-contract.test.js`）、
+写入绑定门与 `vscode.applyEdit` 39 条（`test/editing-grant.test.js`）；bridge 的 63 里含
+`test/apply-edit.test.js` 31 条。扣掉这三组，历史基线是 kit 80 / bridge 32。
 
 涉及真实宿主语义的改动（服务注册、配置监听、VSCode API 调用）**必须真机验证**，
 单测和 E2E 都用假宿主，证明不了那半边。步骤见 `docs/phase6-验收报告.md` §6。

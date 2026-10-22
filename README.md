@@ -48,11 +48,11 @@ VS Code
 
 | 包 | 作用 | 版本 | 测试 |
 |---|---|---|---|
-| `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 100 ✅ |
-| `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.2.0 | 32 ✅ |
+| `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 139 ✅ |
+| `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.2.0 | 63 ✅ |
 | `packages/dsh-kit-demo` | 示例消费者，证明零耦合接入 | 0.1.0 | 7 ✅ |
 
-合计 **139 条单测 + 13 项跨进程 E2E**，全绿。
+合计 **209 条单测 + 13 项跨进程 E2E**，全绿。
 
 ## 快速开始
 
@@ -86,8 +86,8 @@ export function apply(ctx) {
 ## 跑测试
 
 ```bash
-cd packages/dsh-vscode-kit   && node --test "test/*.test.js"   # 100
-cd packages/dsh-kit-bridge   && node --test "test/*.test.js"   # 32
+cd packages/dsh-vscode-kit   && node --test "test/*.test.js"   # 139
+cd packages/dsh-kit-bridge   && node --test "test/*.test.js"   # 63
 cd packages/dsh-kit-demo     && node --test "test/*.test.js"   # 7
 cd packages/dsh-kit-bridge   && node scripts/e2e.mjs           # 13 跨进程
 ```
@@ -106,6 +106,7 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | `vscode.getSelection` | — | `{text, file, start:{line,column}, end, isEmpty}` |
 | `vscode.getDiagnostics` | `{path?, severity?, limit?}` | `{total, files:[{file, diagnostics:[…]}], truncated}` |
 | `vscode.listOpenEditors` | `{limit?}` | `{editors:[{file, isActive, isDirty, languageId?}], total, truncated}` |
+| `vscode.applyEdit` ⚠️写入 | `{file, range:{start,end}, text, grant:{id,epoch}}` | `{applied, file, saved:false, textLength}` —— 必须持 grant，见「写入路径的边界」 |
 
 **坐标约定**：协议对外一律 **1-based**（line/column），只在调用 VS Code API 的边界转 0-based。
 **路径约定**：对外一律 `C:\…` 大写盘符（出口归一化，见经验手册 §4.7）。
@@ -121,6 +122,9 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | -32005 | `unsupported` | 对端不支持该方法（**应降级**） |
 | -32006 | `untrusted-workspace` | 工作区未信任 |
 | -32007 | `disconnected` | 没有编辑器连上 |
+| -32008 | `protocol-incompatible` | 协议版本不兼容（兼容门） |
+| -32009 | `invalid-response` | 对端返回的响应形状不符合契约 |
+| -32010 | `edit-not-bound` | 写入没有有效的 grant 绑定（五种 `reason` 见下） |
 
 `-32005` 与 `-32601` 的区别：前者是"能力协商没通过，你该降级"，
 后者是"方法名根本不存在，是编程错误"。
@@ -134,13 +138,16 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | 只监听 `127.0.0.1` | 局域网、外网 | **本机任何进程**（同用户下的任意程序都够得着） |
 | 256 位随机 token | 猜不到的凭证 | 凭证本身被读到（同用户可读发现文件） |
 | **准入集合 `trusted`** | 不带正确 token 的连接抢走 active 位、收到广播 | —— |
-| 只读或打开动作 | 改动你代码内容 | —— |
+| 只读或打开动作（四项只读能力） | ——（本身不改宿主状态） | ——（**不等于**「不能改你代码」，写入看下一行） |
+| **写入必须持 grant** | 无授权的写入、写错窗口、写工作区外的路径 | 你亲自授权的那个窗口（那是授权本身，不是绕过） |
 
 七条诚实的说明：
 
 1. **本机不是安全边界**。token 防的是「本机别的进程冒充编辑器」，不是防「本机进程读你的文件」。
    同用户下任何进程都能读发现文件拿到 token —— 这是设计上的取舍，不是遗漏。
-2. **首版刻意不做编辑器内容注入**。能读选区、能开文件，但不能往你正在写的文件里写东西。
+2. **写入是收窄放开的，不是「能随意改你代码」**。2026-10-22 起 `vscode.applyEdit` 可做**单文件文本
+   编辑**，但必须持 grant，且只能写 grant 绑定的那个窗口里的真实工作区文件；新建/删除文件、保存落盘
+   仍然不做。挡住什么、挡不住什么见下面「写入路径的边界」。
 3. **洞 3 仍开着**：协议层的响应分支不做 token 校验（见 `phase7-经验手册.md` §5.9 与
    `phase5-打样日志.md` 阶段 9）。它需要单独一轮设计，不要顺手改。
 4. **出站消息带不带 token，按消息类型区分**（`packages/dsh-vscode-kit/src/protocol.js`）：
@@ -163,6 +170,43 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 7. **广播只发给已准入连接**（`server.js:243-246`）。这是**有意收紧的契约变更**，不是实现细节：
    未准入的连接不该收到通知，因为通知里可能带选区文本这类内容。
 
+### 写入路径的边界
+
+上面的表讲的是「谁能进来」。写入多一层「进来以后能改哪里」，这一层的口径单独说清楚 —— **两边都写，不许只写一边**。
+
+**挡住什么**（每条都落到一个可观察的错误码，不是「我们很小心」）：
+
+| 情形 | 表现 |
+|---|---|
+| 写入类调用但从未申请 grant | `-32010`，`data.reason = 'no-grant'` |
+| 有 grant 但绑的不是这次请求的连接/会话（含被新一次授权覆盖） | `-32010`，`reason = 'grant-mismatch'` |
+| grant 已被撤销，或因断线/重连而代际失效 | `-32010`，`reason = 'grant-revoked'` / `'grant-generation-stale'` |
+| 发包后目标连接消失或已换成别的连接 | `-32010`，`reason = 'target-gone'` —— **只失败，不「改投」**到别的窗口重发 |
+| 协议版本不兼容 | `-32008` |
+| 编辑范围越界 / 写入参数形状畸形 | `-32602` / `-32603` |
+| 路径指向符号链接、reparse point、工作区之外 | 路径守卫拒绝（链接与越界是 `-32602`） |
+| 多根工作区（写哪个根说不清） | `-32603`，`reason = 'multi-root'` |
+| 写前重验时目标已变（中途被换成链接等） | `-32602`，`reason = 'path-changed'` |
+| 写后复核发现路径或文档身份变了 | `-32603`（`path-changed-after-write` / `document-identity-*`）—— **报错，不回滚** |
+| 用 `notify` / `broadcast` 发写入类方法 | 发送前就拒（`assertWritableNotNotified`）—— 单向消息没有回执，门判完也证明不了对端存下了 |
+
+判定只有**一份实现**（`packages/dsh-vscode-kit/src/grant.js` 的 `judgeGrant()`），DSH 发送前与扩展执行前
+共用它；写目标由 grant 记录的**连接对象身份**决定，**不用「活跃编辑器」**代替 —— 后者是读路径的口径，
+拿它挑写目标等于把授权退化成「谁最后连上就写给谁」。
+
+**明确挡不住什么**（这几条不是「以后补」，是按威胁模型**排除**的）：
+
+- **检查与写入之间被换掉，挡不住**。守卫能证明的只是「检查那一刻」：路径是工作区内真实文件、
+  链上没有 reparse point、`realpath` 与字面路径逐段同名。它**不能证明**从检查到写入之间这三件事没被改。
+  做到原子需要 `FILE_FLAG_OPEN_REPARSE_POINT` 或目录句柄，**Node 没有**。
+- 能在这个窗口里动手的是**同用户进程**，它本来就能直接写你的文件 —— 所以这条按威胁模型排除，
+  而不是假装解决了。
+- 补偿是**缩小窗口，不是消除窗口**：规范化路径→读文档形状→提交编辑三件事贴着做（中间不放无关 `await`）、
+  写前重验一次目标、写后复核文档身份。采样有天然盲区（同一内容改了又改回来就看不出来）。
+- **写后复核发现不一致 ≠ 回滚**。编辑很可能已经生效，所以这里**报错**，让人自己核对，不做「静默还原」。
+- **`saved: false` 只表示改的是编辑器缓冲区，不是落盘**。落盘仍由人和 VS Code 的保存动作决定。
+- 这不构成「全链检查 = 完整边界」—— 守卫覆盖的是「路径与文档身份」，不覆盖「宿主动作是否真的落盘」。
+
 **已知限制与残余风险**（证据与判断边界见 `docs/威胁模型-通道可达面.md`；以下按该文的措辞，不拔高也不淡化）：
 
 - **发现文件里的 token 是明文**，同用户进程可读 —— 这是设计取舍，不是遗漏。
@@ -177,8 +221,9 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 
 ## 明确不做
 
-编辑器内容注入、逐能力授权白名单、多 VSCode 仲裁、Remote/WSL 反向、
-Marketplace 发布、面板 UI。详见 `phase2-需求文档.md` 的 out-of-scope。
+编辑器内容注入（**2026-10-22 起收窄，不是取消**：只放开 `vscode.applyEdit` 单文件文本编辑，且必须持
+grant、只写绑定的那个窗口；新建/删除文件、保存落盘、批量改动仍不做）、逐能力授权白名单、
+多 VSCode 仲裁、Remote/WSL 反向、Marketplace 发布、面板 UI。详见 `phase2-需求文档.md` 的 out-of-scope。
 
 ## 已知未验证
 
