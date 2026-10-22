@@ -1,0 +1,16 @@
+{"id":"e1a","cmd":"applyEdit","file":"D:/code-workspace/projects/dsh-vscode-dev/work/t4-fixture/alpha.txt","range":{"start":{"line":2,"character":1},"end":{"line":2,"character":6}},"text":"LINE2-BY-DSH"}
+{"id":"e1a","cmd":"applyEdit","file":"D:/code-workspace/projects/dsh-vscode-dev/work/t4-fixture/alpha.txt","range":{"start":{"line":2,"character":1},"end":{"line":2,"character":6}},"text":"LINE2-BY-DSH"}
+{"id":"e1a","cmd":"applyEdit","file":"D:/code-workspace/projects/dsh-vscode-dev/work/t4-fixture/alpha.txt","range":{"start":{"line":2,"character":1},"end":{"line":2,"character":6}},"text":"LINE2-BY-DSH","opts":{"sessionId":"t4-sess","timeoutMs":15000}}
+{"id":"e1b","cmd":"applyEdit","file":"D:/code-workspace/projects/dsh-vscode-dev/work/t4-fixture/alpha.txt","range":{"start":{"line":2,"column":1},"end":{"line":2,"column":6}},"text":"LINE2-BY-DSH","opts":{"sessionId":"t4-sess","timeoutMs":15000}}
+{"id":"e2a","cmd":"applyEdit","file":"D:/code-workspace/projects/dsh-vscode-dev/work/t4-fixture/alpha.txt","range":{"start":{"line":4,"column":1},"end":{"line":4,"column":20}},"text":"LINE4-DSH-TAKEOVER","opts":{"sessionId":"t4-sess","timeoutMs":15000}}
+{"id":"e2b","cmd":"applyEdit","file":"D:/code-workspace/projects/dsh-vscode-dev/work/t4-fixture/alpha.txt","range":{"start":{"line":3,"column":1},"end":{"line":3,"column":15}},"text":"LINE3-BY-DSH","opts":{"sessionId":"t4-sess","timeoutMs":15000}}
+{"id":"e4b","cmd":"applyEdit","file":"D:/code-workspace/projects/dsh-vscode-dev/work/t4-fixture/beta.txt","range":{"start":{"line":2,"column":1},"end":{"line":2,"column":5}},"text":"BEE2-BY-DSH","opts":{"sessionId":"t4-sess","timeoutMs":15000}}
+{"id":"e4c","cmd":"listEditors"}
+{"id":"r1","cmd":"request","method":"vscode.readFile","params":{}}
+{"id":"r2","cmd":"request","method":"vscode.getDocumentText","params":{}}
+{"id":"r3","cmd":"request","method":"vscode.save","params":{}}
+{"id":"v1","cmd":"openFile","path":"D:/code-workspace/projects/dsh-vscode-dev/work/t4-fixture/alpha.txt"}
+{"id":"v2","cmd":"listEditors"}
+{"id":"z1","cmd":"state"}
+{"id":"z2","cmd":"revoke","id":"11873a51e3209dd4230108a4216b88bd"}
+{"id":"z3","cmd":"quit"}
