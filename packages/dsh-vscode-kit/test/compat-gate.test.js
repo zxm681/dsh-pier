@@ -566,6 +566,160 @@ test('★ F2：兼容时 notify() 业务方法照常发出，且能力预检同�
   }
 })
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. ★ 评审 N1 回归：broadcast() 也要过门（按每条连接自己的版本事实逐条判定）
+//
+//    N1 是与 F2 同族的旁路：`broadcast()` 只遍历 trusted 直接 notify，版本门形同虚设。
+//    这里锁四件事：
+//      ① 不兼容连接在 broadcast 时**零业务帧**（且零投递抛 -32008）；
+//      ② 兼容连接照常收到；
+//      ③ 混合场景只投给兼容那条（不兼容那条零业务帧，用同 socket FIFO 做栅栏）；
+//      ④ 没有连接 / 版本缺失 / 版本不兼容 → 一律 -32008（零投递不许静默成功），
+//         而 bridge.* 广播继续豁免（协商通道不能自己堵死）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 某编辑器收到的**业务**通知（bridge.* 协议层不算；广播走 notify，落在这里）。 */
+const businessNotifies = (editor) => editor.notifications.filter(
+  (m) => !String(m.method).startsWith('bridge.'),
+)
+
+test('★ N1 回归①：不兼容连接在 broadcast 时零业务帧，且零投递抛 -32008', async () => {
+  const { server, connectEditor, cleanup } = await withKit()
+  try {
+    const editor = await connectEditor()
+    await hello(editor, 2) // 越界 → 不兼容
+    assert.equal(server.trusted.size, 1, '前置：这条连接已准入')
+
+    assert.throws(
+      () => server.broadcast('vscode.selectionChanged', { text: 'secret' }),
+      (e) => {
+        // 形状对齐契约 §4.1 ③；单个候选时回显它的判定
+        assertIncompatible(e, {
+          peer: 2, peerType: 'number', reason: 'out-of-range', method: 'vscode.selectionChanged',
+        })
+        assert.equal(e.data.delivered, 0)
+        return true
+      },
+      '没有任何兼容连接时广播必须抛错（静默成功正是 N1 的形态）',
+    )
+
+    // 栅栏：同 socket FIFO。服务端若曾把广播写给这条连接，它必然排在这条协议请求的
+    // 响应之前；等响应回来再数，就不需要固定观察窗（评审 S1 的老问题）。
+    await editor.link.request('bridge.ping', {})
+    assert.deepEqual(businessNotifies(editor), [],
+      `不兼容连接收到了广播：${JSON.stringify(businessNotifies(editor).map((m) => m.method))}`)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('★ N1 回归②：兼容连接照常收到 broadcast，返回投递计数', async () => {
+  const { server, connectEditor, cleanup } = await withKit()
+  try {
+    const editor = await connectEditor()
+    await hello(editor, PROTOCOL_VERSION)
+    const delivered = server.broadcast('vscode.selectionChanged', { text: 'hi' })
+    assert.equal(delivered, 1, '返回值 = 实际投递到的连接数')
+    await waitFor(() => businessNotifies(editor).some((m) => m.method === 'vscode.selectionChanged'),
+      { label: '兼容连接收到广播' })
+    assert.deepEqual(businessNotifies(editor)[0].params, { text: 'hi' })
+  } finally {
+    await cleanup()
+  }
+})
+
+test('★ N1 回归③：混合场景（一条兼容一条不兼容）只投给兼容那条', async () => {
+  const { server, connectEditor, cleanup } = await withKit()
+  try {
+    const good = await connectEditor()
+    await hello(good, PROTOCOL_VERSION)
+    const bad = await connectEditor()
+    await hello(bad, 3) // 越界 → 不兼容
+    assert.equal(server.trusted.size, 2)
+
+    const delivered = server.broadcast('vscode.selectionChanged', { text: 'only-compatible' })
+    assert.equal(delivered, 1, '只投给兼容的那一条')
+
+    await waitFor(() => businessNotifies(good).some((m) => m.method === 'vscode.selectionChanged'),
+      { label: '兼容连接收到广播' })
+    assert.deepEqual(businessNotifies(good)[0].params, { text: 'only-compatible' })
+
+    // 不兼容那条：FIFO 栅栏之后再断言零业务帧
+    await bad.link.request('bridge.ping', {})
+    assert.deepEqual(businessNotifies(bad), [],
+      `不兼容连接收到了广播：${JSON.stringify(businessNotifies(bad).map((m) => m.method))}`)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('★ N1 回归④：没有连接 / 版本缺失 → 一律 -32008（零投递可被调用方感知）', async () => {
+  // (a) 一条连接都没有：peer 取不到 → null
+  {
+    const { server, cleanup } = await withKit()
+    try {
+      assert.throws(
+        () => server.broadcast('vscode.selectionChanged', { text: 'x' }),
+        (e) => {
+          assert.equal(e.code, ERR.PROTOCOL_INCOMPATIBLE)
+          assert.equal(e.code, -32008)
+          assert.deepEqual(e.data.required,
+            { min: SUPPORTED_PROTOCOL[0], max: SUPPORTED_PROTOCOL[1] }, 'data.required 是兼容区间')
+          assert.equal(e.data.peer, null, 'peer 取不到就给 null')
+          assert.equal(e.data.reason, 'no-editor')
+          assert.equal(e.data.side, 'dsh')
+          assert.equal(e.data.method, 'vscode.selectionChanged')
+          assert.equal(e.data.delivered, 0)
+          return true
+        },
+      )
+    } finally {
+      await cleanup()
+    }
+  }
+
+  // (b) 连上了但**没报** hello（版本未知，不得推断成 v1）
+  {
+    const { server, connectEditor, cleanup } = await withKit()
+    try {
+      const editor = await connectEditor()
+      await editor.link.request('bridge.ping', {}) // 只准入，不报身份
+      assert.equal(server.trusted.size, 1)
+      assert.throws(
+        () => server.broadcast('vscode.selectionChanged', { text: 'x' }),
+        (e) => {
+          assert.equal(e.code, ERR.PROTOCOL_INCOMPATIBLE)
+          assert.equal(e.data.reason, 'missing')
+          assert.equal(e.data.peer, null)
+          assert.equal(e.data.helloReceived, false)
+          return true
+        },
+      )
+      await editor.link.request('bridge.ping', {})
+      assert.deepEqual(businessNotifies(editor), [], '版本未知的连接不许收到广播')
+    } finally {
+      await cleanup()
+    }
+  }
+})
+
+test('★ N1：bridge.* 广播继续豁免版本门（协商通道不被自己堵死）', async () => {
+  const { server, connectEditor, cleanup } = await withKit()
+  try {
+    const editor = await connectEditor()
+    await hello(editor, 2) // 不兼容
+    const delivered = server.broadcast('bridge.hello', { client: 'dsh-vscode-kit' })
+    assert.equal(delivered, 1, '协议层方法不受版本门约束，照常投递并返回计数')
+    await waitFor(
+      () => editor.notifications.filter((m) => m.method === 'bridge.hello').length === 2,
+      { label: '第二条 bridge.hello 到达对端' }, // 第一条是建连时协议层自动下发的
+    )
+    assert.deepEqual(businessNotifies(editor), [], '豁免路径不许顺带漏业务帧')
+  } finally {
+    await cleanup()
+  }
+})
+
 function deepEqualList(actual, expected) {
   try {
     assert.deepEqual(actual, expected)

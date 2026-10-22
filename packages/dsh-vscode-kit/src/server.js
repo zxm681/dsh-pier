@@ -13,7 +13,10 @@
 import { createServer } from 'node:net'
 import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
-import { connect, createLineSplitter, BridgeError, ERR, PROTOCOL_VERSION } from './protocol.js'
+import {
+  connect, createLineSplitter, BridgeError, ERR, PROTOCOL_VERSION,
+  judgeProtocolVersion, SUPPORTED_PROTOCOL,
+} from './protocol.js'
 // 发现文件规则由 DSH 侧与 VSCode 侧共用同一份实现（写/读必须同一套权限与原子性）。
 // 这里 re-export，保持既有 import 路径（含单测）不变。
 import {
@@ -240,9 +243,96 @@ export async function startBridgeServer(opts = {}) {
     })
   }
 
-  /** 有意收紧的契约变更：通知只发给已准入连接；未认证者收内容属洞 1 同类外泄。 */
+  /**
+   * 广播业务通知：**只投给版本兼容的连接**（评审 N1）。
+   *
+   * 有意收紧的契约变更之一：通知只发给已准入连接；未认证者收内容属洞 1 同类外泄。
+   *
+   * ★ 评审 N1（同族旁路）：这里曾经只遍历 `trusted` 直接 `notify`，**完全绕过版本门**
+   *   —— 与 `VscodeKit.notify()`（评审 F2）是同一个洞的两种形态：不兼容对端照样收到
+   *   业务帧。现在按**每条连接自己的**版本事实逐条判定：
+   *   判据是 `link.editor`（由入站 `bridge.hello` 落位，经 protocol.js 的 `ctx.link`
+   *   绑在「这条连接」上），**不再引入全局槽** —— 全局槽正是评审 F1 的双源根因。
+   *   判定核心与 `index.js` 的 `_assertProtocolCompatible` 共用同一份
+   *   `judgeProtocolVersion` / `SUPPORTED_PROTOCOL`，两处只有「错误怎么长」不同。
+   *
+   * 语义：
+   *  - 兼容连接：正常投递；
+   *  - 版本缺失 / 不兼容 / 已关闭的连接：**跳过**。既不发业务帧，也不给它们回错误帧
+   *    （广播没有「对端侧」的错误通道；往不兼容对端写错误帧同样算业务帧泄漏）；
+   *  - **一条兼容连接都没有：抛 -32008**，data 形状对齐契约 §4.1 ③，让调用方知道
+   *    「发了但没人在听」，而不是静默成功（静默成功正是 N1 暴露的问题形态）；
+   *  - `bridge.*` 协议层方法继续**豁免**（协商通道不能自己堵死），此时照常返回计数。
+   *
+   * @param {string} method
+   * @param {any} [params]
+   * @returns {number} 实际投递到的连接数（0 只可能出现在 `bridge.*` 豁免路径上）
+   * @throws {BridgeError} -32602 方法名非法 / -32008 没有任何版本兼容的连接
+   */
   function broadcast(method, params) {
-    for (const link of trusted) link.notify(method, params)
+    if (typeof method !== 'string' || method === '') {
+      throw new BridgeError(ERR.INVALID_PARAMS, 'method must be a non-empty string', { method })
+    }
+
+    /** 只对「还活着」的连接投递：socket 已销毁 / 终端已关的连接收不到。 */
+    const live = () => {
+      const out = []
+      for (const link of trusted) {
+        if (link.closed === true) continue
+        if (link.socket?.destroyed) continue
+        out.push(link)
+      }
+      return out
+    }
+
+    // 协议层方法豁免版本门：否则版本不兼容时连「问一句对方是几版」都做不到。
+    // 豁免口径必须与 index.js `_assertProtocolCompatible` 一致（同一条规则两处用）。
+    if (method.startsWith('bridge.')) {
+      const targets = live()
+      for (const link of targets) link.notify(method, params)
+      return targets.length
+    }
+
+    // 逐条连接判定：判定对象 = 将要收包的那条连接，不多不少。
+    const candidates = live().map((link) => {
+      const editor = link.editor ?? null
+      return { link, verdict: judgeProtocolVersion(editor ? editor.protocolVersion : undefined) }
+    })
+
+    let delivered = 0
+    for (const { link, verdict } of candidates) {
+      if (!verdict.compatible) continue
+      link.notify(method, params)
+      delivered++
+    }
+    if (delivered > 0) return delivered
+
+    // ── 零投递：必须可被调用方感知（不许静默成功）──
+    const [min, max] = SUPPORTED_PROTOCOL
+    // 只有一个候选时，它的判定就是结论，回显原始值最利于排障；
+    // 多个候选时「谁不兼容」有歧义，peer 取不到就给 null（契约 §4.1 ③ 的归一规则）。
+    const single = candidates.length === 1 ? candidates[0].verdict : null
+    const zeroReason = candidates.length === 0 ? 'no-editor' : 'no-compatible-connection'
+    throw new BridgeError(
+      ERR.PROTOCOL_INCOMPATIBLE,
+      candidates.length === 0
+        ? `protocol version incompatible: no connection to broadcast "${method}" to`
+          + ` (supported ${min}..${max})`
+        : `protocol version incompatible: no compatible connection among ${candidates.length}`
+          + ` (supported ${min}..${max}); refusing to broadcast "${method}"`,
+      {
+        required: { min, max },
+        peer: single ? single.peer : null,
+        peerType: single ? single.peerType : (candidates.length === 0 ? 'undefined' : 'null'),
+        reason: single ? single.reason : zeroReason,
+        helloReceived: candidates.some(({ link }) => link.editor !== null),
+        method,
+        side: 'dsh',
+        // 以下为排障字段（不属于契约 §4.1 ③ 的必填集）
+        delivered: 0,
+        connections: candidates.length,
+      },
+    )
   }
 
   return {

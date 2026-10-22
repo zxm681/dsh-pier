@@ -14,7 +14,7 @@ import {
   writeDiscoveryFile,
   DEFAULT_PORT_RANGE,
 } from '../src/server.js'
-import { connect, createLineSplitter, ERR } from '../src/protocol.js'
+import { connect, createLineSplitter, ERR, PROTOCOL_VERSION } from '../src/protocol.js'
 
 function tempHome() {
   return mkdtempSync(join(tmpdir(), 'dsh-kit-test-'))
@@ -40,6 +40,32 @@ function withTimeout(promise, ms, message) {
       timer.unref?.()
     }),
   ])
+}
+
+/**
+ * 测试用「服务端记录对端身份」：把 hello 里的 `protocolVersion` 落到**这条连接自己**的
+ * `link.editor` 上。
+ *
+ * 生产路径是 index.js 的 `handleInbound`（`msgCtx.link.editor = editor`）；裸 server 用例
+ * 没有插件层，所以这里补一份最小等价物 —— 版本事实**必须挂在连接上**，因为
+ * 版本门（server.js 的 `broadcast` / index.js 的 `_assertProtocolCompatible`）
+ * 只认这一份，没有全局槽可退回（评审 F1/N1）。
+ */
+function recordHello(onRequest) {
+  return (method, params, msgCtx) => {
+    if (method === 'bridge.hello') {
+      if (msgCtx?.link) {
+        msgCtx.link.editor = {
+          client: params?.client ?? 'unknown',
+          protocolVersion: params?.protocolVersion,
+          capabilities: Array.isArray(params?.capabilities) ? params.capabilities : [],
+          seenAt: Date.now(),
+        }
+      }
+      return { ok: true, protocolVersion: 1 }
+    }
+    return onRequest?.(method, params, msgCtx)
+  }
 }
 
 /** 起一个 server 并返回一个已握手的客户端 link。 */
@@ -82,6 +108,21 @@ async function withServer(opts, fn) {
           link,
           socket,
           inbox,
+          /**
+           * 假编辑器上报身份（协议 §3.4）：hello 里的 `protocolVersion` 是版本门的唯一判据。
+           *
+           * ★ 评审 N1 之后，「假编辑器不报 hello」不再等于「可以收广播」：版本事实缺失
+           *   的连接会被 `broadcast` 跳过（fail-closed）。所以凡是要收业务广播的用例，
+           *   必须先让这个假编辑器把版本报出来 —— 补的是 fixture 事实，不是放宽断言。
+           *   服务端侧落位由本文件的 `recordHello` 完成（生产路径见 index.js handleInbound）。
+           *
+           * @param {number|undefined} ptv 传 `undefined` = hello 里**不带**该字段（残缺对端）
+           */
+          hello(ptv, extra = {}) {
+            const params = { client: 'fake-editor', extensionVersion: '0.1.0', capabilities: [], ...extra }
+            if (ptv !== undefined) params.protocolVersion = ptv
+            return link.request('bridge.hello', params)
+          },
           /** 等下一条通知（hello 等） */
           next(timeoutMs = 2000) {
             if (inbox.length) return Promise.resolve(inbox.shift())
@@ -201,14 +242,16 @@ test('出站请求能拿到服务端 onRequest 的返回值', async () => {
 })
 
 test('服务端向两个已准入连接广播通知', async () => {
-  await withServer({ onRequest: () => ({ ok: true }) }, async (server, { dial }) => {
+  await withServer({ onRequest: recordHello(() => ({ ok: true })) }, async (server, { dial }) => {
     const a = await dial()
     const b = await dial()
     await a.next(); await b.next()
-    await a.link.request('ping', {})
-    await b.link.request('ping', {})
+    // 两条连接都报了 v1（版本事实落在各自的 link.editor 上）——广播才允许投递。
+    await a.hello(PROTOCOL_VERSION)
+    await b.hello(PROTOCOL_VERSION)
     assert.equal(server.trusted.size, 2)
-    server.broadcast('vscode.selectionChanged', { text: 'hi' })
+    const delivered = server.broadcast('vscode.selectionChanged', { text: 'hi' })
+    assert.equal(delivered, 2, '两条兼容连接都该收到，返回值即投递计数')
     const [na, nb] = await Promise.all([a.next(), b.next()])
     assert.equal(na.method, 'vscode.selectionChanged')
     assert.deepEqual(nb.params, { text: 'hi' })
@@ -217,11 +260,12 @@ test('服务端向两个已准入连接广播通知', async () => {
 })
 
 test('安全回归：未准入静默连接收不到广播内容（同连接收包栅栏，不靠固定窗口）', async () => {
-  await withServer({ onRequest: () => ({ ok: true }) }, async (server, { dial }) => {
+  await withServer({ onRequest: recordHello(() => ({ ok: true })) }, async (server, { dial }) => {
     const real = await dial()
     const bare = await dial({ token: NO_TOKEN })
     await real.next(); await bare.next() // 建连 hello 不含 token，不能算准入。
-    await real.link.request('ping', {})
+    // real 先报版本：否则它也会被版本门跳过，这条用例就退化成空转。
+    await real.hello(PROTOCOL_VERSION)
     assert.equal(server.links.size, 2)
     assert.equal(server.trusted.size, 1)
     server.broadcast('vscode.selectionChanged', { text: 'private-selection' })
@@ -235,6 +279,41 @@ test('安全回归：未准入静默连接收不到广播内容（同连接收�
     assert.equal(bare.inbox.length, 0,
       `未准入的静默 socket 收到了广播内容：${JSON.stringify(bare.inbox.map((m) => m.method))}`)
     await real.close(); await bare.close()
+  })
+})
+
+// ★ 回归（评审 N1）：`broadcast()` 曾经完全绕过版本门 —— 只遍历 trusted 就 notify，
+//   不兼容对端照样收到业务帧。这里锁住 server 层的两个性质：
+//   ① 版本事实缺失的连接被**跳过**（fail-closed，不推断成 v1）；
+//   ② 一条兼容连接都没有时**抛 -32008**，让调用方知道「发了但没人在听」，不许静默成功。
+test('★ 回归 N1：版本事实缺失的连接不收广播，零兼容时抛 -32008', async () => {
+  await withServer({ onRequest: recordHello(() => ({ ok: true })) }, async (server, { dial }) => {
+    const c = await dial()
+    await c.next() // 建连 hello（服务端 → 对端），不是对端上报身份
+    await c.hello(undefined) // 对端 hello **不带** protocolVersion（残缺/旧版对端）
+    assert.equal(server.trusted.size, 1)
+    assert.equal(server.trusted.values().next().value.editor.protocolVersion, undefined,
+      '前置：这条连接的版本事实确实是缺失的')
+
+    assert.throws(
+      () => server.broadcast('vscode.selectionChanged', { text: 'secret' }),
+      (e) => {
+        assert.equal(e.code, ERR.PROTOCOL_INCOMPATIBLE, `应为 -32008，实际 ${e.code}`)
+        assert.deepEqual(e.data.required, { min: 1, max: 1 }, 'data.required 是兼容区间')
+        assert.equal(e.data.peer, null, '版本缺失时 peer 归一为 null')
+        assert.equal(e.data.reason, 'missing', '判定表：缺失 ≠ v1')
+        assert.equal(e.data.method, 'vscode.selectionChanged')
+        assert.equal(e.data.side, 'dsh')
+        return true
+      },
+      '零兼容连接时广播不许静默成功',
+    )
+
+    // 栅栏：同 socket FIFO —— 广播若曾写给这条连接，必然排在这条协议请求的响应之前。
+    await c.link.request('bridge.ping', {})
+    assert.deepEqual(c.inbox.map((m) => m.method), [],
+      `版本缺失的连接收到了广播：${JSON.stringify(c.inbox.map((m) => m.method))}`)
+    await c.close()
   })
 })
 
