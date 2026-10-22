@@ -29,6 +29,23 @@ function serverLinkFor(server, clientSocket) {
 }
 
 /**
+ * 假编辑器返回的 `vscode.getSelection` 结果，**必须是契约 §5.1 的合法形状**。
+ *
+ * facade 出口现在有形状校验（-32009 invalid-response）：早先这些脚手架返回
+ * `{ text }` / `{ status:'ok', text }` 这种残缺形状，正常断言还能过，但现在会被
+ * 判成畸形响应。**别为了让测试变绿去删校验** —— 这里改的是脚手架的返回，不是校验。
+ */
+function fakeSelection(text) {
+  return {
+    text,
+    file: '/ws/fake.js',
+    start: { line: 1, column: 1 },
+    end: { line: 1, column: 1 + text.length },
+    isEmpty: text.length === 0,
+  }
+}
+
+/**
  * 最小 cordis ctx 模拟：只要 provide/effect 存在就能跑 apply。
  *
  * 必须复刻 cordis 的 effect 契约：`effect(fn)` 会**立刻执行 fn**，并把 fn 的
@@ -116,7 +133,7 @@ test('端到端：apply → 服务注册 → 假编辑器连上 → 消费者 vs
   // 假编辑器：应答 vscode.getSelection
   const editor = await fakeEditor(handle.kit.server, {
     onRequest: (method, params) => {
-      if (method === 'vscode.getSelection') return { status: 'ok', text: 'hello-from-vscode' }
+      if (method === 'vscode.getSelection') return fakeSelection('hello-from-vscode')
       throw new Error(`unexpected method ${method}`)
     },
   })
@@ -140,7 +157,7 @@ test('端到端：apply → 服务注册 → 假编辑器连上 → 消费者 vs
 
   // 3) 消费者 → 编辑器方向：vscode.getSelection 转发并拿到假编辑器的返回
   const sel = await svc.request('vscode.getSelection')
-  assert.deepEqual(sel, { status: 'ok', text: 'hello-from-vscode' })
+  assert.deepEqual(sel, fakeSelection('hello-from-vscode'))
 
   // 4) 糖衣等价
   const sel2 = await svc.vscode.getSelection()
@@ -218,7 +235,7 @@ async function withKit(editorTexts) {
   const editors = []
   for (const text of editorTexts) {
     const editor = await fakeEditor(server, {
-      onRequest: (method) => (method === 'vscode.getSelection' ? { text } : undefined),
+      onRequest: (method) => (method === 'vscode.getSelection' ? fakeSelection(text) : undefined),
     })
     await editor.next() // 吃掉 hello
     editor.serverLink = serverLinkFor(server, editor.socket)
@@ -386,7 +403,7 @@ test('安全回归：真编辑器准入后抢位失败（active 位只认 token 
 
   // 1) 真编辑器先来并报身份 → 准入
   const editor = await fakeEditor(handle.kit.server, {
-    onRequest: (method) => (method === 'vscode.getSelection' ? { text: 'REAL' } : undefined),
+    onRequest: (method) => (method === 'vscode.getSelection' ? fakeSelection('REAL') : undefined),
   })
   await editor.link.request('bridge.ping', {})
   assert.equal([...handle.kit.server.links][0].authorized, true, 'token 通过即准入')

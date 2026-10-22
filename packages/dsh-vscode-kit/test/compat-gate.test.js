@@ -45,6 +45,20 @@ function fakeCtx() {
 }
 
 /**
+ * 假编辑器对 `vscode.getSelection` 的合法应答（契约 §5.1 形状）。
+ *
+ * facade 出口有 -32009 形状校验：`{ done: method }` 这种残缺形状会被判成畸形响应。
+ * 改的是脚手架返回，**不是**校验（删校验让测试变绿是本末倒置）。
+ */
+const FAKE_SELECTION = Object.freeze({
+  text: 'fake-selection',
+  file: '/ws/fake.js',
+  start: { line: 1, column: 1 },
+  end: { line: 2, column: 3 },
+  isEmpty: false,
+})
+
+/**
  * 假编辑器：裸 TCP 连上桥。
  *
  * `received` 只记**业务**请求（bridge.* 协议层方法不算），它就是「门有没有漏包」
@@ -61,6 +75,7 @@ async function fakeEditor(server) {
     onRequest: (method) => {
       allMethods.push(method)
       if (!method.startsWith('bridge.')) received.push(method)
+      if (method === 'vscode.getSelection') return FAKE_SELECTION
       return { done: method }
     },
   })
@@ -223,7 +238,7 @@ test('ptv=1 合法 → 放行，请求真的到达对端', async () => {
     const editor = await connectEditor()
     await hello(editor, 1)
     const res = await svc.request('vscode.getSelection', {})
-    assert.deepEqual(res, { done: 'vscode.getSelection' })
+    assert.deepEqual(res, FAKE_SELECTION)
     assert.deepEqual(editor.received, ['vscode.getSelection'], '门放行后业务请求应到达对端')
   } finally {
     await cleanup()
@@ -353,7 +368,7 @@ test('新连接不给旧连接的版本背书：换了对端就要重新报版�
   try {
     const first = await connectEditor()
     await hello(first, 1)
-    assert.deepEqual(await svc.request('vscode.getSelection', {}), { done: 'vscode.getSelection' })
+    assert.deepEqual(await svc.request('vscode.getSelection', {}), FAKE_SELECTION)
 
     // 第二台编辑器连上并准入（活跃目标按连接序号换成它），但还没报 hello
     const second = await connectEditor()
@@ -367,7 +382,7 @@ test('新连接不给旧连接的版本背书：换了对端就要重新报版�
 
     // 新对端报了 v1 → 放行
     await hello(second, 1)
-    assert.deepEqual(await svc.request('vscode.getSelection', {}), { done: 'vscode.getSelection' })
+    assert.deepEqual(await svc.request('vscode.getSelection', {}), FAKE_SELECTION)
     assert.deepEqual(second.received, ['vscode.getSelection'])
   } finally {
     await cleanup()
@@ -429,7 +444,7 @@ test('★ F1 回归①：双窗口，目标从兼容的 A 切到不兼容的 B �
     // 窗口 A：v1，目标明确、业务正常
     const a = await connectEditor()
     await hello(a, 1, ['vscode.getSelection'], 'window-A')
-    assert.deepEqual(await svc.request('vscode.getSelection', {}), { done: 'vscode.getSelection' })
+    assert.deepEqual(await svc.request('vscode.getSelection', {}), FAKE_SELECTION)
     assert.equal(businessCount(a), 1, 'A 是当时的目标：应收到 1 条业务帧')
 
     // 窗口 B 连上（序号更大 ⇒ 立刻成为目标），但还没报 hello。
@@ -478,7 +493,7 @@ test('★ F1 回归②：目标窗口关掉后回退到另一条不兼容连接 
     await hello(b, 2, ['vscode.getSelection'], 'window-B')
     const a = await connectEditor()
     await hello(a, 1, ['vscode.getSelection'], 'window-A')
-    assert.deepEqual(await svc.request('vscode.getSelection', {}), { done: 'vscode.getSelection' })
+    assert.deepEqual(await svc.request('vscode.getSelection', {}), FAKE_SELECTION)
     assert.equal(businessCount(a), 1)
     assert.equal(businessCount(b), 0, 'B 从头到尾没收到业务帧')
 

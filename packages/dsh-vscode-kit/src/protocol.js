@@ -30,6 +30,12 @@ export const ERR = Object.freeze({
    * 不许拿 -32005（方法缺失）/ -32601（协议层写错）/ -32007（未就绪）代替。
    */
   PROTOCOL_INCOMPATIBLE: -32008,
+  /**
+   * 对端响应形状不合格（契约 §5.1）。**新增**码位，不破坏既有契约：
+   * 只在 facade 出口（`VscodeKit.request()` 把成功结果交回调用方之前）产生。
+   * 不许拿 -32005（方法缺失）/ -32601（协议层写错）/ -32004（超时）代替。
+   */
+  INVALID_RESPONSE: -32009,
 })
 
 /** 错误码 → 稳定诊断串（日志与测试断言都用它，改动即破坏契约）。 */
@@ -47,6 +53,7 @@ export const ERR_NAME = Object.freeze({
   [ERR.UNTRUSTED_WORKSPACE]: 'untrusted-workspace',
   [ERR.DISCONNECTED]: 'disconnected',
   [ERR.PROTOCOL_INCOMPATIBLE]: 'protocol-incompatible',
+  [ERR.INVALID_RESPONSE]: 'invalid-response',
 })
 
 /**

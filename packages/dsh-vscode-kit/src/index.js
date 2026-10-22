@@ -15,6 +15,7 @@ import { startBridgeServer, listLiveBridges, discoveryDir, resolveDshHome } from
 import {
   BridgeError, ERR, PROTOCOL_VERSION, SUPPORTED_PROTOCOL, hasCapability, judgeProtocolVersion,
 } from './protocol.js'
+import { validateResponse } from './response-contract.js'
 
 /** cordis 插件名，必须与 package.json 的 name 一致。 */
 export const name = 'dsh-vscode-kit'
@@ -258,6 +259,7 @@ class VscodeKit {
    * @returns {Promise<any>}
    * @throws {BridgeError} -32001 未授权 / -32003 不存在 / -32004 超时 / -32005 不支持
    *   / -32007 未连接 / -32008 协议版本不兼容（契约 §4.1，发包前就拒）
+   *   / -32009 对端响应形状不合格（契约 §5.1，facade 出口校验）
    */
   async request(method, params = {}, opts = {}) {
     if (typeof method !== 'string' || method === '') {
@@ -289,7 +291,17 @@ class VscodeKit {
 
     // 断线不清任何「版本槽」：版本事实挂在连接上，连接没了自然失效。
     // （旧实现这里清全局 lastEditor，会导致下一条连接继承/丢失判定，见 F1。）
-    return link.request(method, params, opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : undefined)
+    const result = await link.request(
+      method, params, opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : undefined,
+    )
+
+    // ── facade 出口形状校验（契约 §5.1，-32009 invalid-response）──
+    // 位置：糖衣 `kit.vscode.*` 就是本方法的一行转发，所以这里是「结果交回调用方之前」
+    // 的唯一点，raw request() 与糖衣方法共用同一道闸。
+    // ★ 只处理**成功返回**：上面的版本门 / 能力预检 / link.request 抛的 -3200x 在到达
+    //   这里之前就已 reject，原样上浮，不会被包装成 -32009。
+    // 校验规则见 response-contract.js（已发布能力逐字对照契约表，未登记能力只有最低校验）。
+    return validateResponse(method, result)
   }
 
   /**
