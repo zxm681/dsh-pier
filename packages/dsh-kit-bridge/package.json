@@ -2,7 +2,7 @@
   "name": "dsh-kit-bridge",
   "displayName": "DSH Kit Bridge",
   "description": "Thin bridge exposing a minimal set of VS Code capabilities to DeepSeek Harness plugins over loopback TCP.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "dsh-kit-dev",
   "license": "MIT",
   "author": "zxm681",

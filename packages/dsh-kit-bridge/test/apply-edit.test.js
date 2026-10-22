@@ -42,11 +42,23 @@ function tempWorkspace() {
   return { base, root, dispose: () => rmSync(base, { recursive: true, force: true }) }
 }
 
+/** 假宿主的默认"文档版本"（T30：`applyEdit` 的 `expectedVersion` 必须与它一致）。 */
+const DEFAULT_VERSION = 1
+
 /** 假 VS Code 宿主（真文件系统校验 + 记录 applyEditText 调用）。 */
-function makeHost(roots, { trusted = true, applied = true, applyEditText, documentShape } = {}) {
+function makeHost(
+  roots,
+  { trusted = true, applied = true, applyEditText, documentShape, version = DEFAULT_VERSION } = {},
+) {
   const calls = []
+  // 每个文件一个可改的版本号（T30）：`host.setVersion(abs, n)` 模拟"缓冲区被人改过"。
+  const versions = new Map()
+  const versionOf = (abs) => (versions.has(abs) ? versions.get(abs) : version)
   const host = {
     calls,
+    versions,
+    versionOf,
+    setVersion: (abs, v) => { versions.set(abs, v) },
     fileExists: (p) => { try { return existsSync(p) && statSync(p).isFile() } catch { return false } },
     resolvePath: (p) => (isAbsolute(p) ? normalize(p) : join(roots[0], p)),
     workspaceRoots: () => roots.slice(),
@@ -56,6 +68,32 @@ function makeHost(roots, { trusted = true, applied = true, applyEditText, docume
     activeEditor: () => null,
     collectDiagnostics: () => [],
     listEditors: () => [],
+    // 文档状态（T30）：版本号来自 `versions`（默认 DEFAULT_VERSION），其余字段按磁盘文本算。
+    // 想造"版本不符 / 超限 / 脏文档"的场景就改 `versions` 或覆盖本方法。
+    readDocumentState: async (abs, { includeText = false } = {}) => {
+      const text = readFileSync(abs, 'utf8')
+      return {
+        version: versionOf(abs),
+        isDirty: false,
+        eol: text.includes('\r\n') ? 'crlf' : 'lf',
+        lineCount: text.split('\n').length,
+        textLength: text.length,
+        byteLength: Buffer.byteLength(text, 'utf8'),
+        ...(includeText === true ? { text } : {}),
+      }
+    },
+    // 目标范围当前文本（T30 的 `expectedRangeText` 比对用），**0-based** range。
+    readRangeText: async (abs, range) => {
+      const lines = readFileSync(abs, 'utf8').split('\n')
+      const at = (i) => lines[i] ?? ''
+      if (range.start.line === range.end.line) {
+        return at(range.start.line).slice(range.start.column, range.end.column)
+      }
+      const parts = [at(range.start.line).slice(range.start.column)]
+      for (let i = range.start.line + 1; i < range.end.line; i += 1) parts.push(at(i))
+      parts.push(at(range.end.line).slice(0, range.end.column))
+      return parts.join('\n')
+    },
     // 范围边界检查的数据源（评审 F8）：按真文件的行数/行长报形状（"文档"= 磁盘内容，
     // 单测里没有未落盘的缓冲区）。想造越界场景就传 documentShape 覆盖。
     readDocumentShape: documentShape ?? (async (abs, lines = []) => {
@@ -86,22 +124,29 @@ const EPOCH_A = 'b'.repeat(32)
 /** 一套"已授权"的环境：能力层 + 授权表 + 活连接。 */
 function grantedEnv({
   root, trusted = true, applied = true, link = { name: 'link-a' }, documentShape, applyEditText,
+  version = DEFAULT_VERSION,
 } = {}) {
   const grants = new GrantStore()
   grants.adopt({ id: ID_A, epoch: EPOCH_A, link })
-  const host = makeHost([root], { trusted, applied, documentShape, applyEditText })
+  const host = makeHost([root], { trusted, applied, documentShape, applyEditText, version })
   const caps = createCapabilities(host, { grants })
   return { grants, host, caps, link }
 }
 
 const FILE = (root) => join(root, 'a.js')
 
-/** 入口参数一律 1-based（协议对外口径）。 */
+/**
+ * 入口参数一律 1-based（协议对外口径）。
+ *
+ * T30 起 `expectedVersion` 是**必填**字段，所以脚手架默认带上 `DEFAULT_VERSION`；
+ * 想造版本冲突的用例自己覆盖（`editParams(file, { expectedVersion: 0 })`）。
+ */
 function editParams(file, extra = {}) {
   return {
     file,
     range: { start: { line: 1, column: 1 }, end: { line: 1, column: 6 } },
     text: 'HELLO',
+    expectedVersion: DEFAULT_VERSION,
     grant: { id: ID_A, epoch: EPOCH_A },
     ...extra,
   }
@@ -515,6 +560,8 @@ test('bridge.grant 入站：存下 DSH 发来的 id/epoch，之后的写入放�
       file: 'a.js',
       range: { start: { line: 1, column: 1 }, end: { line: 1, column: 6 } },
       text: 'HELLO',
+      // T30：写入必须带版本锚点（真链路上这条也是必填项，缺了会被 -32602 拒）。
+      expectedVersion: ed.host.versionOf(join(ws.root, 'a.js')),
       grant: { id, epoch },
     })
     assert.equal(res.applied, true)

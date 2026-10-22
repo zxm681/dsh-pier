@@ -190,12 +190,21 @@ async function withKit(n = 1, { onRequest } = {}) {
   return { svc, server, handle, editors, cleanup }
 }
 
-/** 一条形状合法的写入请求参数（不含 grant —— 由用例决定给不给）。 */
+/**
+ * 一条形状合法的写入请求参数（不含 grant —— 由用例决定给不给）。
+ *
+ * T30 起还**必须**带版本锚点：本文件这些用例测的是"绑定门"这一层，所以给一个固定的
+ * 版本号（`VERSION`），让请求能走到门那里；专门测版本锚点的用例在
+ * `test/document-version.test.js` 里。
+ */
+const VERSION = 4
+
 function writeParams(extra = {}) {
   return {
     file: '/ws/a.js',
     range: { start: { line: 1, column: 1 }, end: { line: 1, column: 3 } },
     text: 'hello',
+    expectedVersion: VERSION,
     ...extra,
   }
 }

@@ -9,4 +9,8 @@ work/dshhome-c/
 work/long/
 work/win-*/
 # 判卷临时产物（独立评委的探针脚本、变异备份、一次性夹具，可随时重建，不入库）
-work/t25-*/
+# 注意用 `work/tNN-*`（不带尾斜杠）：散在 work 根下的 mut*.mjs、*.diff、*.backup 也要盖住
+work/t25-*
+work/t31-*
+work/t32-*
+work/t33-*

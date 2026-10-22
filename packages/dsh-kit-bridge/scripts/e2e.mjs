@@ -11,7 +11,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -85,7 +85,11 @@ process.stdin.on('data', async (chunk) => {
     if (!line.trim()) continue
     const req = JSON.parse(line)
     try {
-      const r = await handle.kit.request(req.method, req.params ?? {}, { timeoutMs: 10000 })
+      // T30：除了普通能力调用，还要能从外面驱动「发一张写凭证」（真流程：先 grant 再写）。
+      const r = req.op === 'grant'
+        ? await handle.kit.editing.grant({ sessionId: req.sessionId ?? 'e2e-session' })
+        : await handle.kit.request(req.method, req.params ?? {},
+            { timeoutMs: 10000, ...(req.sessionId ? { sessionId: req.sessionId } : {}) })
       console.log('RESULT ' + JSON.stringify({ id: req.id, result: r }))
     } catch (e) {
       console.log('RESULT ' + JSON.stringify({ id: req.id, error: { code: e.code, message: e.message } }))
@@ -96,13 +100,21 @@ process.stdin.on('data', async (chunk) => {
 
 const editorSide = join(home, 'editor-side.mjs')
 writeFileSync(editorSide, `
+import { existsSync as x, renameSync as mv, readFileSync as rf } from 'node:fs'
+import { join as j } from 'node:path'
 import { createCapabilities } from '${toUrl(join(pkgRoot, 'src/capabilities.js'))}'
 import { createConnector } from '${toUrl(join(pkgRoot, 'src/connector.js'))}'
+import { GrantStore } from '${toUrl(join(kitRoot, 'src/grant.js'))}'
+// 真工作区根：路径守卫（workspace-paths.js）会真的 lstat 文件，/ws 这种假路径过不了。
+const WS = process.env.E2E_WS
+const DOC = j(WS, 'e2e.js')
+// 真文档状态（含版本号）：T30 的写入锚点必须以宿主自己的 version 为准。
+const doc = { version: 5, text: rf(DOC, 'utf8'), isDirty: false }
 // 假 VS Code 宿主：把“打开的文件”记到 stdout，供 E2E 断言
 const host = {
   fileExists: () => true,
-  resolvePath: (p) => (p.startsWith('/') ? p : '/ws/' + p),
-  workspaceRoots: () => ['/ws'],
+  resolvePath: (p) => (p.startsWith('/') ? p : j(WS, p)),
+  workspaceRoots: () => [WS],
   isTrusted: () => true,
   openTextDocument: async (p, o) => console.log('OPENED ' + JSON.stringify({ path: p, ...o })),
   openExternalFile: async (p) => console.log('EXTERNAL ' + p),
@@ -113,16 +125,47 @@ const host = {
     { file: '/ws/e2e.js', isActive: true, isDirty: false, languageId: 'javascript' },
     { file: '/ws/other.js', isActive: false, isDirty: true },
   ]),
+  readDocumentShape: async (abs, lines = []) => {
+    const buf = doc.text.split(String.fromCharCode(10))
+    return { lineCount: buf.length, lineLengths: lines.map((n) => (n >= 1 && n <= buf.length ? buf[n - 1].length : null)) }
+  },
+  // T30：版本锚点的读侧
+  readDocumentState: async (abs, { includeText = false } = {}) => ({
+    version: doc.version, isDirty: doc.isDirty, eol: 'lf',
+    lineCount: doc.text.split(String.fromCharCode(10)).length, textLength: doc.text.length,
+    byteLength: Buffer.byteLength(doc.text, 'utf8'),
+    ...(includeText === true ? { text: doc.text } : {}),
+  }),
+  readRangeText: async () => '',
+  // 等价于 vscode.workspace.applyEdit：只改缓冲区、版本 +1、绝不落盘
+  applyEditText: async (abs, range, text) => {
+    doc.version += 1
+    doc.isDirty = true
+    console.log('APPLIED ' + JSON.stringify({ version: doc.version, abs, text }))
+    return { applied: true, documentPath: abs }
+  },
   log: (m) => console.log('host: ' + m),
 }
-const { dispatch } = createCapabilities(host)
+const grants = new GrantStore()
+const { dispatch } = createCapabilities(host, { grants })
 const conn = createConnector({
-  dispatch, dshHome: process.env.DSH_HOME, pollIntervalMs: 100,
+  dispatch, grants, dshHome: process.env.DSH_HOME, pollIntervalMs: 100,
   log: (m) => console.log('conn: ' + m),
   onStateChange: (s) => console.log('STATE ' + s.state + (s.port ? ' port=' + s.port : '')),
 })
 console.log('STATE ' + conn.state.state + ' (initial)')
 conn.start()
+// T30 的 E2E 需要一次**真实的人工编辑**：外部放一个 marker，这里改缓冲区、版本 +1，
+// 然后删掉 marker。这样"人在窗口里敲了一下"在跨进程层面是真的（DSH 侧完全不知情）。
+const marker = j(process.env.DSH_HOME, 'human-touch')
+setInterval(() => {
+  if (!x(marker)) return
+  mv(marker, marker + '.done', () => {})
+  doc.text = doc.text.replace('hello', 'hello-HUMAN')
+  doc.version += 1
+  doc.isDirty = true
+  console.log('HUMAN_EDIT version=' + doc.version)
+}, 100)
 // 关键：connector 的轮询定时器与 socket 都 unref() 了 —— 库不许延长宿主进程寿命。
 // 真实宿主（VSCode 扩展宿主）自己就是长活的；这个 fixture 是裸 node，
 // 必须自己挂一个 keepalive，否则 start() 之后进程立刻优雅退出。
@@ -139,7 +182,11 @@ try {
   log('e2e', `DSH_HOME=${home}`)
 
   // 1) 先起编辑器侧：它必须在没有 DSH 的情况下保持 idle（真实冷启动路径）
-  edProc = launch(editorSide, 'editor')
+  // T30：给扩展侧一个**真**工作区（写能力要过路径守卫，会真的 lstat）。
+  const wsRoot = join(home, 'ws')
+  mkdirSync(wsRoot, { recursive: true })
+  writeFileSync(join(wsRoot, 'e2e.js'), 'hello world' + String.fromCharCode(10) + 'second line' + String.fromCharCode(10))
+  edProc = launch(editorSide, 'editor', { E2E_WS: wsRoot })
   await waitLine(edProc, /STATE idle/, 'editor', 8000)
   check('无 DSH 时编辑器保持 idle 不崩', true)
 
@@ -182,7 +229,58 @@ try {
     editors.result?.total === 2 && editors.result.editors.some((e) => e.isActive),
     JSON.stringify(editors.result ?? editors.error))
 
-  // 8) 未实现能力 → -32005
+  // 8) T30：版本锚点（读 version → 人工改缓冲区 → 旧 version 写 → -32012）
+  const docPath = join(wsRoot, 'e2e.js')
+  const st0 = await rpc(dshProc, { id: 10, method: 'vscode.getDocumentState', params: { file: docPath } })
+  check('vscode.getDocumentState 跨进程成功（拿到宿主版本号）',
+    typeof st0.result?.version === 'number' && st0.result.version === 5,
+    JSON.stringify(st0.result ?? st0.error))
+  check('getDocumentState 形状齐全（version/isDirty/eol/lineCount/textLength/file）',
+    ['version', 'isDirty', 'eol', 'lineCount', 'textLength', 'file'].every((k) => k in (st0.result ?? {})),
+    JSON.stringify(Object.keys(st0.result ?? {})))
+
+  const g = await rpc(dshProc, { id: 11, op: 'grant', sessionId: 'e2e' })
+  check('editing.grant 跨进程发放（对端已存档）',
+    g.result?.delivered === true && typeof g.result?.id === 'string', JSON.stringify(g.result ?? g.error))
+  const grant = { id: g.result.id, epoch: g.result.epoch }
+  const write = (id, expectedVersion) => rpc(dshProc, {
+    id, method: 'vscode.applyEdit', sessionId: 'e2e',
+    params: {
+      file: docPath,
+      range: { start: { line: 2, column: 1 }, end: { line: 2, column: 7 } },
+      text: 'SECOND', grant, expectedVersion,
+    },
+  })
+
+  const v0 = st0.result.version
+  const ok = await write(12, v0)
+  check('版本相符的写入跨进程成功（applied 且 saved:false）',
+    ok.result?.applied === true && ok.result?.saved === false,
+    JSON.stringify(ok.result ?? ok.error))
+
+  const vAfterWrite = await readVersion(30)
+  check('写入后宿主版本 +1（锚点用的是宿主自己的 version）', vAfterWrite === v0 + 1,
+    `version=${vAfterWrite}, expected ${v0 + 1}`)
+
+  // 人工编辑：外部放 marker，扩展侧自己改缓冲区（DSH 侧完全不知情），版本再 +1。
+  writeFileSync(join(home, 'human-touch'), '1')
+  await waitLine(edProc, /HUMAN_EDIT/, 'editor', 5000)
+  let vHuman = null
+  for (let i = 0; i < 40 && vHuman !== v0 + 2; i += 1) {
+    vHuman = await readVersion(40 + i)
+    if (vHuman !== v0 + 2) await new Promise((r) => setTimeout(r, 100))
+  }
+  check('人工编辑使版本 +1（DSH 侧只能通过 getDocumentState 看见）', vHuman === v0 + 2, `version=${vHuman}`)
+
+  // ★ 核心回归：拿"人工编辑之前"的版本去写 —— T4 里这一下会静默吃掉别人的字。
+  const stale = await write(13, vAfterWrite)
+  check('★ 旧版本写入跨进程被 -32012 拦下（T4 的丢字场景在真链路上消失）',
+    stale.error?.code === -32012, JSON.stringify(stale.result ?? stale.error))
+  const vAfterStale = await readVersion(60)
+  check('冲突时宿主零调用：版本没有再 +1', vAfterStale === vHuman,
+    `version=${vAfterStale} (expected ${vHuman})`)
+
+  // 9) 未实现能力 → -32005
   const bad = await rpc(dshProc, { id: 3, method: 'vscode.diff' })
   check('未实现能力回 -32005', bad.error?.code === -32005, JSON.stringify(bad.error))
 
@@ -198,6 +296,12 @@ try {
 } finally {
   for (const c of children) { try { c.kill() } catch { /* ignore */ } }
   rmSync(home, { recursive: true, force: true })
+}
+
+/** 读一次宿主版本号（T30 的读侧糖衣，跨进程）。 */
+async function readVersion(id) {
+  const r = await rpc(dshProc, { id, method: 'vscode.getDocumentState', params: { file: join(home, 'ws', 'e2e.js') } })
+  return r.result?.version ?? null
 }
 
 /** 通过 stdin 驱动 DSH 侧 fixture，返回 RESULT 行解析结果。 */

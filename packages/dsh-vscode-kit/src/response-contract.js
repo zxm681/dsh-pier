@@ -174,6 +174,52 @@ const RESPONSE_CONTRACTS = Object.freeze({
       ['textLength', isIntegerAtLeast(0), 'textLength:int>=0'],
     ],
   },
+
+  /**
+   * 文档状态（T30：写入锚点的读侧）。
+   *
+   * `version` 是**写入前置条件**的唯一凭据，所以它必须是非负整数：对端回 `"12"`、
+   * `12.5`、`null` 都不是"小毛病" —— 拿它去和 `expectedVersion` 比会得到
+   * "永远冲突"或（string/int 混比时）"永远不等"两种极难排查的行为，在这里拦最省事。
+   *
+   * `eol` 收窄成 `'lf'|'crlf'`：它是给消费者判断"要不要按行拼回去"用的，枚举比布尔清楚；
+   * 对端将来要加 `'cr'` 必须先改契约（这正是契约该有的摩擦）。
+   *
+   * `textUnavailable` **只能**是 `true`（`v === true`，不是 `isBoolean`）：
+   * 出现这个键 = 一句事实陈述"文本超限、整份没给"。回 `false` 或 `null` 说明对端把
+   * 语义搞混了，此时更该判畸形响应（-32009），而不是替它猜。
+   * 且它与 `text` **互斥** —— 见 `consistency`。
+   */
+  'vscode.getDocumentState': {
+    expected: 'object with file:string(non-empty), version:int>=0, isDirty:boolean, '
+      + "eol:in{lf,crlf}, lineCount:int>=1, textLength:int>=0, "
+      + 'and at most one of text?:string / textUnavailable===true',
+    fields: [
+      ['file', isNonEmptyString, 'file:string(non-empty)'],
+      ['version', isIntegerAtLeast(0), 'version:int>=0'],
+      ['isDirty', isBoolean, 'isDirty:boolean'],
+      ['eol', oneOf('lf', 'crlf'), 'eol:in{lf,crlf}'],
+      ['lineCount', isIntegerAtLeast(1), 'lineCount:int>=1'],
+      ['textLength', isIntegerAtLeast(0), 'textLength:int>=0'],
+    ],
+    optional: [
+      ['textUnavailable', (v) => v === true, 'textUnavailable===true'],
+      // 空文本是合法值（空文件 `includeText:true` 回 `text:''`），所以用 isString 而不是非空。
+      ['text', isString, 'text:string'],
+    ],
+    consistency: [
+      [
+        (r) => !('text' in r && 'textUnavailable' in r),
+        'text and textUnavailable are mutually exclusive',
+      ],
+      [
+        // `text` 是**全集**：长度必须与 `textLength` 自洽，否则消费者拿到的"全文"
+        // 和它算坐标用的行长度是两套数（T4 的坐标漂移有同一类成因）。
+        (r) => (typeof r.text !== 'string' ? true : r.text.length === r.textLength),
+        'text.length must equal textLength',
+      ],
+    ],
+  },
 })
 
 /** 已登记形状的能力名（测试与诊断用）。 */
@@ -250,6 +296,19 @@ function checkFields(object, contract, prefix) {
     //    契约是 `languageId?:string` / `source?:string`，不是 `string|null`
     //    （评审 F1：此处曾把 null 当未提供，于是 null 被放行）。
     if (!test(read.value)) return { at: join(prefix, path), value: describeLeaf(read.value), label }
+  }
+
+  // 跨字段一致性（T30 起支持）：单字段谓词表达不了「二者互斥」「最多出现一个」这类约束，
+  // 而这类约束恰恰是消费者会拿来分派逻辑的东西 —— 两个都给出来时它该信谁？
+  // 谓词只回布尔，不读内容、不回显值（与其余校验同一口径）。
+  for (const [test, label] of contract.consistency ?? []) {
+    let ok = false
+    try {
+      ok = test(object) === true
+    } catch {
+      ok = false
+    }
+    if (!ok) return { at: prefix || '(result)', value: 'inconsistent', label }
   }
 
   return null

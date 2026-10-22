@@ -10,8 +10,10 @@ import { existsSync, statSync } from 'node:fs'
 
 import * as vscode from 'vscode'
 
+import { BridgeError, ERR } from '../../dsh-vscode-kit/src/protocol.js'
 import { GrantStore } from '../../dsh-vscode-kit/src/grant.js'
 import { createCapabilities } from './capabilities.js'
+import { applyEditAtomically } from './edit-transaction.js'
 
 /**
  * 建适配器。`output` 是扩展的日志通道（可选）。
@@ -146,60 +148,138 @@ export function createHost(output) {
   }
 
   /**
-   * 编辑器对「这个 uri」持有的那个文档的规范化路径 —— 也就是**缓冲区身份**
-   * （评审 R3-1：能力层拿它判定"写到底落在哪个文档"）。
+   * 读**文档**状态：版本号 / 脏标记 / 换行 / 行数 / 长度 /（可选）全文（T30）。
    *
-   * 为什么要绕一圈从编辑器取、而不是把传进来的 `abs` 原样回传：传进来的字符串只能证明
-   * "请求发到了哪"，证明不了"编辑器把它落到哪个文档"。`uri.fsPath` 是编辑器自己的视图
-   * （大小写规范化、盘符统一、将来换成别的 scheme 也是它说了算），所以只有它算身份。
+   * `version` 取 `TextDocument.version` —— 编辑器自己维护的单调计数器，缓冲区每被改动
+   * 一次就 +1（用户手打、另一个插件、格式化、DSH 自己上一次写入，全都算）。
+   * 它是"我基于哪一刻的内容写了这组坐标"唯一能被机制证明的锚点：
+   * **不要**换成年月日、内容哈希或 `mtime` —— 哈希要整份算、`mtime` 只在落盘时变，
+   * 而 T4 的错就发生在"缓冲区改了但磁盘没变"的那个窗口里。
    *
-   * 优先在已打开的文档里找（同步、零成本）；找不到再 `openTextDocument` 一次
-   * （对已打开的文档返回同一个内存实例，不会读盘覆盖未保存改动）。这一步在写入**之后**，
-   * 所以它的 await 不构成写前窗口。
+   * `text` 只在 `includeText:true` 时给出，且必须是**全集**：超限的判定与整份不给
+   * 的动作都在能力层（`MAX_TEXT_BYTES`），适配器不许自己截一刀再交出去。
+   *
+   * 成本说明：`doc.getText()` 是一次 O(n) 拷贝，未 dirty 时理论上可用磁盘大小替代，
+   * 但那样 `textLength`（UTF-16 码元数）就得另算一遍，两个口径混在一起更容易出错；
+   * 何况 VS Code 默认拒绝打开 >50MB 的文本文件，能走到这里的文档本来就有上界。
+   * 8 MiB 这道坎保护的是**协议通道与消费者上下文**，不是宿主内存。
+   */
+  async function readDocumentState(abs, opts = {}) {
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(abs))
+    const text = doc.getText()
+    return {
+      version: doc.version,
+      isDirty: doc.isDirty === true,
+      eol: doc.eol === vscode.EndOfLine.CRLF ? 'crlf' : 'lf',
+      lineCount: doc.lineCount,
+      textLength: text.length,
+      byteLength: Buffer.byteLength(text, 'utf8'),
+      ...(opts?.includeText === true ? { text } : {}),
+    }
+  }
+
+  /**
+   * 读**文档**里 0-based `range` 的当前文本 —— `expectedRangeText` 逐字比对的唯一数据源（T30）。
+   *
+   * 同样走 `openTextDocument`（已打开的文档返回同一个内存实例），所以读到的是用户
+   * 眼前缓冲区里的那几个字符，不是磁盘上的。
+   */
+  async function readRangeText(abs, range) {
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(abs))
+    const start = new vscode.Position(range.start.line, range.start.column)
+    const end = new vscode.Position(range.end.line, range.end.column)
+    return doc.getText(new vscode.Range(start, end))
+  }
+
+  /**
+   * 拿「这个 uri 的**编辑器**」—— 写入事务只能在 `TextEditor` 上做（T32）。
+   *
+   * 为什么非要编辑器（上游语义，见 `edit-transaction.js` 头注释）：`TextEditor.edit` 的
+   * 提交路径会**带着构造时的文档版本号**交给主线程做 CAS，而 `WorkspaceEdit` 那条路
+   * 只能表达"按提交那一刻的当前版本改"。拿不到编辑器就**失败闭合**（`-32603`），
+   * **绝不退回** `vscode.workspace.applyEdit` —— 退回去等于把 B1（版本检查与写入不原子）
+   * 原样留着，还多一层"看起来成了"的假象。
+   *
+   * 优先用已经可见的编辑器（零成本、不动用户布局）；否则 `showTextDocument` 建一个：
+   * `preserveFocus` 不抢焦点，`preview` 用预览页签（不在用户标签栏里插一条常驻）。
+   * 副作用如实记在这里：**给没有打开的文件写入，会顺手把它以预览页签打开**。这是为了
+   * 拿到版本 CAS 付的代价，比"静默吃掉人工改动"便宜得多。
    *
    * @param {import('vscode').Uri} uri
-   * @returns {Promise<string|null>} 拿不到就返回 null（由能力层失败闭合）
+   * @param {string} abs 规范化后的绝对路径（只用于错误信息）
+   * @returns {Promise<import('vscode').TextEditor>}
    */
-  async function documentIdentity(uri) {
+  async function editorFor(uri, abs) {
+    const want = uri.toString()
+    let doc
     try {
-      const want = uri.toString()
-      const open = (vscode.workspace.textDocuments ?? [])
-        .find((d) => d?.uri?.toString() === want)
-      if (open) return typeof open.uri.fsPath === 'string' ? open.uri.fsPath : null
-      const doc = await vscode.workspace.openTextDocument(uri)
-      return typeof doc?.uri?.fsPath === 'string' ? doc.uri.fsPath : null
+      doc = await vscode.workspace.openTextDocument(uri)
     } catch (err) {
-      log(`documentIdentity: cannot resolve ${uri?.fsPath ?? uri}: ${err?.message ?? err}`)
-      return null
+      throw new BridgeError(ERR.NOT_FOUND,
+        `cannot open ${abs} as a text document: ${err?.message ?? err}`,
+        { method: 'vscode.applyEdit', path: abs, reason: 'document-unavailable' })
+    }
+    const visible = (vscode.window.visibleTextEditors ?? [])
+      .find((e) => e?.document?.uri?.toString() === want)
+    if (visible) return visible
+    try {
+      return await vscode.window.showTextDocument(doc, { preserveFocus: true, preview: true })
+    } catch (err) {
+      throw new BridgeError(ERR.INTERNAL,
+        `cannot obtain a text editor for ${abs}: ${err?.message ?? err}`,
+        { method: 'vscode.applyEdit', path: abs, reason: 'editor-unavailable' })
     }
   }
 
   /**
    * 在**缓冲区**里替换一段文本（`vscode.applyEdit` 的唯一落点）。
    *
+   * **版本等值的判定在事务内部**（`edit-transaction.js`）：这里先把编辑器拿到手
+   * （这一步的 await 允许存在 —— 它发生在事务**之前**），然后由事务在
+   * `editor.edit(callback)` 的同步 callback 里读 `document.version`、比对、构造 edit。
+   * 本文件只负责把 0-based `range` 塞进 `vscode.Range` 并调 `builder.replace`。
+   *
    * `range` 是 **0-based**（转换在 capabilities 层做完了，见 `toApiRange`）——
-   * 这里只负责把它原样塞进 `vscode.Range`。**一次减法都不许再出现在本文件**：
-   * 边界之上的层已经保证"一个 1-based 输入只被减一次"，这里再减就是错行。
+   * **一次减法都不许再出现在本文件**：边界之上的层已经保证"一个 1-based 输入只被减一次"。
    *
    * **绝不保存**：不调 `document.save()`、不调 `workbench.action.files.save`。
-   * 返回 `{applied, documentPath}`：`vscode.workspace.applyEdit` 返回 false 表示编辑器拒绝了
-   * 这次编辑（例如文件被外部改动导致版本不匹配），必须如实上报，不许当成成功。
-   * `documentPath` 是**编辑器报告的文档身份**（评审 R3-1）—— 拿不到就是 null，
+   * 返回 `{applied, documentPath, version}`：`applied:false` 表示编辑器拒绝了这次编辑，
+   * 必须如实上报，不许当成成功；`documentPath` 是**编辑器报告的文档身份**
+   * （评审 R3-1：就是那个实际收到这次编辑的 `TextEditor.document.uri.fsPath`，
+   * 比"按 uri 再查一次"更直接 —— 它是写入对象的本身）—— 拿不到就是 null，
    * 让能力层失败闭合，而不是编一个"就是我传进去的路径"糊过去。
+   *
+   * @param {string} abs
+   * @param {{start:{line:number,column:number}, end:{line:number,column:number}}} range 0-based
+   * @param {string} text
+   * @param {number} expectedVersion 调用方准备这组坐标时所基于的 `document.version`（**必填**）
    */
-  async function applyEditText(abs, range, text) {
-    const uri = vscode.Uri.file(abs)
-    const edit = new vscode.WorkspaceEdit()
-    const start = new vscode.Position(range.start.line, range.start.column)
-    const end = new vscode.Position(range.end.line, range.end.column)
-    edit.replace(uri, new vscode.Range(start, end), text)
-    const applied = await vscode.workspace.applyEdit(edit)
-    // 身份在写入**之后**取：它要回答的是"这次编辑落到哪个文档"，不是"我们请求了哪个路径"。
-    const documentPath = await documentIdentity(uri)
+  async function applyEditText(abs, range, text, expectedVersion) {
+    const editor = await editorFor(vscode.Uri.file(abs), abs)
+    const outcome = await applyEditAtomically({
+      editor,
+      file: abs,
+      expectedVersion,
+      apply: (builder) => {
+        // Range 在**事务的同步区间里**构造：坐标与版本属于同一刻，不许在事务外先算好。
+        builder.replace(
+          new vscode.Range(
+            new vscode.Position(range.start.line, range.start.column),
+            new vscode.Position(range.end.line, range.end.column),
+          ),
+          text,
+        )
+      },
+      log,
+    })
     log(`applyEditText: ${abs} [${range.start.line}:${range.start.column}-`
-      + `${range.end.line}:${range.end.column}] ${text.length} chars → applied=${applied}`
-      + ` (not saved; document=${documentPath ?? 'unknown'})`)
-    return { applied: applied === true, documentPath }
+      + `${range.end.line}:${range.end.column}] ${text.length} chars → applied=${outcome.applied}`
+      + ` v${outcome.version} (not saved; document=${outcome.documentPath ?? 'unknown'})`)
+    return {
+      applied: outcome.applied === true,
+      documentPath: outcome.documentPath,
+      version: outcome.version,
+    }
   }
 
   return {
@@ -213,6 +293,8 @@ export function createHost(output) {
     collectDiagnostics,
     listEditors,
     readDocumentShape,
+    readDocumentState,
+    readRangeText,
     applyEditText,
     log,
   }

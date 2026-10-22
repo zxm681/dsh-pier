@@ -7,7 +7,8 @@
  */
 
 import * as vscode from 'vscode'
-import { writeFileSync, mkdirSync } from 'node:fs'
+import { writeFileSync, mkdirSync, readFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -40,7 +41,13 @@ function readConfig() {
  *
  * @returns {Promise<object>} 结构化结果，永远不抛
  */
-async function runSelfTest(dispatch) {
+/**
+ * T32 版本锚点自检用的夹具内容（**只在这里定义一次**：写盘与"盘上没变"的期望值必须是
+ * 同一个字面量，否则两边各写一份，改一处就会静默变成假通过）。
+ */
+const FIXTURE_TEXT = 'line1\nline2\nline3\n'
+
+async function runSelfTest(dispatch, { grants } = {}) {
   const out = { at: new Date().toISOString(), vscodeVersion: vscode.version, steps: [] }
   const step = async (name, fn) => {
     try {
@@ -118,6 +125,67 @@ async function runSelfTest(dispatch) {
     }
   })
 
+  // 3) T32：版本锚点的**事务内**判定 —— 这是单测/E2E 证明不了的那半边。
+  //    单测里假宿主可以"配合"；这里用的是真实 `TextEditor.edit`（会让真
+  //    `document.version` +1，和用户键入同一条路径）与真实 dispatch。
+  await step('applyEdit:versionAnchor', async () => {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath
+    if (!root) return { skipped: 'no workspace folder open (writes must land inside a trusted root)' }
+    if (!vscode.workspace.isTrusted) return { skipped: 'workspace not trusted' }
+
+    const file = join(root, `dsh-selftest-anchor-${process.pid}.txt`)
+    writeFileSync(file, FIXTURE_TEXT, 'utf8')
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file))
+    const editor = await vscode.window.showTextDocument(doc, { preserveFocus: true, preview: true })
+
+    // ① 锚点：用消费者会用的那条路（getDocumentState）拿版本
+    const state = await dispatch('vscode.getDocumentState', { file })
+    const expectedVersion = state.version
+
+    // ② 一次**真实编辑**（走 TextEditor.edit，版本 +1 —— 这就是评审 B1 里"人工插一行"）
+    const humanOk = await editor.edit((b) => b.insert(new vscode.Position(0, 0), 'HUMAN '))
+    const versionAfterHuman = doc.version
+
+    // ③ 立刻用**旧版本**写：必须 -32012，且一个字都没写进去
+    const grant = { id: randomBytes(16).toString('hex'), epoch: randomBytes(16).toString('hex') }
+    const link = { name: 'selftest-local-link' }
+    grants?.adopt({ id: grant.id, epoch: grant.epoch, link })
+    let code = null
+    let data = null
+    try {
+      await dispatch('vscode.applyEdit', {
+        file,
+        range: { start: { line: 2, column: 1 }, end: { line: 2, column: 6 } },
+        text: 'DSH!!',
+        expectedVersion,
+        grant,
+      }, { link })
+    } catch (err) {
+      code = err?.code ?? null
+      data = err?.data ?? null
+    }
+
+    const textAfter = doc.getText()
+    const evidence = {
+      expectedVersion,
+      versionAfterHuman,
+      humanEditApplied: humanOk === true,
+      code,
+      data,
+      versionUnchangedByRefusedWrite: doc.version === versionAfterHuman,
+      humanKept: textAfter.includes('HUMAN '),
+      nothingWritten: !textAfter.includes('DSH!!'),
+      diskUnchanged: readFileSync(file, 'utf8') === FIXTURE_TEXT,
+    }
+    // 自检的判据写在这里：不是"跑通了"，是"旧版本写**必须被拒**"。
+    if (code !== -32012) {
+      throw new Error(`expected -32012 for a stale write, got ${String(code)} (${JSON.stringify(data)})`)
+    }
+    if (!evidence.nothingWritten) throw new Error('stale write landed: DSH!! is in the buffer')
+    if (!evidence.versionUnchangedByRefusedWrite) throw new Error('the refused write still bumped the version')
+    return evidence
+  })
+
   try {
     const dir = join(process.env.USERPROFILE ?? process.env.HOME ?? tmpdir(), '.dsh', 'dsh-vscode-kit')
     mkdirSync(dir, { recursive: true })
@@ -169,7 +237,7 @@ export function activate(context) {
   if (cfg.selfTestOnStart) {
     const selfTestKey = `selftestRun:${vscode.version}`
     ;(async () => {
-      const result = await runSelfTest(dispatch)
+      const result = await runSelfTest(dispatch, { grants })
       const pass = result.steps.every((s) => s.ok)
       log(`self-test ${pass ? 'PASS' : 'FAIL'}: ${JSON.stringify(result.steps.map((s) => `${s.name}=${s.ok}`))}`)
       ctx.selfTest = { ...result, key: selfTestKey }
@@ -202,7 +270,7 @@ export function activate(context) {
     }),
 
     vscode.commands.registerCommand('dshKit.selfTest', async () => {
-      const result = await runSelfTest(dispatch)
+      const result = await runSelfTest(dispatch, { grants })
       const pass = result.steps.every((s) => s.ok)
       const text = result.steps.map((s) => `${s.ok ? 'PASS' : 'FAIL'} ${s.name}${s.ok ? '' : ` — ${s.error}`}`).join('\n')
       log(`self-test ${pass ? 'PASS' : 'FAIL'}\n${text}`)

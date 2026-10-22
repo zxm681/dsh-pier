@@ -57,6 +57,98 @@ const DEFAULT_HELLO_WAIT_MS = 1_000
 const DEFAULT_GRANT_ACK_TIMEOUT_MS = 3_000
 
 /**
+ * 「写入必须带版本锚点」的本地闸门（T30）。
+ *
+ * 位置：**糖衣里、request() 之前**。这里抛 = 一个字节都没发出去。
+ * 为什么不靠对端的 -32602 兜底：对端拒是一次"谈成了但被否"，会经过网络、会重试、
+ * 会在日志里长得像故障；而这里是编程错误（调用方没读版本就写），越早越响越安全。
+ * 绕过糖衣直接 `kit.request('vscode.applyEdit', {...})` 仍然会被扩展侧 -32602 拒 ——
+ * 两道闸，本地这道负责"让安全路径成为唯一路径"，远端那道负责"不信本端"。
+ *
+ * @param {string} method
+ * @param {object} params
+ * @throws {BridgeError} ERR.INVALID_PARAMS（`data.stage === 'local'`）
+ */
+function assertLocalExpectedVersion(method, params) {
+  const v = params?.expectedVersion
+  if (Number.isInteger(v) && v >= 0) return
+  const reason = v === undefined ? 'expected-version-missing'
+    : typeof v !== 'number' ? 'expected-version-not-a-number'
+      : !Number.isInteger(v) ? 'expected-version-not-an-integer'
+        : 'expected-version-negative'
+  throw new BridgeError(ERR.INVALID_PARAMS,
+    'vscode.applyEdit requires a version anchor: pass expectedVersion (integer >= 0) read from '
+    + 'kit.vscode.getDocumentState(file).version. Refusing to send a write without one.',
+    { method, reason, stage: 'local', got: { type: typeof v } })
+}
+
+/** 只是对象（不是数组/null/类实例的壳子）—— 形态判定用。 */
+function isPlainObject(v) {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+/** 从 opts 里挑出**属于请求参数**的锚点字段（位置形态没有别的地方放它们）。 */
+const ANCHOR_FIELDS = ['expectedVersion', 'expectedRangeText', 'grant']
+
+/**
+ * 归一化 `applyEdit` 的两种调用形态。
+ *
+ *  位置形态：applyEdit(file, range, text, opts)   ← 文档里的主形态
+ *  对象形态：applyEdit(params, opts)              ← 既有调用方（含 demo 与 39 条用例）在用
+ *
+ * 锚点字段可以放在位置形态的 opts 里、或对象形态的 params/opts 里 —— 但不论哪种，
+ * 归一化之后必须落在 `params` 上（协议里它们就是请求参数，不是传输选项）。
+ * `timeoutMs` / `waitForEditor` 这类**传输**选项继续由 opts 往下传给 request()。
+ */
+function normalizeApplyEditArgs(args) {
+  const first = args[0]
+  if (typeof first === 'string') {
+    const opts = isPlainObject(args[3]) ? args[3] : {}
+    const params = { file: first }
+    if (args[1] !== undefined) params.range = args[1]
+    if (args[2] !== undefined) params.text = args[2]
+    for (const k of ANCHOR_FIELDS) if (opts[k] !== undefined) params[k] = opts[k]
+    return { params, opts }
+  }
+  const params = isPlainObject(first) ? { ...first } : {}
+  const opts = isPlainObject(args[1]) ? args[1] : {}
+  for (const k of ANCHOR_FIELDS) {
+    if (params[k] === undefined && opts[k] !== undefined) params[k] = opts[k]
+  }
+  return { params, opts }
+}
+
+/**
+ * 归一化 `getDocumentState` 的两种调用形态：
+ *  `getDocumentState(file, opts?)` / `getDocumentState({file, includeText?}, opts?)`。
+ * 只有 `file` 是参数，`opts`（超时等）原样往下传。
+ */
+function normalizeDocStateArgs(args) {
+  const first = args[0]
+  if (typeof first === 'string') {
+    return { params: withDocStateFields({ file: first }, args[1]), opts: isPlainObject(args[1]) ? args[1] : {} }
+  }
+  const params = isPlainObject(first) ? withDocStateFields({ ...first }, args[1]) : {}
+  return { params, opts: isPlainObject(args[1]) ? args[1] : {} }
+}
+
+/**
+ * 把 `includeText` 从「第二个参数（选项）」提升进**请求参数**。
+ *
+ * ★ 真机踩出来的（T30 验收，2026-10-22）：开头只把它留在 opts 里 —— 于是能力层根本
+ *   收不到 `includeText`，`getDocumentState(file,{includeText:true})` 静默返回
+ *   "没有 text 也没有 textUnavailable"的形状。单测当时还断言了错误行为（`opts.includeText`），
+ *   所以两边一起绿、现场一起错。区分口径：
+ *     `includeText` = **业务参数**（决定宿主给不给全文）→ 进 params；
+ *     `timeoutMs` / `waitForEditor` = **传输选项**（决定这趟怎么发）→ 留在 opts。
+ */
+function withDocStateFields(params, opts) {
+  if (!isPlainObject(opts)) return params
+  if ('includeText' in opts) params.includeText = opts.includeText
+  return params
+}
+
+/**
  * 消费者拿到的服务对象。
  *
  * 只暴露两个入口：request（万能）与 vscode（糖衣）。其余字段以 `_` 前缀标为内部，
@@ -94,7 +186,28 @@ class VscodeKit {
       listOpenEditors: (params, opts) => this.request('vscode.listOpenEditors', params, opts),
       // 写入类：额外过会话授权绑定门（契约 §6.1，发送前）。糖衣只做转发，
       // 门在 request() 里统一判 —— 绕过糖衣走 raw request 也照样过门。
-      applyEdit: (params, opts) => this.request('vscode.applyEdit', params, opts),
+      //
+      // 版本锚点（T30）：缺 `expectedVersion` 在这里**本地就拒**，一个字节都不发。
+      // 为什么不交给对端回 -32602：错误越晚被人看见，越容易被当成"网络问题"重试，
+      // 而重试的正是那条没有锚点的写路径 —— 安全路径要成为**唯一**路径，
+      // 就不能留一条"发出去再被拒"的软路径。
+      // 两种调用形态都支持，但**都要**带锚点：
+      //   applyEdit(file, range, text, { expectedVersion, expectedRangeText?, grant? })
+      //   applyEdit({ file, range, text, expectedVersion, expectedRangeText?, grant }, opts?)
+      // 写成 `async` 是有意的：让"本地拒绝"与"对端拒绝"都表现为**被拒的 Promise**，
+      // 调用方只需一种处理方式（否则一半要 try/catch、一半要 .catch，总会有人漏）。
+      applyEdit: async (...args) => {
+        const { params, opts } = normalizeApplyEditArgs(args)
+        assertLocalExpectedVersion('vscode.applyEdit', params)
+        return this.request('vscode.applyEdit', params, opts)
+      },
+      // 读取版本号（写入锚点的读侧）。同样是双形态：
+      //   getDocumentState(file, { includeText?, timeoutMs? })
+      //   getDocumentState({ file, includeText? }, opts?)
+      getDocumentState: (...args) => {
+        const { params, opts } = normalizeDocStateArgs(args)
+        return this.request('vscode.getDocumentState', params, opts)
+      },
     }
 
     /**
@@ -798,9 +911,16 @@ export function apply(ctx, config = {}) {
       : notReady('vscode.listOpenEditors')),
     // 写入类糖衣：与 VscodeKit.vscode.applyEdit 成对出现（契约 §2.2 第②步：
     // 要加就两处都加；只加一处会让 facade 消费者拿到裸 TypeError）。
-    applyEdit: (params, opts) => (kit
-      ? kit.vscode.applyEdit(params, opts)
+    // 注意这里用 `(...args)` 原样转发：`VscodeKit.vscode.applyEdit` 支持
+    // 位置形态与对象形态两种调用，facade 若只转发 `(params, opts)` 就会把位置形态
+    // 的第二个参数（range）当成 opts 丢掉。
+    applyEdit: (...args) => (kit
+      ? kit.vscode.applyEdit(...args)
       : notReady('vscode.applyEdit')),
+    // 写入锚点的读侧（T30），同样两处都加。
+    getDocumentState: (file, opts) => (kit
+      ? kit.vscode.getDocumentState(file, opts)
+      : notReady('vscode.getDocumentState')),
   }
 
   /**

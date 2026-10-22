@@ -44,6 +44,21 @@ export const ERR = Object.freeze({
    * 不许拿 -32001（未授权）/ -32005（能力缺失）/ -32007（未连接）/ -32008（版本不兼容）代替。
    */
   EDIT_NOT_BOUND: -32010,
+  /**
+   * 文档版本锚点冲突（T30：`vscode.applyEdit` 的前置条件）。**新增**码位，不动既有码语义。
+   *
+   * 只在写入类能力上产生，两种情形共用本码、处置**完全一样**（停下、重新读
+   * `vscode.getDocumentState`、用新版本重发；**不得**拿旧版本重试）：
+   *  - 版本不符：`data = { file, expected, actual }`
+   *    —— 调用方基于的版本已不是目标文档的版本（缓冲区在中间被人改过）；
+   *  - 范围文本不符：`data = { file, expectedVersion, actualVersion,
+   *    reason:'range-text-mismatch', expectedTextLength, actualTextLength }`
+   *    —— 版本对得上，但那一块内容不是调用方以为的内容（典型：同版本下范围记错）。
+   *
+   * 不许拿 -32004（超时）/ -32005（能力缺失）/ -32010（没有授权绑定）代替：
+   * 那三个说的是"这次没谈成"，本码说的是"谈成了，但你的锚点过期了"。
+   */
+  DOCUMENT_VERSION_CONFLICT: -32012,
 })
 
 /** 错误码 → 稳定诊断串（日志与测试断言都用它，改动即破坏契约）。 */
@@ -63,6 +78,7 @@ export const ERR_NAME = Object.freeze({
   [ERR.PROTOCOL_INCOMPATIBLE]: 'protocol-incompatible',
   [ERR.INVALID_RESPONSE]: 'invalid-response',
   [ERR.EDIT_NOT_BOUND]: 'edit-not-bound',
+  [ERR.DOCUMENT_VERSION_CONFLICT]: 'document-version-conflict',
 })
 
 /**
