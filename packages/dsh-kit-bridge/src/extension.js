@@ -143,11 +143,18 @@ export function activate(context) {
     return { disabled: true }
   }
 
-  const { dispatch, capabilities } = createDispatcher(output)
+  // 授权表与"当前活连接"共享槽都由 dispatcher 建：能力层（执行前复核）与连接层
+  // （收 bridge.grant / 断线置失效）**必须共用同一份**，否则判定与状态各说各话。
+  const { dispatch, capabilities, grants, linkState } = createDispatcher(output)
   log(`capabilities: ${capabilities.join(', ')}`)
 
   const connector = createConnector({
     dispatch,
+    grants,
+    linkState,
+    // 评审 F7：连接层的绑定门也要先问信任 —— 否则「未信任工作区」这个事实
+    // 会随「带不带 grant」变成两种回答（-32010 / -32006），调用方分不清该做什么。
+    isTrusted: () => vscode.workspace.isTrusted,
     log,
     dshHome: cfg.dshHome,
     pollIntervalMs: cfg.pollIntervalMs,

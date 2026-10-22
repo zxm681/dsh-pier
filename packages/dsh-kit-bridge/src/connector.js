@@ -17,6 +17,9 @@ import {
   judgeProtocolVersion,
 } from '../../dsh-vscode-kit/src/protocol.js'
 import { discoveryDir, listLiveBridges } from '../../dsh-vscode-kit/src/discovery.js'
+import {
+  GrantStore, extensionWriteGate, isWriteMethod,
+} from '../../dsh-vscode-kit/src/grant.js'
 import { CAPABILITIES } from './capabilities.js'
 
 /** 扩展对外声明的身份（写进 hello，DSH 侧据此判能力）。 */
@@ -33,6 +36,13 @@ export const EXTENSION_VERSION = '0.2.0'
  * @param {number} [deps.requestTimeoutMs]                   出站请求默认超时
  * @param {(info) => void} [deps.onStateChange]              状态变化观测点
  * @param {(method, params, ctx) => any} [deps.onRequest]    额外入站处理方法（测试/扩展用）
+ * @param {import('../../dsh-vscode-kit/src/grant.js').GrantStore} [deps.grants]
+ *        会话授权表。**必须与能力层共用同一个实例**（否则收下的 grant 与判定的 grant 是两份）。
+ * @param {{link: object|null}} [deps.linkState]
+ *        "当前活连接"共享槽：本层写，能力层的绑定门读。不给就自己建一个（单测够用）。
+ * @param {() => boolean} [deps.isTrusted]
+ *        工作区信任（判序在 grant 之前，评审 F7）。不给则信任门不参与判定 ——
+ *        能力层的 `assertTrusted` 仍会在 handler 里守住 -32006。
  */
 export function createConnector(deps) {
   const {
@@ -44,14 +54,79 @@ export function createConnector(deps) {
     requestTimeoutMs = 30_000,
     onStateChange = () => {},
     onRequest,
+    grants: injectedGrants,
+    linkState: injectedLinkState,
   } = deps
+
+  /** 会话授权表（§6.1.1 ①-b(2)）：本端只**存** DSH 发来的 grant，绝不自己生成。 */
+  const grants = injectedGrants ?? new GrantStore()
+  /** 当前活连接（对象引用；绑定门按**身份**判，不按任何序号）。 */
+  const linkState = injectedLinkState ?? { link: null }
+
+  /**
+   * 绑定门（契约 §6.1.1 ②A：`handleInbound` 交给 `dispatch` 之前）。
+   * 与能力层那道门是**同一个函数**（`extensionWriteGate`）：两道门位置不同、
+   * 判定同源，改一处不会让另一处偷偷失效。
+   */
+  // 信任优先（评审 F7）：未信任工作区时不在这道门里下结论，让 dispatch 的
+  // `assertTrusted` 给出 -32006 —— 用户该看到"工作区没被信任"，不是"没授权"。
+  const isTrusted = typeof deps.isTrusted === 'function' ? deps.isTrusted : null
+  const grantGate = extensionWriteGate(grants, { isTrusted })
+
+  /**
+   * 连接消失的唯一收口：清共享槽 + 让挂在这条连接上的 grant 全部失效。
+   * `cause:'disconnected'` 由**本端本地**完成（§6.1.1 ①-b(2)），不依赖 DSH 事后补发 ——
+   * 断线时 DSH 可能自己都不在了。
+   */
+  function forgetLink(gone) {
+    if (linkState.link === gone) linkState.link = null
+    if (!gone) return 0
+    const n = grants.closeLink(gone)
+    if (n > 0) log(`edit grant invalidated by disconnect (${n})`, 'info')
+    return n
+  }
 
   /**
    * DSH 侧发来的入站方法（编辑器 → DSH 是请求方向，DSH → 编辑器是能力方向）。
-   * 首版只有 ping；保留 onRequest 注入点给测试与未来扩展。
+   *
+   * `bridge.grant` / `bridge.grantRevoke` 属于**授权生命周期**，不是业务能力：
+   * 它们必须能在版本门之前处理（甚至版本不兼容时也要能收，才好把凭证清掉），
+   * 所以放在这张表里，而不是丢给 capabilities。
    */
   const inbound = {
     'bridge.ping': (params) => ({ pong: true, at: Date.now(), echo: params }),
+    /**
+     * DSH 发放/覆盖授权（契约 §6.1.1 ①-b）。
+     * ★ 单一生成方是 DSH：本端**只存**，绝不自己算 id/epoch、也不补默认值。
+     * `ctx.link` 是承载这条报文的连接实例 —— 存下来的就是它（对象身份，§6.1.1 ①-c 第 6 行）。
+     */
+    'bridge.grant': (params, ctx) => {
+      const g = params?.grant ?? params
+      const record = grants.adopt({
+        id: g?.id,
+        epoch: g?.epoch,
+        link: ctx?.link ?? null,
+        sessionId: g?.sessionId ?? null,
+        windowId: g?.windowId ?? null,
+      })
+      log(`edit grant adopted (id ${String(record.id).slice(0, 8)}…)`, 'info')
+      return { ok: true, id: record.id }
+    },
+    /**
+     * DSH 撤销授权（契约 §6.1.1 ①-b(2)：会话侧撤销 → `cause:'revoked'`）。
+     * 幂等：id 已经不在（或从没收到过）也回 ok —— 撤销是"确保它不再有效"，
+     * 不是"必须曾经存在"，报错只会让 DSH 侧多做一次无意义重试。
+     */
+    'bridge.grantRevoke': (params) => {
+      const id = params?.id
+      if (typeof id !== 'string' || id === '') {
+        throw new BridgeError(ERR.INVALID_PARAMS, 'params.id must be a non-empty string',
+          { method: 'bridge.grantRevoke' })
+      }
+      const revoked = grants.revoke(id, 'revoked')
+      if (revoked) log(`edit grant revoked (id ${id.slice(0, 8)}…)`, 'info')
+      return { ok: true, revoked }
+    },
     'bridge.hello': (params) => {
       // DSH 连上后主动 hello（协议 §3.4：每条连接的第一条消息由服务端下发）。
       // 扩展侧在这里做**对等自检**（契约 §4.1 ②）：判 DSH 的 ptv，不兼容就地降级。
@@ -64,7 +139,6 @@ export function createConnector(deps) {
         capabilities: CAPABILITIES,
       }
     },
-    ...(undefined), // 自定义 onRequest 在 handleInbound 里串接，不放进这张表
   }
 
   /** @type {{state: string, port?: number, pid?: number, dshVersion?: string, since: number}} */
@@ -168,7 +242,7 @@ export function createConnector(deps) {
    */
   function handleInbound(method, params, ctx) {
     const fn = inbound[method]
-    if (fn) return fn(params)
+    if (fn) return fn(params, ctx)
     // ★ 协议兼容门（契约 §4.1 硬规则）：版本未知/不兼容时**不得执行任何业务能力**。
     //   ★ 评审 F3：这一层必须跑在 `onRequest` 注入点**之前** —— 注入点可以把任意业务
     //   方法接走（`custom !== undefined` 直接 return），门若在它后面，将来往注入点挂
@@ -177,12 +251,16 @@ export function createConnector(deps) {
     if (!String(method).startsWith('bridge.') && peer.status !== 'compatible') {
       throw incompatibleError(method)
     }
+    // ★ 绑定门第一处（契约 §6.1.1 ②A）：`handleInbound` 交给 `dispatch` 之前。
+    //   位置在版本门之后（版本不兼容时先说 -32008，不必谈凭证）、onRequest 之前
+    //   （注入点同样不许绕门）。第二处在 capabilities.dispatch 里，两处同源。
+    grantGate(method, params, ctx)
     if (onRequest) {
       const custom = onRequest(method, params, ctx)
       if (custom !== undefined) return custom
     }
     // 未实现的能力由 capabilities.dispatch 回 -32005（可与「协议层方法不存在」区分）。
-    return dispatch(method, params)
+    return dispatch(method, params, ctx)
   }
 
   /** 连一个具体实例。失败 reject，不重试（重试交给轮询）。 */
@@ -233,6 +311,8 @@ export function createConnector(deps) {
       authorize: (incoming, method) => method === 'bridge.hello' || incoming === info.token,
     })
     link.socket = s
+    // 这是"当前活连接"的**唯一**写入口；绑定门读的就是它（对象身份，不是序号）。
+    linkState.link = link
 
     const feed = createLineSplitter((line) => link.handleLine(line))
     s.on('data', (chunk) => {
@@ -240,8 +320,12 @@ export function createConnector(deps) {
     })
     s.on('close', () => {
       if (socket !== s) return
+      const gone = link
       socket = null
       link = null
+      // ★ 断开即失效（§6.1.1 ①-b(2)）：挂在这条连接上的 grant 全部 `cause:'disconnected'`。
+      //   本端本地完成 —— 不依赖 DSH 补发、也不靠任何计数器。
+      forgetLink(gone)
       setState('idle', { reason: 'disconnected' })
       log('disconnected from DSH', 'warn')
     })
@@ -303,12 +387,15 @@ export function createConnector(deps) {
       if (pollTimer) return
       tick().finally(schedule)
     },
-    /** 立刻重连（忽略当前轮询节奏）。 */
+    /** 立刻重连（忽略当前轮询节奏）。旧的 grant 随旧连接一起作废。 */
     reconnect() {
-      if (socket) {
-        try { socket.destroy() } catch { /* ignore */ }
+      if (socket || link) {
+        const gone = link
+        try { socket?.destroy() } catch { /* ignore */ }
         socket = null
         link = null
+        // 新连接会取代旧连接：按连接**对象身份**判失效，旧 grant 一律 disconnected。
+        forgetLink(gone)
       }
       setState('idle', { reason: 'manual-reconnect' })
       return tick()
@@ -316,6 +403,7 @@ export function createConnector(deps) {
     stop() {
       stopped = true
       if (pollTimer) { clearTimeout(pollTimer); pollTimer = null }
+      const gone = link
       if (link) link.close('connector stopped')
       if (socket) {
         // 与 DSH 侧同一个教训：协议层 close ≠ 传输层 close。
@@ -323,6 +411,7 @@ export function createConnector(deps) {
       }
       socket = null
       link = null
+      forgetLink(gone)
       setState('idle', { reason: 'stopped' })
     },
     get state() { return state },
@@ -330,6 +419,10 @@ export function createConnector(deps) {
     /** 对端版本协商结果（诊断/测试用；不属于协议契约字段）。 */
     get peer() { return peer },
     get attempts() { return attempts },
+    /** 会话授权表（扩展宿主内唯一一份；测试与诊断用）。 */
+    get grants() { return grants },
+    /** 当前活连接的共享槽（`{link}`）；绑定门读的就是它。 */
+    get linkState() { return linkState },
     /** 供测试/扩展调用 DSH 侧方法。 */
     request(method, params, opts) {
       if (!link) {

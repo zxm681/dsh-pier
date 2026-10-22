@@ -23,6 +23,8 @@ import {
   DISCOVERY_DIR_NAME, resolveDshHome, discoveryDir, writeDiscoveryFile,
   removeDiscoveryFile, isProcessAlive, sweepDiscoveryDir, listLiveBridges,
 } from './discovery.js'
+// 写入类方法的入口护栏（评审 F5）：广播没有回执，不许承载写入类方法。
+import { assertWritableNotNotified } from './grant.js'
 
 export {
   DISCOVERY_DIR_NAME, resolveDshHome, discoveryDir, writeDiscoveryFile,
@@ -113,6 +115,12 @@ export async function startBridgeServer(opts = {}) {
     sweep = true,
     onConnected,
     onAuthorized,
+    /**
+     * 连接消失（close/error/server 关闭）回调 —— 插件层用它回收挂在该连接上的
+     * 会话授权（`grants.closeLink(link)`，契约 §6.1.1 ①-b(2)「执行端本地完成」）。
+     * 传的是**连接对象本身**：回收判据是对象身份，不是序号。
+     */
+    onLinkClosed,
   } = opts
 
   if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
@@ -172,8 +180,22 @@ export async function startBridgeServer(opts = {}) {
     socket.on('data', (chunk) => {
       try { feed(chunk) } catch (err) { onError?.(err); socket.destroy() }
     })
-    socket.on('close', () => { link.close('peer disconnected'); trusted.delete(link); links.delete(link) })
-    socket.on('error', (err) => { onError?.(err); link.close(err.message); trusted.delete(link); links.delete(link) })
+    socket.on('close', () => {
+      // ★ 会话授权绑定（契约 §6.1.1 ①-b(2)）：承载连接消失 → 该连接上的 grant 立刻失效。
+      //   判据是**连接对象身份**（grant 表里存的就是这个 link 引用），不碰序号/计数。
+      //   顺序：先关协议终端（此后这条连接既不能发也不能收），再通知插件层回收凭证。
+      link.close('peer disconnected')
+      trusted.delete(link)
+      links.delete(link)
+      try { onLinkClosed?.(link) } catch (err) { onError?.(err) }
+    })
+    socket.on('error', (err) => {
+      onError?.(err)
+      link.close(err.message)
+      trusted.delete(link)
+      links.delete(link)
+      try { onLinkClosed?.(link) } catch (e) { onError?.(e) }
+    })
     // 允许进程在只剩空闲连接时也能退出（测试与 CLI 场景都需要）
     socket.unref?.()
     // 连接序号在 links.add 的同一处赋值：一条连接一个序号，建连那一刻定死，
@@ -217,6 +239,9 @@ export async function startBridgeServer(opts = {}) {
       link.close('server shutting down')
       // 关键：只 close 协议终端不会断 TCP，server.close() 会一直等连接结束。
       try { link.socket?.destroy() } catch { /* ignore */ }
+      // 关闭服务 = 所有承载连接都没了：挂在它们上面的编辑授权一并失效
+      // （契约 §6.1.1 ①-b(2)：宿主重启后不落盘、全消失）。
+      try { onLinkClosed?.(link) } catch (err) { onError?.(err) }
     }
     links.clear()
     trusted.clear()
@@ -273,6 +298,9 @@ export async function startBridgeServer(opts = {}) {
     if (typeof method !== 'string' || method === '') {
       throw new BridgeError(ERR.INVALID_PARAMS, 'method must be a non-empty string', { method })
     }
+    // ★ 评审 F5：写入类方法**不许**走广播。广播是无回执的「发出去就算」，既过不了
+    //   会话绑定门，也拿不到扩展侧落点前的复核与回执；入口直接拒，要求改用 request()。
+    assertWritableNotNotified(method, 'broadcast')
 
     /** 只对「还活着」的连接投递：socket 已销毁 / 终端已关的连接收不到。 */
     const live = () => {

@@ -154,6 +154,26 @@ const RESPONSE_CONTRACTS = Object.freeze({
       },
     ],
   },
+
+  /**
+   * 写入类能力的返回形状（契约 §5.1：新增能力**必须**登记返回清单，否则不许进
+   * `CAPABILITIES`；test/response-contract.test.js 有双向守门）。
+   *
+   * ★ `saved` 不是"布尔字段"，是**业务承诺**：T3 的 applyEdit 只改缓冲区、绝不落盘。
+   *   所以谓词写成 `v === false` 而不是 `isBoolean` —— 对端一旦回 `saved:true`，
+   *   本端必须判成畸形响应（-32009），而不是"看起来成功了"。
+   *   `file` 是规范化后的绝对路径（对端 realpath 过的那个），非空字符串。
+   *   `textLength` = 本次写入文本的长度（UTF-16 码元数，即 `text.length`）。
+   */
+  'vscode.applyEdit': {
+    expected: 'object with applied:boolean, file:string(non-empty), saved===false, textLength:int>=0',
+    fields: [
+      ['applied', isBoolean, 'applied:boolean'],
+      ['file', isNonEmptyString, 'file:string(non-empty)'],
+      ['saved', (v) => v === false, 'saved===false'],
+      ['textLength', isIntegerAtLeast(0), 'textLength:int>=0'],
+    ],
+  },
 })
 
 /** 已登记形状的能力名（测试与诊断用）。 */

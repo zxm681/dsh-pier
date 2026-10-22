@@ -16,6 +16,11 @@ import {
   BridgeError, ERR, PROTOCOL_VERSION, SUPPORTED_PROTOCOL, hasCapability, judgeProtocolVersion,
 } from './protocol.js'
 import { validateResponse } from './response-contract.js'
+import {
+  GrantStore, GRANT_REASONS, GRANT_TOMBSTONE_LIMIT, WRITE_METHODS, isWriteMethod,
+  judgeGrant, judgeSession, dshWriteGate, editNotBoundError, rejectParamsSessionId,
+  assertWritableNotNotified,
+} from './grant.js'
 
 /** cordis 插件名，必须与 package.json 的 name 一致。 */
 export const name = 'dsh-vscode-kit'
@@ -43,17 +48,30 @@ const DEFAULT_CONNECT_WAIT_MS = 3_000
 const DEFAULT_HELLO_WAIT_MS = 1_000
 
 /**
+ * 等扩展侧 `bridge.grant` 回执的上限（评审 F9）。
+ *
+ * 3s 是"本机 IPC 往返 + 扩展侧存表"的量级：正常路径几毫秒就回，超时基本等于
+ * handler 没装 / 连接半死。宁可让 `grant()` 报错（用户重试），也不要把
+ * `delivered:true` 变成"写进 socket 了"的同义词。
+ */
+const DEFAULT_GRANT_ACK_TIMEOUT_MS = 3_000
+
+/**
  * 消费者拿到的服务对象。
  *
  * 只暴露两个入口：request（万能）与 vscode（糖衣）。其余字段以 `_` 前缀标为内部，
  * 消费者插件不该碰，但排障时可读。
  */
 class VscodeKit {
-  constructor({ server, dshVersion, connectWaitMs, helloWaitMs, onLog }) {
+  constructor({ server, dshVersion, connectWaitMs, helloWaitMs, grantAckTimeoutMs, onLog }) {
     this.server = server
     this.dshVersion = dshVersion
     this.connectWaitMs = connectWaitMs
     this.helloWaitMs = helloWaitMs ?? DEFAULT_HELLO_WAIT_MS
+    // 等扩展侧回 `{ok:true,id}` 的上限（评审 F9）：没回执 = 没生效，超时即撤销本地记录。
+    this.grantAckTimeoutMs = Number.isInteger(grantAckTimeoutMs) && grantAckTimeoutMs > 0
+      ? grantAckTimeoutMs
+      : DEFAULT_GRANT_ACK_TIMEOUT_MS
     this.onLog = onLog
 
     // 这里**故意没有** lastEditor 槽：对端身份（协议版本 / 能力清单）挂在
@@ -74,7 +92,97 @@ class VscodeKit {
       getSelection: (params, opts) => this.request('vscode.getSelection', params, opts),
       getDiagnostics: (params, opts) => this.request('vscode.getDiagnostics', params, opts),
       listOpenEditors: (params, opts) => this.request('vscode.listOpenEditors', params, opts),
+      // 写入类：额外过会话授权绑定门（契约 §6.1，发送前）。糖衣只做转发，
+      // 门在 request() 里统一判 —— 绕过糖衣走 raw request 也照样过门。
+      applyEdit: (params, opts) => this.request('vscode.applyEdit', params, opts),
     }
+
+    /**
+     * 会话授权（编辑会话凭证）表 —— **本端是唯一生成方**（契约 §6.1.1 ①）。
+     *
+     * `link` 存的是连接**对象引用**：失效判定按对象身份比，不按任何序号（铁律 §6.1.1）。
+     */
+    this.grants = new GrantStore()
+    /** 发送前门的唯一实例：判的是「这次要发的那条连接」，不是别的视图。 */
+    this._writeGate = dshWriteGate(this.grants)
+
+    /**
+     * 编辑授权对外面（`kit.editing.*`）。
+     *
+     * 三个动作各有明确归属：
+     *  - `grant()`：**只在有已准入且协议兼容的目标连接时**发放；没有就抛错，不排队不缓存。
+     *  - `revoke(id?)`：先本地失效（权威），再尽力通知对端；通知送不到不影响撤销结论。
+     *  - `list()`：诊断视图，不是判据。
+     */
+    this.editing = {
+      grant: (opts) => this.grantEditing(opts),
+      revoke: (id) => this.revokeEditing(id),
+      list: () => this.grants.entries(),
+    }
+  }
+
+  /**
+   * 内部：写路径的目标连接 —— **只从 grant 记录来**，绝不经过 `_activeLink()`。
+   *
+   * ★ 评审 F3：契约 §6.1.1 明令写目标是保存的 `grant.link`。旧实现先按
+   *   `_activeLink()` 选 argmax 再比 grant，于是「A 有有效 grant、B 后连」会让
+   *   A 的合法写请求被拒绝（绑定门退化成"只许给当前活跃窗口写"）。
+   *   这里的口径反过来：**谁能写**由记录决定，**写给谁**也是记录决定；
+   *   B 后连不影响 A 一个字，A 消失也只是失败（不许回落到 B）。
+   *
+   * @param {any} params      业务参数（可能携带调用方显式给的 grant，用于世代判定）
+   * @param {string|null} sessionId 调用方上下文里的会话身份（不来自 params）
+   * @returns {{link: object|null, params: any}}
+   */
+  _bindWriteTarget(params, sessionId) {
+    const given = params?.grant ?? null
+    // ① 找记录：调用方显式给了 grant 就按 id 找（世代/形状由判定表判）；
+    //    没给就按**可信会话**找 —— 契约要的是"由会话找到记录"，不是"由凭据找窗口"。
+    const found = given ? this.grants.lookup(given?.id ?? null) : this._grantForSession(sessionId)
+    const record = found?.kind === 'active' ? found.record : null
+    const link = record ? this._liveTargetOrNull(record) : null
+
+    // ② 补内部字段（评审 F2 后半句「第三方不应负责复制内部 grant 字段」）：
+    //    只有"调用方没给"时才补，且补的是**同一条**记录。调用方给了就一个字都不改，
+    //    否则错误的 epoch 会被悄悄改对，第 5 行永远命中不了。
+    if (link && !given && record) {
+      return { link, params: { ...params, grant: { id: record.id, epoch: record.epoch } } }
+    }
+    return { link: record ? link : null, params }
+  }
+
+  /**
+   * 按可信会话找它当前的有效 grant（同一会话重复发放时后一条覆盖前一条，
+   * 与 `issue()` 的 supersede 语义一致）。
+   * @param {string|null} sessionId
+   * @returns {{kind: 'active', record: object} | null}
+   */
+  _grantForSession(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return null
+    let best = null
+    for (const record of this.grants.active()) {
+      if (record.sessionId === sessionId) best = record
+    }
+    return best ? { kind: 'active', record: best } : null
+  }
+
+  /**
+   * 记录里的承载连接**现在还活着吗**（评审 F3「检查该 link 的准入/版本/存活」）。
+   *
+   * 死连接不在这里另造一种拒绝：就地按断线回收（与 `onLinkClosed` 同一机制），
+   * 然后让判定表第 3 行给出 `target-gone` —— 拒绝理由只有一处来源。
+   * @param {object} record
+   * @returns {object|null}
+   */
+  _liveTargetOrNull(record) {
+    const target = record?.link ?? null
+    if (!target) return null
+    const dead = target.closed === true
+      || target.socket?.destroyed === true
+      || (this.server?.trusted instanceof Set && !this.server.trusted.has(target))
+    if (!dead) return target
+    this.grants.closeLink(target)
+    return null
   }
 
   /**
@@ -205,8 +313,12 @@ class VscodeKit {
    * @param {string} method
    * @param {object|null} [link] 判定与发包必须是**同一条连接**；省略时取当前目标
    */
-  _assertProtocolCompatible(method, link) {
-    if (typeof method === 'string' && method.startsWith('bridge.')) return
+  _assertProtocolCompatible(method, link, opts = {}) {
+    // `exempt:false` 强制不豁免 —— 授权发放用：`bridge.grant` 发的是写权限凭证，
+    // 虽然名字在 `bridge.*` 里，但绝不能投给版本不兼容的对端（契约 §6.1：只有
+    // 「已准入且协议兼容」的目标连接才配拿到 grant）。
+    const exempt = opts.exempt ?? (typeof method === 'string' && method.startsWith('bridge.'))
+    if (exempt) return
     // ★ 评审 F1：判据只取这一条连接自己上报的版本（`link.editor`），不再有全局槽。
     //   调用方（request/notify）已经选好了 link 并会用它发包，所以「判的」=「发的」。
     const target = link ?? this._activeLink()
@@ -251,6 +363,223 @@ class VscodeKit {
   }
 
   /**
+   * 发放编辑授权（契约 §6.1 / §6.1.1 ①）。
+   *
+   * v1 最小形态（本卡定的申请流程，契约把"申请"留给协作编辑）：
+   *  - **只在有目标连接时发放**：没有已准入且协议兼容的目标，直接抛（-32007 / -32008）。
+   *    **不排队、不缓存** —— 排队等于发放一条对端永远收不到的凭证，还留在表里放行；
+   *  - `id`/`epoch` 在这里各 `randomBytes(16)` 生成一次，此后终生不变（单一生成方=DSH）；
+   *  - `sessionId` 是**调用方自己的 DSH 会话标识**（消费者从它自己的上下文里取，
+   *    不是线路数据、也不是 grant 的一部分）。写请求必须带来同一个值才会放行
+   *    （评审 F2；判定在 `dshWriteGate` 里，与七行判定同源）。不给 = 这条 grant
+   *    永远不能用于写入（fail closed），所以正常调用都必须给；
+   *  - 投递用 **request 并等结构化回执**（评审 F9）：扩展侧 `bridge.grant` 的 handler
+   *    先把凭证存进它自己的表，然后才回 `{ok:true, id}`。收到回执才算发放成功；
+   *    送不出去 / 超时 / 回执形状不对 → **撤销本地记录**再抛（不自动重发，
+   *    重发由调用方决定，因为每次重发都可能覆盖旧凭证）。
+   *
+   * 异步（返回 Promise）：v1 起投递语义从"写进 socket 就算送达"改成了"等到回执"。
+   *
+   * @param {{sessionId?: string|null, windowId?: string|null, timeoutMs?: number}} [opts]
+   * @returns {Promise<{id: string, epoch: string, windowId: string|null,
+   *                    delivered: true, ack: {ok: true, id: string}}>}
+   * @throws {BridgeError} -32007 没有目标连接 / -32008 目标协议不兼容
+   *   / -32004 等不到回执 / -32010 `sessionId` 缺失或形状不对（凭证无法参与会话绑定）
+   */
+  async grantEditing({ sessionId = null, windowId = null, timeoutMs } = {}) {
+    const link = this._activeLink()
+    if (!link) {
+      throw new BridgeError(
+        ERR.DISCONNECTED,
+        'no editor connected; refusing to grant editing (no target to deliver the grant to)',
+        { method: 'bridge.grant', reason: 'no-editor', granted: false },
+      )
+    }
+    // 版本门：`bridge.grant` 是协议层方法，但发的是**写权限凭证**，强制不豁免。
+    this._assertProtocolCompatible('bridge.grant', link, { exempt: false })
+
+    // 没有会话标识的 grant 是"谁拿到都能用"的 bearer 凭证 —— 契约要的会话授权不允许。
+    // 在发放时就拒，而不是先发出去再指望没人用得上（评审 F2：默认允许 null 会话就是洞）。
+    // 判序排在「有没有目标 / 版本是否兼容」之后：那两条是更前置的前提，
+    // 先回答"现在能不能发"，再回答"发给谁、能不能用"。
+    if (typeof sessionId !== 'string' || sessionId === '') {
+      throw new BridgeError(ERR.INVALID_PARAMS,
+        "editing.grant requires sessionId (the caller's own DSH session); "
+        + 'a grant without a session can never authorize a write',
+        { method: 'bridge.grant', reason: 'session-required', field: 'sessionId', granted: false })
+    }
+
+    // ★ 评审 R2-2：**先 stage，不生效**。
+    //   第一版这里是 `issue()`（生成即入 active 表），于是"等回执"这段时间里
+    //   `lookup` / `_grantForSession` / writeGate 已经能拿它放行 —— 评审实测：回执永不返回，
+    //   同 session 的并发写照样到达写宿主。而"对端还不知道这条凭证"这件事，恰恰是
+    //   最不能放行的时刻（对端没有记录可复核，写请求等于裸奔）。
+    //   pending 存在两张表之外，因此没有任何放行路径能看到它。
+    const { id, epoch } = this.grants.stage({ link, sessionId, windowId })
+    const grant = { id, epoch, sessionId, windowId }
+    const waitMs = Number.isInteger(timeoutMs) && timeoutMs > 0 ? timeoutMs : this.grantAckTimeoutMs
+    let ack
+    try {
+      // 走 request（不是 notify）：没有回执就没有"扩展已存档"的证据（评审 F9）。
+      // link.request 构造时带着 token，凭据的显式携带规则不变。
+      ack = await link.request('bridge.grant', { grant }, { timeoutMs: waitMs })
+      if (!ack || ack.ok !== true || ack.id !== id) {
+        throw new BridgeError(ERR.INTERNAL,
+          'bridge.grant was not acknowledged with {ok:true, id}; the editor did not store this grant',
+          { method: 'bridge.grant', reason: 'no-ack', granted: false, ack: ack ?? null })
+      }
+      // ★ 回执合格还不够：承载连接/授权必须**此刻仍然有效**（评审 R2-2 ②）。
+      //   等回执期间连接可能已经断了（或已被移出 trusted）—— 那时激活一条绑定在
+      //   死连接上的凭证，等于制造一条永远无法复核的权限。
+      if (!this._isCarrierUsable(link)) {
+        throw new BridgeError(ERR.DISCONNECTED,
+          'carrier connection went away while waiting for bridge.grant ack; grant not activated',
+          { method: 'bridge.grant', reason: 'carrier-gone', granted: false })
+      }
+      // ★ 原子激活：同步一次状态迁移（Map delete+set，中间没有 await）。
+      //   失败说明这条 pending 已被 supersede / 连接回收作废 —— 按"没生效"处理，绝不重试。
+      if (!this.grants.activate(id)) {
+        throw new BridgeError(ERR.INTERNAL,
+          'staged grant was retired before activation (superseded or carrier closed); not granted',
+          { method: 'bridge.grant', reason: 'grant-vanished', granted: false })
+      }
+    } catch (err) {
+      // ★ 失败收口（评审 R2-2 ③；评审 R3-2 修正）：本地**和**对端都要处理，
+      //   但**只针对这一条 id**，绝不波及承载连接。
+      //   不能只清本地 pending —— 执行端可能已经 adopt 了这条权限（报文到了、回执没回来，
+      //   或者回执在半路丢了），"我没收到回执"不等于"对端没存档"。所以：
+      //     discard 本地 pending → 给这个 id 发 grantRevoke（尽力而为、幂等）→ 记诊断。
+      //   ⚠️ 不 `link.close()`、不 `socket.destroy()`：那条连接上可能已经有一条健康的新
+      //   授权（旧 pending 被 supersede 之后才失败），而且小超时可以反复触发 —— 踢连接
+      //   既是误伤也是断连 DoS（评审实测，见 `_abortPendingGrant` 的注释）。
+      this._abortPendingGrant(id, link, err)
+      if (err instanceof BridgeError) throw err
+      throw new BridgeError(ERR.INTERNAL,
+        `bridge.grant delivery failed: ${err?.message ?? err}`,
+        { method: 'bridge.grant', reason: 'delivery-failed', granted: false })
+    }
+    this.onLog?.('info', `edit grant issued (id ${id.slice(0, 8)}…, window ${windowId ?? 'n/a'})`)
+    return { id, epoch, windowId, delivered: true, ack: { ok: true, id } }
+  }
+
+  /** @param {object} link 这条连接此刻还能承载凭证吗（活连接 + 仍被准入）。 */
+  _isCarrierUsable(link) {
+    if (!link || typeof link !== 'object') return false
+    if (link.closed === true) return false
+    if (link.socket?.destroyed === true) return false
+    if (this.server?.trusted instanceof Set && !this.server.trusted.has(link)) return false
+    return true
+  }
+
+  /**
+   * 发放失败的对端收口（评审 R2-2 ③，**评审 R3-2 重做**）。
+   *
+   * 契约要求"失败闭合"，而**只有本端闭合是不够的**：对端可能已经存下这条凭证
+   * （报文到了、回执没回来，或者回执在半路丢了）—— "我没收到回执"不等于"对端没存档"。
+   *
+   * 所以：本地 discard 这条 pending → 给**这一个 id** 发 `grantRevoke`（尽力而为、幂等）
+   * → 记诊断。**就这三件事。**
+   *
+   * ⚠️ **绝不终止承载连接**（这是 R3-2 的结论，第一版写错了）：
+   *  - 承载连接上可能已经有一条**另一条健康的新授权**（旧 pending 被 supersede 之后才失败），
+   *    踢掉连接就是误伤它 —— 评审实测过 `NEW_GRANT_COLLATERAL {socketDestroyed:true,
+   *    active:0, newGrantState:'tombstone', cause:'disconnected'}`。
+   *  - 而且这是可反复触发的：小超时重试几次就能把连接反复踢断，构成断连 DoS
+   *    （评审实测 `SMALL_DEADLINE_DOS`：一轮就把连接踢了）。
+   * 每条失败只该影响**它自己那一条 id**。代价是"撤销报文可能没送到、对端留着一条本端
+   * 已经不认的凭证"—— 但那条凭证的对端回执从没回来过，本端从头到尾没放过行，
+   * 而这个残留由"连接断开时按 disconnected 回收"兜底，不需要靠主动断连来换。
+   *
+   * 关于"对端活着但一直不回执"（R3-2 ④）：pending 超时后按 `revoked` 永久作废
+   * （不入 `disconnected`：连接还活着，这不是断连），并且**不禁**同一连接重新 `grant()`——
+   * `stage()` 只作废该连接的既有记录，不会因为"上一条超时过"而拒绝新的一次发放，
+   * 否则一次超时就把这个窗口永久锁死了。
+   *
+   * @param {string} id 已 stage 的 grant id（**只动它**）
+   * @param {object} link 承载连接（只用来发撤销报文，不碰它的生命周期）
+   * @param {unknown} err 触发收口的错误（只用于日志）
+   */
+  _abortPendingGrant(id, link, err) {
+    // ① 本地：pending → 墓碑 revoked（永久作废；墓碑留给下次拿它来写时解释成 revoked
+    //    而不是含糊的 no-grant）。命中不了（已被 supersede / 连接已回收）也算正常幂等。
+    let discarded = false
+    try {
+      discarded = this.grants.discardPending(id, 'revoked')
+    } catch (e) {
+      this.onLog?.('warn', `abort pending grant: local discard failed: ${e?.message ?? e}`)
+    }
+    // ② 对端：**只给这个 id** 发撤销（带 token；不等回执 —— 拿不到回执正是这次失败的
+    //    原因之一，再等一次没有意义）。连接没了就发不出去，那也无所谓：对端连接没了，
+    //    它本地的 pending 也跟着没了。
+    let delivered = false
+    if (link && link.closed !== true && link.socket?.destroyed !== true) {
+      try {
+        link.notify('bridge.grantRevoke', { id, reason: 'revoked' }, { withToken: true })
+        delivered = true
+      } catch (e) {
+        this.onLog?.('warn', `abort pending grant: revoke notify failed: ${e?.message ?? e}`)
+      }
+    }
+    // ③ 诊断：说清"作了废什么 / 撤销有没有送到 / 连接刻意保留"。不碰连接，
+    //    所以同连接上的其它 active grant 与后续 grant() 都完全不受影响。
+    this.onLog?.('warn',
+      `edit grant ${id.slice(0, 8)}… aborted after failed delivery: ${err?.message ?? err}`
+      + ` (pending ${discarded ? 'discarded' : 'already gone'}; revoke`
+      + ` ${delivered ? 'sent' : 'undeliverable'}; carrier link kept alive)`)
+
+    // ④ 迁移合法性自检（R2-4 思想）：收口之后，这个 id **绝不能**还是 active/pending。
+    //    留一条诊断比留一条隐形权限便宜得多。
+    try {
+      const after = this.grants.lookup(id)
+      if (after?.kind === 'active') {
+        this.onLog?.('error', `abort pending grant: ${id.slice(0, 8)}… is STILL active after abort`)
+      }
+    } catch { /* 诊断失败不影响收口结论 */ }
+  }
+
+  /**
+   * 撤销编辑授权（`revoke(id?)`；省略 id 则撤销本端所有有效 grant）。
+   *
+   * **先本地失效，再尽力通知**：契约 §6.1.1 ①-b(2) 要求执行端的失效在本地完成、
+   * 不依赖事后补发 —— 所以撤销报文丢了也不改变"已经撤销"这个结论。
+   *
+   * @param {string} [id]
+   * @returns {{revoked: string[], count: number}}
+   */
+  revokeEditing(id) {
+    const ids = (id === undefined || id === null)
+      ? this.grants.active().map((r) => r.id)
+      : [id]
+    const revoked = []
+    for (const one of ids) {
+      const found = this.grants.lookup(one)
+      if (!found) {
+        // 可能是仍在等回执的 pending（`lookup` 按契约看不见它）：撤销 = 不再等它。
+        // 对端这时可能已经存档，所以照样发撤销报文（拿 pendingCarrier 找到承载连接）。
+        const carrier = this.grants.pendingCarrier(one)
+        if (this.grants.discardPending(one, 'revoked')) {
+          try { carrier?.notify('bridge.grantRevoke', { id: one, reason: 'revoked' }, { withToken: true }) } catch { /* 尽力而为 */ }
+          revoked.push(one)
+        }
+        continue // 查不到/已是墓碑：幂等，不报错
+      }
+      if (found.kind !== 'active') continue
+      const link = found.record.link
+      this.grants.revoke(one, 'revoked') // ① 本地权威失效
+      try { // ② 尽力通知（带 token；对端可能已经不在，发不出去不影响结论）
+        link.notify('bridge.grantRevoke', { id: one, reason: 'revoked' }, { withToken: true })
+      } catch (err) {
+        this.onLog?.('warn', `edit grant revoke notify failed: ${err?.message ?? err}`)
+      }
+      revoked.push(one)
+    }
+    if (revoked.length > 0) {
+      this.onLog?.('info', `edit grant revoked (${revoked.length})`)
+    }
+    return { revoked, count: revoked.length }
+  }
+
+  /**
    * 发起一次桥接请求。
    *
    * @param {string} method 形如 'vscode.openFile'，方法名即能力命名空间。
@@ -260,39 +589,76 @@ class VscodeKit {
    * @throws {BridgeError} -32001 未授权 / -32003 不存在 / -32004 超时 / -32005 不支持
    *   / -32007 未连接 / -32008 协议版本不兼容（契约 §4.1，发包前就拒）
    *   / -32009 对端响应形状不合格（契约 §5.1，facade 出口校验）
+   *   / -32010 写入类方法没有有效授权绑定（契约 §6.1，**发包前就拒，一个字节都不发**）
    */
   async request(method, params = {}, opts = {}) {
     if (typeof method !== 'string' || method === '') {
       throw new BridgeError(ERR.INVALID_PARAMS, 'method must be a non-empty string')
     }
 
+    const write = isWriteMethod(method)
+    // ★ 评审 F2：`params.sessionId` 直接拒 —— 会话身份不许由业务参数自证。
+    if (write) rejectParamsSessionId(params, method)
+
     const waitForEditor = opts.waitForEditor !== false
     const waitMs = waitForEditor ? (opts.waitMs ?? this.connectWaitMs) : 0
-    const link = await this._waitForEditor(waitMs)
 
-    if (!link) {
-      throw new BridgeError(
-        ERR.DISCONNECTED,
-        'no editor connected; make sure the dsh-kit-bridge VSCode extension is running',
-        { method, discoveryDir: discoveryDir(), waitedMs: waitMs },
-      )
+    // 调用方上下文里的会话身份（本端可信来源：消费者自己的 DSH 上下文，不是线路数据）。
+    const sessionId = typeof opts.sessionId === 'string' && opts.sessionId !== ''
+      ? opts.sessionId
+      : null
+
+    // ── 选目标（评审 F3）──
+    // 读路径：当前活跃连接；写路径：**grant 记录里的承载连接**，不经过 `_activeLink()`。
+    let link
+    let wireParams = params
+    if (write) {
+      const bound = this._bindWriteTarget(params, sessionId)
+      link = bound.link
+      wireParams = bound.params
+    } else {
+      link = await this._waitForEditor(waitMs)
+      if (!link) {
+        throw new BridgeError(
+          ERR.DISCONNECTED,
+          'no editor connected; make sure the dsh-kit-bridge VSCode extension is running',
+          { method, discoveryDir: discoveryDir(), waitedMs: waitMs },
+        )
+      }
     }
 
-    // ── 协议兼容门（契约 §4.1 ②）：跑在能力预检之前、发包之前 ──
+    // ── 协议兼容门 + 能力预检：判的、发的是**同一条**连接 ──
     // hello 之前没有对端版本，属于「未知版本」：先等一小段（扩展连上后立刻报 hello），
     // 等不到就按不兼容处理 —— 绝不把「还没报」推断成 v1。
     // ★ 评审 F1：等的是**这条连接**的 hello，判的也是这条连接，发还是这条连接。
     //   以前读全局槽，A 的 hello 会给 B 的目标位背书（探针 B/D 实测 fail-open）。
-    if (!link.editor && waitForEditor && this.helloWaitMs > 0) {
-      await this._waitForHello(link, Math.min(this.helloWaitMs, waitMs))
+    // ★ 评审 F3：写路径的 link 可能为 null（没有有效记录），此时**不**回退到
+    //   `_activeLink()` —— 显式传 null 进去，让下面那道门按判定表给出 -32010。
+    if (link) {
+      if (!link.editor && waitForEditor && this.helloWaitMs > 0) {
+        await this._waitForHello(link, Math.min(this.helloWaitMs, waitMs))
+      }
+      this._assertProtocolCompatible(method, link)
+      this._assertCapability(method, link)
     }
-    this._assertProtocolCompatible(method, link)
-    this._assertCapability(method, link)
+
+    // ── 会话授权绑定门（契约 §6.1，第二个门）：版本门 / 能力预检之后，写线路之前 ──
+    // 位置就是契约要的那一处：判的是「这次要发的那条连接」（link），不是别的视图。
+    // 失败在这里直接抛 -32010 —— 下面的 link.request 一行都没执行，业务帧零字节出门。
+    // 判据是一张表（WRITE_METHODS）而不是一个开关：新增写入类能力只加一条表项，门自动生效。
+    // ★ 评审 F2：会话身份从 `opts.sessionId`（调用方上下文）来，与记录里的比对。
+    if (write) this._writeGate(method, wireParams, link, { sessionId })
+
+    if (!link) {
+      // 理论上到不了：上面那道门对"没有有效记录"必然抛 -32010。留一行兜底，别让
+      // 裸 TypeError 成为失败形态（铁律 2）。
+      throw new BridgeError(ERR.DISCONNECTED, 'no editor connected', { method })
+    }
 
     // 断线不清任何「版本槽」：版本事实挂在连接上，连接没了自然失效。
     // （旧实现这里清全局 lastEditor，会导致下一条连接继承/丢失判定，见 F1。）
     const result = await link.request(
-      method, params, opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : undefined,
+      method, wireParams, opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : undefined,
     )
 
     // ── facade 出口形状校验（契约 §5.1，-32009 invalid-response）──
@@ -317,6 +683,10 @@ class VscodeKit {
     if (typeof method !== 'string' || method === '') {
       throw new BridgeError(ERR.INVALID_PARAMS, 'method must be a non-empty string')
     }
+    // ★ 评审 F5：写入类方法**不许**走通知。通知没有回执，发送前门判完也证明不了
+    //   对端存下了；而"默认给通知带 token 让它变成可执行写"是把漏洞换个位置。
+    //   入口就拒，要求改用 request()（那道门与会话绑定才跑得起来）。
+    assertWritableNotNotified(method, 'notify')
     const link = this._activeLink()
     if (!link) throw new BridgeError(ERR.DISCONNECTED, 'no editor connected', { method })
     this._assertProtocolCompatible(method, link)
@@ -368,6 +738,7 @@ export function apply(ctx, config = {}) {
     dshHome,
     connectWaitMs = DEFAULT_CONNECT_WAIT_MS,
     helloWaitMs = DEFAULT_HELLO_WAIT_MS,
+    grantAckTimeoutMs = DEFAULT_GRANT_ACK_TIMEOUT_MS,
     enabled = true,
     onLog,
   } = config ?? {}
@@ -425,11 +796,41 @@ export function apply(ctx, config = {}) {
     listOpenEditors: (params, opts) => (kit
       ? kit.vscode.listOpenEditors(params, opts)
       : notReady('vscode.listOpenEditors')),
+    // 写入类糖衣：与 VscodeKit.vscode.applyEdit 成对出现（契约 §2.2 第②步：
+    // 要加就两处都加；只加一处会让 facade 消费者拿到裸 TypeError）。
+    applyEdit: (params, opts) => (kit
+      ? kit.vscode.applyEdit(params, opts)
+      : notReady('vscode.applyEdit')),
+  }
+
+  /**
+   * 编辑授权面（`kit.editing.*`）—— 同样是**稳定存在**的转发函数。
+   *
+   * 未就绪时的失败形态按语义分：`grant`/`revoke` 是命令，抛 -32007 server-not-ready；
+   * `list` 是只读诊断，返回空表（让排障代码不必为"还没起来"写分支）。
+   */
+  const editing = {
+    grant: (opts) => {
+      if (!kit) {
+        throw new BridgeError(ERR.DISCONNECTED, 'dsh-vscode-kit is not listening yet',
+          { method: 'bridge.grant', reason: 'server-not-ready' })
+      }
+      return kit.editing.grant(opts)
+    },
+    revoke: (id) => {
+      if (!kit) {
+        throw new BridgeError(ERR.DISCONNECTED, 'dsh-vscode-kit is not listening yet',
+          { method: 'bridge.grantRevoke', reason: 'server-not-ready' })
+      }
+      return kit.editing.revoke(id)
+    },
+    list: () => (kit ? kit.editing.list() : []),
   }
 
   const facade = {
     get ready() { return kit !== null },
     get vscode() { return vscode },
+    get editing() { return editing },
     request: (method, params, opts) => (kit ? kit.request(method, params, opts) : notReady(method)),
     notify: (method, params) => {
       if (!kit) throw new BridgeError(ERR.DISCONNECTED, 'dsh-vscode-kit is not listening yet',
@@ -507,6 +908,15 @@ export function apply(ctx, config = {}) {
           //   （旧实现是 `kit.lastEditor = null`，那正是评审 F1 的双源。）
           kit._notifyConnected(link)
         },
+        // ★ 会话授权绑定（契约 §6.1.1 ①-b(2)）：承载连接消失 → 这条连接上的编辑授权
+        //   立刻失效，由**协议层的连接生命周期**驱动（不是定时器、不是轮询、不是计数器）。
+        //   收回判据是换进来的这个 link 对象身份，`grants` 里存的就是它。
+        //   闭包读 `kit` 变量而不是参数：监听先起、kit 后装配，空窗期内没有 grant 可回收，
+        //   但绑定仍然正确（那时 `kit === null`，`?.` 安全跳过）。
+        onLinkClosed: (link) => {
+          const n = kit?.grants.closeLink(link) ?? 0
+          if (n > 0) log('info', `edit grant invalidated by disconnect (${n})`)
+        },
       })
 
       kit = new VscodeKit({
@@ -514,6 +924,7 @@ export function apply(ctx, config = {}) {
         dshVersion: readDshVersion(),
         connectWaitMs,
         helloWaitMs,
+        grantAckTimeoutMs,
         onLog: log,
       })
 

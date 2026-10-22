@@ -10,6 +10,7 @@ import { existsSync, statSync } from 'node:fs'
 
 import * as vscode from 'vscode'
 
+import { GrantStore } from '../../dsh-vscode-kit/src/grant.js'
 import { createCapabilities } from './capabilities.js'
 
 /**
@@ -125,6 +126,82 @@ export function createHost(output) {
       })
   }
 
+  /**
+   * 读**文档**（不是磁盘）的行数与指定行行长 —— 范围边界检查的唯一数据源（评审 F8）。
+   *
+   * 为什么用 `openTextDocument` 而不是 `readFileSync`：真机里缓冲区可能已改未存，
+   * 按磁盘算行数会把合法范围判成越界（或者更糟：把越界判成合法，然后被
+   * `vscode.Range` clamp 成「写到最后一行」）。
+   * `openTextDocument` 对已打开的文档返回**同一个**内存实例，不会读盘覆盖改动。
+   */
+  async function readDocumentShape(abs, lines = []) {
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(abs))
+    const requested = Array.isArray(lines) ? lines : []
+    return {
+      lineCount: doc.lineCount,
+      lineLengths: requested.map((n) => (n >= 1 && n <= doc.lineCount
+        ? doc.lineAt(n - 1).text.length
+        : null)),
+    }
+  }
+
+  /**
+   * 编辑器对「这个 uri」持有的那个文档的规范化路径 —— 也就是**缓冲区身份**
+   * （评审 R3-1：能力层拿它判定"写到底落在哪个文档"）。
+   *
+   * 为什么要绕一圈从编辑器取、而不是把传进来的 `abs` 原样回传：传进来的字符串只能证明
+   * "请求发到了哪"，证明不了"编辑器把它落到哪个文档"。`uri.fsPath` 是编辑器自己的视图
+   * （大小写规范化、盘符统一、将来换成别的 scheme 也是它说了算），所以只有它算身份。
+   *
+   * 优先在已打开的文档里找（同步、零成本）；找不到再 `openTextDocument` 一次
+   * （对已打开的文档返回同一个内存实例，不会读盘覆盖未保存改动）。这一步在写入**之后**，
+   * 所以它的 await 不构成写前窗口。
+   *
+   * @param {import('vscode').Uri} uri
+   * @returns {Promise<string|null>} 拿不到就返回 null（由能力层失败闭合）
+   */
+  async function documentIdentity(uri) {
+    try {
+      const want = uri.toString()
+      const open = (vscode.workspace.textDocuments ?? [])
+        .find((d) => d?.uri?.toString() === want)
+      if (open) return typeof open.uri.fsPath === 'string' ? open.uri.fsPath : null
+      const doc = await vscode.workspace.openTextDocument(uri)
+      return typeof doc?.uri?.fsPath === 'string' ? doc.uri.fsPath : null
+    } catch (err) {
+      log(`documentIdentity: cannot resolve ${uri?.fsPath ?? uri}: ${err?.message ?? err}`)
+      return null
+    }
+  }
+
+  /**
+   * 在**缓冲区**里替换一段文本（`vscode.applyEdit` 的唯一落点）。
+   *
+   * `range` 是 **0-based**（转换在 capabilities 层做完了，见 `toApiRange`）——
+   * 这里只负责把它原样塞进 `vscode.Range`。**一次减法都不许再出现在本文件**：
+   * 边界之上的层已经保证"一个 1-based 输入只被减一次"，这里再减就是错行。
+   *
+   * **绝不保存**：不调 `document.save()`、不调 `workbench.action.files.save`。
+   * 返回 `{applied, documentPath}`：`vscode.workspace.applyEdit` 返回 false 表示编辑器拒绝了
+   * 这次编辑（例如文件被外部改动导致版本不匹配），必须如实上报，不许当成成功。
+   * `documentPath` 是**编辑器报告的文档身份**（评审 R3-1）—— 拿不到就是 null，
+   * 让能力层失败闭合，而不是编一个"就是我传进去的路径"糊过去。
+   */
+  async function applyEditText(abs, range, text) {
+    const uri = vscode.Uri.file(abs)
+    const edit = new vscode.WorkspaceEdit()
+    const start = new vscode.Position(range.start.line, range.start.column)
+    const end = new vscode.Position(range.end.line, range.end.column)
+    edit.replace(uri, new vscode.Range(start, end), text)
+    const applied = await vscode.workspace.applyEdit(edit)
+    // 身份在写入**之后**取：它要回答的是"这次编辑落到哪个文档"，不是"我们请求了哪个路径"。
+    const documentPath = await documentIdentity(uri)
+    log(`applyEditText: ${abs} [${range.start.line}:${range.start.column}-`
+      + `${range.end.line}:${range.end.column}] ${text.length} chars → applied=${applied}`
+      + ` (not saved; document=${documentPath ?? 'unknown'})`)
+    return { applied: applied === true, documentPath }
+  }
+
   return {
     fileExists: (p) => { try { return existsSync(p) && statSync(p).isFile() } catch { return false } },
     resolvePath,
@@ -135,13 +212,34 @@ export function createHost(output) {
     activeEditor,
     collectDiagnostics,
     listEditors,
+    readDocumentShape,
+    applyEditText,
     log,
   }
 }
 
-/** 一步到位：从 vscode 搭出能力分派函数。 */
-export function createDispatcher(output) {
+/**
+ * 一步到位：从 vscode 搭出能力分派函数。
+ *
+ * 授权表在这里建（`grants`），**同一个实例**同时给能力层（执行前复核）和连接层
+ * （收 `bridge.grant` / 断线置失效）—— 两份实例 = 两套判定，那是 bug 温床。
+ * `linkState` 是"当前活连接"的共享槽：connector 写，诊断/观测量读。
+ * 写入门**不再**从这里取"活连接"（评审 F4：判定表第 3 行才是连接存活的唯一出处），
+ * 只取工作区信任 —— 信任判序在 grant 之前（评审 F7）。
+ */
+export function createDispatcher(output, { grants } = {}) {
   const host = createHost(output)
-  const caps = createCapabilities(host)
-  return { dispatch: caps.dispatch, capabilities: caps.CAPABILITIES, host }
+  const store = grants ?? new GrantStore()
+  const linkState = { link: null }
+  const caps = createCapabilities(host, {
+    grants: store,
+    isTrusted: () => vscode.workspace.isTrusted,
+  })
+  return {
+    dispatch: caps.dispatch,
+    capabilities: caps.CAPABILITIES,
+    host,
+    grants: store,
+    linkState,
+  }
 }

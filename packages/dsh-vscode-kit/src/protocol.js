@@ -36,6 +36,14 @@ export const ERR = Object.freeze({
    * 不许拿 -32005（方法缺失）/ -32601（协议层写错）/ -32004（超时）代替。
    */
   INVALID_RESPONSE: -32009,
+  /**
+   * 会话授权绑定门（契约 §6.1 / §6.1.1）。**新增**码位，不动既有码语义。
+   * 两个时点各判一次：DSH 侧发送前、扩展侧执行前（逐操作）。
+   * 五种 `data.reason`（no-grant / grant-mismatch / grant-revoked / target-gone /
+   * grant-generation-stale）都归本码 —— 处置完全一样：停下、重新申请、不得重试。
+   * 不许拿 -32001（未授权）/ -32005（能力缺失）/ -32007（未连接）/ -32008（版本不兼容）代替。
+   */
+  EDIT_NOT_BOUND: -32010,
 })
 
 /** 错误码 → 稳定诊断串（日志与测试断言都用它，改动即破坏契约）。 */
@@ -54,6 +62,7 @@ export const ERR_NAME = Object.freeze({
   [ERR.DISCONNECTED]: 'disconnected',
   [ERR.PROTOCOL_INCOMPATIBLE]: 'protocol-incompatible',
   [ERR.INVALID_RESPONSE]: 'invalid-response',
+  [ERR.EDIT_NOT_BOUND]: 'edit-not-bound',
 })
 
 /**
