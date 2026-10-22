@@ -1146,6 +1146,15 @@ function respond(id, result) {
 
 ### 实测劫持（`lesson3-hijack.mjs`）
 
+> **[2026-10-22 勘误] 读下面这段输出之前，先看三件事。**
+> ① 它跑的是 `lesson3-hijack.mjs` **修复前**的行为，原样保留、一个数字都没改——"修复前洞 2 确实成立"的证据不能篡改。
+> ② 但那两行 `kit.lastEditor = "real-vscode"` 是**脚本打印出来的输出**，不是可以照抄的赋值语句。今天的 `lastEditor` 是**只读 getter**（`packages/dsh-vscode-kit/src/index.js:121`，`get lastEditor()`），只负责回读当前目标连接的身份；谁把它当代码写成 `kit.lastEditor = X`，会抛 `TypeError: Cannot set property lastEditor of #<VscodeKit> which has only a getter`。
+> ③ 身份与版本的事实**不在任何全局槽里**，而是挂在**连接对象自己**身上：`link.editor`，由 hello 写入（`packages/dsh-vscode-kit/src/index.js:559`）。`lastEditor` 只是它的只读视图，所以"谁报的身份"和"包发给谁"永远是同一条连接。
+>
+> **所以重跑这个脚本，看到的是已修后的行为，不是下面这一段。** 今天那条裸连接照样连得上（TCP 拦不住），但它 `authorized = false`、抢不到"编辑器"位，DSH 侧一条请求都发不出去——本机实跑现在是这样收场：`-32008 protocol version incompatible: peer protocolVersion is missing (supported 1..1); refusing to send "vscode.getSelection"`（脚本里的假编辑器没在 hello 里带 `protocolVersion`，按"未知版本"被拒，而不是照跑）。
+>
+> 顺带一句：本节上面引的 `_activeLink()` 与 `links.add(link)` 两段也是**修复前的样子**。今天挑目标扫的是 `trusted`、按 `connSeq` 取最后一条活连接（`packages/dsh-vscode-kit/src/index.js:97`），`links.add` 只剩"记连接"这一件事（`packages/dsh-vscode-kit/src/server.js:182`），"准入"从 `trusted.add` 那一刻才算（`server.js:162-163`）。
+
 ```
 === 场景准备 ===
   桥：127.0.0.1:7410
