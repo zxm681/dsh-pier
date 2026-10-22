@@ -43,6 +43,13 @@ function kitSpy() {
 const FILE = '/ws/a.js'
 const RANGE = { start: { line: 1, column: 1 }, end: { line: 1, column: 6 } }
 const GRANT = { id: 'a'.repeat(32), epoch: 'b'.repeat(32) }
+/**
+ * 假的对端化身（T34 引入；★ T35 起 `expectedIncarnation` **无条件必填**）。
+ *
+ * 本文件的主线是"版本锚点与参数归一化"，脚手架默认带化身，与默认带 `expectedVersion`
+ * 同理 —— 缺锚点会在锚点形状门短路，锚点/归一化那些性质根本跑不到。
+ */
+const INC = 'inc-kit-t30'
 
 // ---------------------------------------------------------------------------
 // ① 错误码：只加不改
@@ -113,7 +120,7 @@ test('T30 ★ expectedVersion 形状不对（字符串 / 小数 / 负数 / null�
 
 test('T30 ★ expectedVersion=0 是合法值（空文件/新文档的版本就是 0）', async () => {
   const { kit, sent } = kitSpy()
-  await kit.vscode.applyEdit(FILE, RANGE, 'HELLO', { expectedVersion: 0 })
+  await kit.vscode.applyEdit(FILE, RANGE, 'HELLO', { expectedVersion: 0, expectedIncarnation: INC })
   assert.equal(sent.length, 1, '0 不许被当成"没给"')
 })
 
@@ -124,25 +131,30 @@ test('T30 ★ expectedVersion=0 是合法值（空文件/新文档的版本就�
 test('T30 位置形态带锚：锚点/grant 提升进 params，opts 只留传输选项', async () => {
   const { kit, sent } = kitSpy()
   await kit.vscode.applyEdit(FILE, RANGE, 'HELLO', {
-    expectedVersion: 7, expectedRangeText: 'hello', grant: GRANT, timeoutMs: 1234,
+    expectedVersion: 7, expectedIncarnation: INC, expectedRangeText: 'hello',
+    grant: GRANT, timeoutMs: 1234,
   })
   assert.equal(sent.length, 1)
   assert.equal(sent[0].method, 'vscode.applyEdit')
   assert.deepEqual(sent[0].params, {
-    file: FILE, range: RANGE, text: 'HELLO', expectedVersion: 7, expectedRangeText: 'hello', grant: GRANT,
+    file: FILE, range: RANGE, text: 'HELLO', expectedVersion: 7, expectedIncarnation: INC,
+    expectedRangeText: 'hello', grant: GRANT,
   })
-  assert.deepEqual(sent[0].opts, { expectedVersion: 7, expectedRangeText: 'hello', grant: GRANT, timeoutMs: 1234 },
+  assert.deepEqual(sent[0].opts, {
+    expectedVersion: 7, expectedIncarnation: INC, expectedRangeText: 'hello',
+    grant: GRANT, timeoutMs: 1234,
+  },
     'opts 原样往下传（timeoutMs 这类传输选项不许被糖衣吞掉）')
 })
 
 test('T30 对象形态带锚：params 原样转发，opts 只作传输选项', async () => {
   const { kit, sent } = kitSpy()
   await kit.vscode.applyEdit(
-    { file: FILE, range: RANGE, text: 'HELLO', expectedVersion: 7, grant: GRANT },
+    { file: FILE, range: RANGE, text: 'HELLO', expectedVersion: 7, expectedIncarnation: INC, grant: GRANT },
     { timeoutMs: 500 },
   )
   assert.deepEqual(sent[0].params,
-    { file: FILE, range: RANGE, text: 'HELLO', expectedVersion: 7, grant: GRANT })
+    { file: FILE, range: RANGE, text: 'HELLO', expectedVersion: 7, expectedIncarnation: INC, grant: GRANT })
   assert.deepEqual(sent[0].opts, { timeoutMs: 500 })
 })
 
@@ -154,7 +166,9 @@ test('T32 ★ 四个入口归一化到**同一份** params（位置 / 对象 与
   // 这条归一化是"一致"的**前提**：只要有一处自己拼参数，锚点就可能被吞掉或改名，
   // 而能力层的前置检查**不是保证**（评审 T31-B1：前置检查过了之后缓冲区还能被改），
   // 真正的保证只有写事务内部那一次 `document.version` 比对 —— 那份 params 必须原样到达它。
-  const raw = { file: FILE, range: RANGE, text: 'HELLO', expectedVersion: 7, grant: GRANT }
+  const raw = {
+    file: FILE, range: RANGE, text: 'HELLO', expectedVersion: 7, expectedIncarnation: INC, grant: GRANT,
+  }
 
   const rawSpy = kitSpy() // ① raw request：消费者自己组参，直接 request（基准，零归一化）
   await rawSpy.kit.request('vscode.applyEdit', { ...raw })
@@ -163,7 +177,9 @@ test('T32 ★ 四个入口归一化到**同一份** params（位置 / 对象 与
   await objectSpy.kit.vscode.applyEdit({ ...raw })
 
   const positionalSpy = kitSpy() // ③ 位置形态：applyEdit(file, range, text, opts)
-  await positionalSpy.kit.vscode.applyEdit(FILE, RANGE, 'HELLO', { expectedVersion: 7, grant: GRANT })
+  await positionalSpy.kit.vscode.applyEdit(FILE, RANGE, 'HELLO', {
+    expectedVersion: 7, expectedIncarnation: INC, grant: GRANT,
+  })
 
   const rangeTextSpy = kitSpy() // ④ expectedRangeText 分支
   await rangeTextSpy.kit.vscode.applyEdit({ ...raw, expectedRangeText: 'hello' })

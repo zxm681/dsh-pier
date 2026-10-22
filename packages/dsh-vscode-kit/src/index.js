@@ -36,6 +36,30 @@ export const inject = []
 /** 本端（DSH 侧）声明支持的能力：DSH 能接收的入站方法族。 */
 const INBOUND_CAPABILITIES = ['bridge.ping']
 
+/**
+ * 对端在 hello 里声明"我回锚点时带文档实例身份"的 feature 名（T34）。
+ *
+ * ⚠️ 与 `packages/dsh-kit-bridge/src/connector.js` 的 `PEER_FEATURES` **必须逐字相同**
+ * （bridge 侧的 test/t34-incarnation.test.js 直接比对两个常量）。
+ *
+ * 为什么用 hello 的 `features` 而不是 `capabilities`：`capabilities` 是**方法名**清单，
+ * 回答"你能接哪些方法"；这里要回答的是"你的锚点里有没有 `incarnation`、你会不会判它"。
+ * 声明了 ⇒ 糖衣强制要求 `expectedIncarnation`；没声明（老扩展）⇒ 不强制，
+ * 否则两端会互相锁死在升级窗口里。
+ */
+export const PEER_FEATURE_DOCUMENT_INCARNATION = 'document-incarnation'
+
+/**
+ * **会话绑定的读方法**（T34）：这些方法一旦拿到 `opts.sessionId`，目标连接就必须是
+ * 该会话 grant 记录里的那条 `link`，**不许**回退到 `_activeLink()`。
+ *
+ * 为什么（T5 的 Q1，高危）：写路径早就按 grant 绑定了，但读还是"问最活跃的窗口"。
+ * A 拿 grant、B 后连 ⇒ 锚点从 B 读、写入落 A。两个窗口版本数字一重合，按 B 视角的
+ * 坐标就静默写进了 A 的缓冲区 —— 版本门一个字都拦不住（数字相等）。
+ * 修法就是把读也钉在同一条连接上：**读和写必须是同一份视角**。
+ */
+export const SESSION_BOUND_READS = Object.freeze(['vscode.getDocumentState'])
+
 /** 默认等待编辑器连接的时间。 */
 const DEFAULT_CONNECT_WAIT_MS = 3_000
 
@@ -82,13 +106,84 @@ function assertLocalExpectedVersion(method, params) {
     { method, reason, stage: 'local', got: { type: typeof v } })
 }
 
+/**
+ * 「写锚点必须带文档实例身份」的本地闸门（T34 引入；**T35 收紧为无条件必填**）——
+ * 与 `assertLocalExpectedVersion` 同族：在这里抛 = 一个字节都没发出去。
+ *
+ * ## 位置：**所有写入口共用的发送路径**（`request()` 里）
+ *
+ * T34 时这道门只装在糖衣 `kit.vscode.applyEdit` 里，且"仅当对端 hello 声明了
+ * `document-incarnation` 才强制"。T6 终审把那个设计判掉了（H1）：公开的
+ * `kit.request('vscode.applyEdit', …)` **绕过糖衣**，省略 `expectedIncarnation` 就一路写成功；
+ * 两个窗口版本数字相同时，按另一窗口的视图覆盖了授权窗口中的人工内容，还报 `applied:true`。
+ * 于是本闸门移到 `request()` 的写分支里 —— raw / 糖衣 / 位置形态 / 对象形态
+ * **只有这一条发送路径**，谁也绕不过去。糖衣里那次调用保留为"更早、更清楚"的重复闸。
+ *
+ * ## 什么时候强制：**永远**
+ *
+ * 不再看对端有没有公告化身支持。公告只说明"对端能回 incarnation"，它不是强制条件 ——
+ * 把强制绑在公告上，等于"对端一沉默，本端就把判据关掉"。理由一句话：**没有化身身份就
+ * 无法证明写的是同一个文档实例**，而版本号是每个实例各自计数的、关闭重开后被复用。
+ *
+ * ## ★ 有意的不兼容收紧（被接受的代价）
+ *
+ * 旧版扩展（不返回 `incarnation`）从此**不能被写**：调用方拿不到化身 ⇒ 这里 `-32602`。
+ * 这不是回归，而是把"做不到唯一保证的写"从"静默放行"改成"明确拒写"。
+ *
+ * ## 两件不同的事，同一个 reason 家族
+ *
+ *  - `expected-incarnation-missing`：该给没给（含"对端不公告"的老端）；
+ *  - `expected-incarnation-not-a-non-empty-string`：给了但不是非空字符串。
+ *    空串尤其危险 —— 它会让"宿主读不到化身"与"调用方给了空串"互相匹配成功。
+ *
+ * `data`：`{ method, reason, stage: 'local', got: {type} }`。
+ * 码位 `-32602`（参数错）：这是**调用方自己的编程错误**，不是对端拒绝，也不是授权问题；
+ * 与 `-32012`（对端判你锚点过期了）分工明确 —— 这里根本没发出去。
+ *
+ * @param {string} method
+ * @param {object} params
+ * @throws {BridgeError} ERR.INVALID_PARAMS（`data.stage === 'local'`）
+ */
+function assertLocalExpectedIncarnation(method, params) {
+  const v = params?.expectedIncarnation
+  if (typeof v === 'string' && v !== '') return
+  const reason = v === undefined
+    ? 'expected-incarnation-missing'
+    : 'expected-incarnation-not-a-non-empty-string'
+  throw new BridgeError(ERR.INVALID_PARAMS,
+    'vscode.applyEdit requires the document-instance anchor: pass expectedIncarnation '
+    + '(the string returned as vscode.getDocumentState.incarnation) together with expectedVersion. '
+    + 'Refusing to send a write that cannot tell "the same document" from "a reopened one".',
+    { method, reason, stage: 'local', got: { type: typeof v } })
+}
+
+/**
+ * 调用方上下文里的会话身份（`opts.sessionId`）。
+ *
+ * 唯一可信来源是**调用方自己的 DSH 上下文**，不是线路数据：`params.sessionId` 由
+ * `rejectParamsSessionId` 在写路径上直接拒（评审 F2）。空串按"没给"处理 ——
+ * 空串当会话会让 `_grantForSession` 静默匹配不到，错误会变成难读的 -32010。
+ * @param {{sessionId?: unknown}} [opts]
+ * @returns {string|null}
+ */
+function readSessionId(opts) {
+  const v = opts?.sessionId
+  return typeof v === 'string' && v !== '' ? v : null
+}
+
 /** 只是对象（不是数组/null/类实例的壳子）—— 形态判定用。 */
 function isPlainObject(v) {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
 }
 
-/** 从 opts 里挑出**属于请求参数**的锚点字段（位置形态没有别的地方放它们）。 */
-const ANCHOR_FIELDS = ['expectedVersion', 'expectedRangeText', 'grant']
+/**
+ * 从 opts 里挑出**属于请求参数**的锚点字段（位置形态没有别的地方放它们）。
+ *
+ * `expectedIncarnation`（T34）与 `expectedVersion` 同族：两者一起构成写锚点
+ * （`{version, incarnation}`），都必须原样落到 `params` 上发给对端 —— 留在 opts 里
+ * 宿主收不到，那就等于这道门从来没开过。真机踩过同一形态的坑（`includeText`，T30）。
+ */
+const ANCHOR_FIELDS = ['expectedVersion', 'expectedIncarnation', 'expectedRangeText', 'grant']
 
 /**
  * 归一化 `applyEdit` 的两种调用形态。
@@ -176,6 +271,27 @@ class VscodeKit {
     /** 等对端 hello（拿协议版本）的等待者队列。 */
     this.helloWaiters = new Set()
 
+    /**
+     * 对端 hello 里声明的 `features`（T34）—— **按连接**存（WeakMap），不写进
+     * `link.editor` 的形状里：这是"这条连接说了什么"，随连接回收，
+     * 与 `link.editor` 同生共死，但不动既有身份对象的字段（不改已发布形状）。
+     * @type {WeakMap<object, Set<string>>}
+     */
+    this._peerFeatures = new WeakMap()
+
+    /**
+     * **锚点来源表**（T34）：`incarnation` → 它是从哪条连接、哪个会话读出来的。
+     *
+     * 存在的唯一理由：`applyEdit` 要能在**本地**发现"你拿 A 窗口的锚点去写 B 窗口"。
+     * 判据只能是 `incarnation → link` 的对象身份（不用版本号：版本号正是会撞的那个）。
+     *
+     * 上限 256 条（FIFO 淘汰）：这是加速/自证用的小缓存，不是事实源 —— 淘汰之后
+     * 只是"本端不再能自证来源"，写入照样由对端的化身门兜底（-32012），不会因此放行。
+     * 不用 Map 就丢不掉内存，用无限 Map 就是一处慢性泄漏。
+     * @type {Map<string, {link: object|null, sessionId: string|null, file: string|null, at: number}>}
+     */
+    this._anchorSources = new Map()
+
     // 糖衣方法族。新增能力只在这里加一行，协议层不改。
     // 注意两个参数都要往下传：早期写成 `openFile: (params) => this.request(m, params)`
     // 会把消费者传的 opts（timeoutMs / waitForEditor）静默丢掉。
@@ -199,6 +315,20 @@ class VscodeKit {
       applyEdit: async (...args) => {
         const { params, opts } = normalizeApplyEditArgs(args)
         assertLocalExpectedVersion('vscode.applyEdit', params)
+        // ★ T34：锚点的**另一半**——文档实例身份，以及"这个锚点是从哪读的"。
+        // 三个本地闸门，顺序有意：形状 → 必填 → 来源（最贵的放最后）。
+        // 都在 request() 之前 ⇒ 抛在这里 = 一个字节都没发出去（与 expectedVersion 同族）。
+        // ★ T35：必填**不再看对端公告**（原先 `required: this._peerRequiresIncarnation(...)`）
+        //   —— 公告不是强制条件，"对端一沉默本端就少判一半"正是 H1 的形态。
+        //   真正的兜底在 `request()` 的写分支里（raw request 走的是那条路），
+        //   这里是同一判据的**更早一道**（糖衣调用方不必先摸到发送路径才看到错误）。
+        const sessionId = readSessionId(opts)
+        const bound = this._bindWriteTarget(params, sessionId)
+        assertLocalExpectedIncarnation('vscode.applyEdit', params)
+        this._assertAnchorSource('vscode.applyEdit', params, {
+          link: bound.link,
+          sessionId,
+        })
         return this.request('vscode.applyEdit', params, opts)
       },
       // 读取版本号（写入锚点的读侧）。同样是双形态：
@@ -231,6 +361,10 @@ class VscodeKit {
       grant: (opts) => this.grantEditing(opts),
       revoke: (id) => this.revokeEditing(id),
       list: () => this.grants.entries(),
+      // 写入锚点的**绑定读**（T34）：按会话拿到"我获准写入的那份文档"的
+      // `{version, incarnation}`。`kit.vscode.getDocumentState(file)` 是**活跃视角**，
+      // 在它上面derive 出的锚点可能来自另一个窗口 —— 这个方法是唯一正确的读法。
+      stateFor: (sessionId, file, opts) => this.readStateFor(sessionId, file, opts),
     }
   }
 
@@ -473,6 +607,167 @@ class VscodeKit {
         `editor does not advertise capability for "${method}"`,
         { method, capabilities: caps })
     }
+  }
+
+  /**
+   * 记下这条连接在 hello 里声明的语义能力（T34）。**按连接**存，WeakMap。
+   *
+   * 只认字符串项：畸形 feature 混进 Set 会让"声明的支持"变成猜谜。
+   * ★ T35：声明与否**不再改变强制行为** —— 化身锚点无条件必填（见
+   *   `assertLocalExpectedIncarnation`）。这张表从此只用于诊断/兼容性判断。
+   * @param {object|null} link
+   * @param {unknown} features hello 的 `params.features`
+   */
+  _notePeerFeatures(link, features) {
+    if (!link) return
+    const list = Array.isArray(features) ? features.filter((f) => typeof f === 'string') : []
+    this._peerFeatures.set(link, new Set(list))
+  }
+
+  /**
+   * 这条连接是否声明了"锚点里带文档实例身份"（T34）。
+   *
+   * ★ **T35：只是诊断查询，不再决定强制。** 曾经"未声明 = 老扩展 ⇒ 不强制
+   * `expectedIncarnation`"，那让"对端不公告"变成一条关掉判据的路径（T6 终审 H1 的
+   * 态度问题：安全不变量不能挂在对方的公告上）。现在化身无条件必填，
+   * 所以本方法**不参与**任何放行判断 —— 别再用它去决定要不要判。
+   * @param {object|null} link
+   * @returns {boolean}
+   */
+  _peerRequiresIncarnation(link) {
+    if (!link) return false
+    const feats = this._peerFeatures.get(link)
+    return feats instanceof Set && feats.has(PEER_FEATURE_DOCUMENT_INCARNATION)
+  }
+
+  /**
+   * 给**绑定读**的结果打来源标记，并记进锚点来源表（T34）。
+   *
+   * 两件事都做：
+   *  1. `boundTo`：`'session'`（按会话钉在 grant 的连接上）/ `'active'`（活跃视角）。
+   *     调用方据此知道"这个锚点是不是写路径的视角" —— 活跃视角的锚点**可能来自
+   *     另一个窗口**，用它去写本会话就等着被 `applyEdit` 本地拒。
+   *  2. `incarnation → {link, sessionId}`：`applyEdit` 判"锚点来源 ≠ 写目标"的唯一依据。
+   *
+   * 注意 `boundTo` 是**加在返回体上**的元信息，不是协议字段：对端不知道会话，
+   * 它只回答"这份文档是什么状态"。所以它在 `validateResponse` **之后**加 ——
+   * 契约校验的是对端回的字段，不是本端补的视图。
+   *
+   * @param {object} result 已过响应形状校验的对端结果
+   * @param {{link: object|null, sessionId: string|null}} p
+   * @returns {object}
+   */
+  _markBoundRead(result, { link, sessionId }) {
+    if (result && typeof result === 'object' && typeof result.incarnation === 'string') {
+      this._anchorSources.set(result.incarnation, {
+        link: link ?? null,
+        sessionId: sessionId ?? null,
+        file: typeof result.file === 'string' ? result.file : null,
+        at: Date.now(),
+      })
+      // FIFO 淘汰：Map 的插入顺序就是淘汰顺序（不是 LRU —— 这里够用且更简单诚实）。
+      while (this._anchorSources.size > 256) {
+        const oldest = this._anchorSources.keys().next()
+        if (oldest.done) break
+        this._anchorSources.delete(oldest.value)
+      }
+    }
+    return {
+      ...result,
+      boundTo: sessionId ? 'session' : 'active',
+      ...(sessionId ? { boundSessionId: sessionId } : {}),
+    }
+  }
+
+  /**
+   * 本地拒绝「拿别的窗口/别的会话的锚点去写」（T34）。
+   *
+   * 判据是对象身份：`incarnation` 是本次进程读出来的、且当时那条 `link` **不是**
+   * 这次要写的那条 ⇒ 拒。**一个字节都不发**：错配的写请求一旦发出去，对端只能凭
+   * 版本号判断，而版本号相等时它放行 —— 那正是 T5 记下的静默错配。
+   *
+   * 三种情况不拒（都不是"错配"，各有更该说话的人）：
+   *  - 锚点不是本进程读出来的（表里没有）：来源不可自证，交给对端化身门兜底；
+   *  - 写目标为空（没有有效 grant）：让绑定门报 -32010，那个错更准确；
+   *  - 来源与目标**是同一条连接**：读和写走同一条线，正是我们要的形状。
+   *
+   * `data`：`{ method, reason: 'anchor-source-mismatch', stage: 'local',
+   *           anchor: {boundTo, sessionId, file}, target: {sessionId} }`。
+   * 码位 `-32602`：调用方用错了锚点，改法明确（改用 `kit.editing.stateFor(sessionId, file)`）。
+   *
+   * @param {string} method
+   * @param {object} params
+   * @param {{link: object|null, sessionId: string|null}} p
+   * @throws {BridgeError}
+   */
+  _assertAnchorSource(method, params, { link, sessionId }) {
+    const incarnation = params?.expectedIncarnation
+    if (typeof incarnation !== 'string' || incarnation === '') return
+    const source = this._anchorSources.get(incarnation)
+    if (!source) return
+    if (!link) return
+    if (source.link === link) return
+    throw new BridgeError(ERR.INVALID_PARAMS,
+      'anchor-source-mismatch: this anchor was read from another window/session '
+      + `(${source.sessionId ? `session ${source.sessionId}` : 'the active editor view'}`
+      + `${source.file ? `, ${source.file}` : ''}), but this write is bound to `
+      + `${sessionId ? `session ${sessionId}` : 'no session'}. Refusing to send it — `
+      + 're-read the anchor with kit.editing.stateFor(sessionId, file).',
+      {
+        method,
+        reason: 'anchor-source-mismatch',
+        stage: 'local',
+        anchor: {
+          boundTo: source.sessionId ? 'session' : 'active',
+          sessionId: source.sessionId ?? null,
+          file: source.file ?? null,
+        },
+        target: { sessionId: sessionId ?? null },
+      })
+  }
+
+  /**
+   * 写入锚点的**绑定读**（T34）：`kit.editing.stateFor(sessionId, file, opts?)`。
+   *
+   * 与 `kit.vscode.getDocumentState` 的区别只有一处、但那是全部：**目标连接由会话的
+   * grant 记录决定**，与写路径同一套口径。于是"锚点来自哪份文档"与"写入落哪份文档"
+   * 由同一个事实源回答，跨窗口错配在源头上就不存在。
+   *
+   * 失败面：
+   *  - 会话没有有效 grant / 记录里的连接已死 → `-32010`（`data.reason` = `no-grant` /
+   *    `target-gone`）。**绝不**回退到活跃编辑器：回退就等于把 T5 的 Q1 原地复现。
+   *  - `sessionId` / `file` 不成形 → `-32602`（`stage: 'local'`，本端零发送）。
+   *
+   * 返回体带 `boundTo:'session'` + `boundSessionId`，并把锚点记进来源表 —— 之后
+   * `applyEdit` 才能证明"你这份锚点确实是这个会话读出来的"。
+   *
+   * @param {string} sessionId 调用方自己的 DSH 会话标识（不来自线路）
+   * @param {string} file 工作区内的文件（绝对路径或相对工作区根）
+   * @param {{includeText?: boolean, timeoutMs?: number}} [opts]
+   * @returns {Promise<{file: string, version: number, incarnation?: string, isDirty: boolean,
+   *   eol: 'lf'|'crlf', lineCount: number, textLength: number, text?: string,
+   *   boundTo: 'session', boundSessionId: string}>}
+   */
+  async readStateFor(sessionId, file, opts = {}) {
+    const method = 'vscode.getDocumentState'
+    if (typeof sessionId !== 'string' || sessionId === '') {
+      throw new BridgeError(ERR.INVALID_PARAMS,
+        'kit.editing.stateFor(sessionId, file) requires a non-empty sessionId — '
+        + 'the anchor is read through the grant record of that session, '
+        + 'and there is no way to guess which window you mean',
+        { method, reason: 'session-id-required', stage: 'local', got: { type: typeof sessionId } })
+    }
+    if (typeof file !== 'string' || file.trim() === '') {
+      throw new BridgeError(ERR.INVALID_PARAMS,
+        'kit.editing.stateFor(sessionId, file) requires a non-empty file',
+        { method, reason: 'file-required', stage: 'local', got: { type: typeof file } })
+    }
+    const params = { file }
+    if (isPlainObject(opts) && 'includeText' in opts) params.includeText = opts.includeText
+    const transport = isPlainObject(opts) ? { ...opts } : {}
+    delete transport.includeText
+    delete transport.sessionId
+    return this.request(method, params, { ...transport, sessionId })
   }
 
   /**
@@ -729,6 +1024,18 @@ class VscodeKit {
       const bound = this._bindWriteTarget(params, sessionId)
       link = bound.link
       wireParams = bound.params
+    } else if (sessionId && SESSION_BOUND_READS.includes(method)) {
+      // ── 绑定读（T34）：给了 sessionId 就必须走该会话 grant 记录的那条 link ──
+      // 与写路径**同一套**会话标识、同一条记录、同一个对象身份。
+      // 没有有效记录时**绝不**回退 `_activeLink()` —— 那正是 T5 的 Q1：
+      // 回退 = 锚点从"谁最后连上"的窗口读出来，再拿去写另一个窗口。
+      const found = this._grantForSession(sessionId)
+      const record = found?.record ?? null
+      link = record ? this._liveTargetOrNull(record) : null
+      if (!link) {
+        // 行 1（没有该会话的记录）/ 行 3（记录里的连接已死）—— 与判定表同一套 reason。
+        throw editNotBoundError(method, record ? 'target-gone' : 'no-grant', record ? 3 : 1)
+      }
     } else {
       link = await this._waitForEditor(waitMs)
       if (!link) {
@@ -768,6 +1075,21 @@ class VscodeKit {
       throw new BridgeError(ERR.DISCONNECTED, 'no editor connected', { method })
     }
 
+    // ── ★ T35：写锚点的第二半（文档实例身份）—— **所有写入口共用的那一道闸** ──
+    // 为什么必须放在这里、而不是只放在糖衣 `kit.vscode.applyEdit` 里：
+    // T6 终审 H1 证明公开的 `request('vscode.applyEdit', …)` 绕过糖衣就很成功 ——
+    // 省略 `expectedIncarnation` ⇒ 桥端早失败跳过 + 事务内比较跳过 ⇒ 只剩整数版本比较，
+    // 两个窗口版本数字相同时（v7/inc-A 与 v7/inc-B）按 B 的视图覆盖了 A 的人工内容。
+    // raw request / 糖衣 / 位置形态 / 对象形态最后都汇到这一行，判在这里 = 四条入口同一道门。
+    //
+    // 判的是 `wireParams`（真正要上线的那份），不是调用方手里的 `params`：
+    // 少判一次"发出去的那份"就等于给"参数在补 grant 时被换掉"留了缝。
+    //
+    // 位置有意排在 `_writeGate` **之后**：授权绑定门（-32010）的判定序是契约 §6.1.1 ①-c
+    // 的七行，不能被参数形状门抢到前面去（那会让"没有授权"错报成"参数错"）。
+    // 但仍在 `link.request` **之前** ⇒ 抛在这里 = 一个字节都没发出去（与 expectedVersion 同族）。
+    if (write) assertLocalExpectedIncarnation(method, wireParams)
+
     // 断线不清任何「版本槽」：版本事实挂在连接上，连接没了自然失效。
     // （旧实现这里清全局 lastEditor，会导致下一条连接继承/丢失判定，见 F1。）
     const result = await link.request(
@@ -780,7 +1102,13 @@ class VscodeKit {
     // ★ 只处理**成功返回**：上面的版本门 / 能力预检 / link.request 抛的 -3200x 在到达
     //   这里之前就已 reject，原样上浮，不会被包装成 -32009。
     // 校验规则见 response-contract.js（已发布能力逐字对照契约表，未登记能力只有最低校验）。
-    return validateResponse(method, result)
+    const validated = validateResponse(method, result)
+    // ★ T34：绑定读的出口标记。**只在形状校验之后**加 —— 契约校验的是对端回了什么，
+    //   `boundTo` 是本端补的视图（对端根本不知道会话），不该混进对端字段里受校验。
+    if (SESSION_BOUND_READS.includes(method)) {
+      return this._markBoundRead(validated, { link, sessionId })
+    }
+    return validated
   }
 
   /**
@@ -945,6 +1273,18 @@ export function apply(ctx, config = {}) {
       return kit.editing.revoke(id)
     },
     list: () => (kit ? kit.editing.list() : []),
+    /**
+     * 写入锚点的**绑定读**（T34）。与 `kit.editing.grant/revoke` 一样稳定存在：
+     * 未就绪时抛 -32007（它是命令，不是诊断视图）—— 拿不到锚点就没法写，
+     * 与其返回一个空对象让调用方解构出 undefined 去发请求，不如当场说清楚。
+     */
+    stateFor: (sessionId, file, opts) => {
+      if (!kit) {
+        throw new BridgeError(ERR.DISCONNECTED, 'dsh-vscode-kit is not listening yet',
+          { method: 'vscode.getDocumentState', reason: 'server-not-ready' })
+      }
+      return kit.editing.stateFor(sessionId, file, opts)
+    },
   }
 
   const facade = {
@@ -1100,6 +1440,8 @@ export function apply(ctx, config = {}) {
           //   不再写全局槽。这样「谁报的 hello」与「包发给谁」永远是同一条连接。
           if (msgCtx?.link) {
             msgCtx.link.editor = editor
+            // ★ T34：语义能力公告（`features`）按连接记 —— 它决定糖衣要不要强制化身锚点。
+            kit._notePeerFeatures(msgCtx.link, params.features)
             kit._notifyHello(msgCtx.link)
           } else {
             // 理论上到不了：协议层给每次分派都带 ctx.link。真到了就 fail-closed ——

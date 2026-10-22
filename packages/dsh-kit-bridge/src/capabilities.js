@@ -317,6 +317,65 @@ function readExpectedRangeText(params, method) {
 }
 
 /**
+ * 读并校验**必填**的 `params.expectedIncarnation`（T34 引入；**T35 收紧为无条件必填**）。
+ *
+ * ## ★ 这是**有意的不兼容收紧**，不是回归
+ *
+ * T34 时这里写成"可选"（给了才判），理由是"扩展侧不知道调用方是哪个 DSH 版本，老版本不传
+ * 这个字段，写入仍应按版本锚点工作（向后兼容）"。T6 终审推翻了那个理由，证据见
+ * `work/评审-T6-终审放行.md` §2（H1）：两个窗口的**版本数字相同时**（A=v7/inc-A，
+ * B=v7/inc-B），一条**省略** `expectedIncarnation` 的 `vscode.applyEdit` 被两道门
+ * （本能力的早失败 + 事务内比较）一起放过，按 B 的视图覆盖了授权窗口 A 中的人工内容，
+ * 仍返回 `applied:true`。也就是说"可选"不是兼容，是**留了一条把判据整体关掉的公开路径**。
+ *
+ * 因此：**不再有"不带化身的写"**。理由只有一句 —— 没有化身身份就**无法证明**写的是
+ * 同一个文档实例；版本号是每个实例各自计数的、关闭重开后会复用，它证明不了这件事。
+ *
+ * 代价是明确的、被接受的：**旧版扩展/旧调用方（不返回、不传 `incarnation`）从此不能被写**
+ * （`-32602` / `reason:'expected-incarnation-missing'`）。这不是"断线式"退化，而是把
+ * "做不到唯一保证的写"明确**降级为拒写** —— 静默放行一条拿不到保证的自动编辑，
+ * 比拒写危险得多。
+ *
+ * 形状：空串/非字符串同样参数错 —— 空串会让"宿主读不到化身"与"调用方给了空串"
+ * 互相匹配成功，那等于把这道门重新关掉。
+ *
+ * @returns {string} 非空化身字符串
+ * @throws {BridgeError} -32602（`reason:'expected-incarnation-missing'` /
+ *   `'expected-incarnation-not-a-non-empty-string'`）
+ */
+function readExpectedIncarnation(params, method) {
+  const v = params?.expectedIncarnation
+  if (typeof v === 'string' && v !== '') return v
+  const reason = v === undefined
+    ? 'expected-incarnation-missing'
+    : 'expected-incarnation-not-a-non-empty-string'
+  throw new BridgeError(ERR.INVALID_PARAMS,
+    'vscode.applyEdit requires the document-instance anchor: params.expectedIncarnation must be a '
+    + 'non-empty string (take it from vscode.getDocumentState.incarnation and pass it back '
+    + 'unchanged). A version number alone cannot prove "the same document instance" — it is '
+    + 'reused when a document is reopened — so writes without an incarnation are refused.',
+    { method, reason, got: { type: typeof v } })
+}
+
+/**
+ * 化身锚点判定（T34）—— 与 `assertVersionMatches` 并排的**同一道门**的第二半。
+ *
+ * 版本证明"内容没被改过"，化身证明"还是那一份文档"。两者都必要：
+ * 关掉重开后新实例又从版本 1 开始数，只有化身能把"旧视角的坐标"与"新实例"分开。
+ *
+ * 报错码与版本冲突**共用** `-32012`（处置一样：重读、重发、不许拿旧锚点重试），
+ * 用 `data.reason='incarnation-mismatch'` 区分是哪一半过期了。
+ */
+function assertIncarnationMatches(actual, expected, file, method) {
+  if (actual === expected) return
+  throw new BridgeError(ERR.DOCUMENT_VERSION_CONFLICT,
+    'the document instance is not the one this request was prepared against '
+    + `(incarnation ${typeof actual === 'string' ? actual : 'unknown'}, expected ${expected}); `
+    + 're-read vscode.getDocumentState and re-apply against the current document instance',
+    { method, file, reason: 'incarnation-mismatch', expected, actual: typeof actual === 'string' ? actual : null })
+}
+
+/**
  * 读**文档**状态（版本 / 脏标记 / 换行 / 行数 / 长度 / 可选全文）。
  *
  * 形状校验与 `readDocumentShape` 同一套理由（评审 R2-3）：宿主回的字段缺一个就说明
@@ -324,8 +383,8 @@ function readExpectedRangeText(params, method) {
  * `undefined !== 5` 会让每次写入都报冲突，或者更糟：`undefined === undefined` 一路放行。
  *
  * @param {{includeText: boolean}} wanted
- * @returns {Promise<{version:number, isDirty:boolean, eol:'lf'|'crlf', lineCount:number,
- *   textLength:number, byteLength:number, text?:string}>}
+ * @returns {Promise<{version:number, incarnation?:string, isDirty:boolean, eol:'lf'|'crlf',
+ *   lineCount:number, textLength:number, byteLength:number, text?:string}>}
  */
 async function readDocumentState(host, abs, wanted, method) {
   if (typeof host.readDocumentState !== 'function') {
@@ -353,6 +412,13 @@ async function readDocumentState(host, abs, wanted, method) {
     if (!Number.isInteger(state.lineCount) || state.lineCount < 1) bad.push('lineCount')
     if (!Number.isInteger(state.textLength) || state.textLength < 0) bad.push('textLength')
     if (!Number.isInteger(state.byteLength) || state.byteLength < 0) bad.push('byteLength')
+    // ★ T34：`incarnation` 在**这个适配器版本上可选**（老宿主/测试替身没有），但"给了就要
+    //   是形状对的字符串" —— 允许 `undefined`，绝不允许 `undefined` 一路被当成身份去比。
+    //   空串同样拒：它会让"调用方给了空串"与"宿主没给"互相匹配成功。
+    if (state.incarnation !== undefined
+      && (typeof state.incarnation !== 'string' || state.incarnation === '')) {
+      bad.push('incarnation')
+    }
   }
   if (bad.length > 0) {
     throw new BridgeError(ERR.INTERNAL,
@@ -418,7 +484,7 @@ async function readTargetRangeText(host, abs, apiRange, method) {
  * @param {() => object|null}                         host.activeEditor  返回 {file, text, start, end} 或 null
  * @param {(abs: string|null) => Array<{file: string, diagnostics: Array<{severity:string,line:number,character:number,message:string,source?:string,code?:any}>}>} host.collectDiagnostics
  * @param {() => Array<{file: string, isActive?: boolean, isDirty?: boolean, languageId?: string}>} host.listEditors
- * @param {(abs: string, range: {start:{line:number,column:number}, end:{line:number,column:number}}, text: string, expectedVersion: number) => Promise<{applied: boolean, documentPath?: string|null, version?: number|null}>} [host.applyEditText]
+ * @param {(abs: string, range: {start:{line:number,column:number}, end:{line:number,column:number}}, text: string, expectedVersion: number, expectedIncarnation?: string) => Promise<{applied: boolean, documentPath?: string|null, version?: number|null, incarnation?: string|null}>} [host.applyEditText]
  *        在**缓冲区**里替换一段文本（0-based range，已在校验层转过一次）。**不许保存**。
  *        **`expectedVersion` 必须由这一层在提交那一刻再判一次**（T32 / 评审 T31 的 B1）：
  *        适配器实现见 `edit-transaction.js` —— 在 `TextEditor.edit` 的**同步 callback** 里
@@ -643,8 +709,12 @@ export function createCapabilities(host, opts = {}) {
    * vscode.getDocumentState —— 写入锚点的读侧（T30）。
    *
    * params: { file: string, includeText?: boolean }
-   * result: { file, version, isDirty, eol: 'lf'|'crlf', lineCount, textLength,
+   * result: { file, version, incarnation, isDirty, eol: 'lf'|'crlf', lineCount, textLength,
    *           textUnavailable?: true, text?: string }
+   *
+   * `incarnation`（T34）= 这份**文档实例**的不透明身份（`inc-<hex>`）。它补的是
+   * `version` 的盲区：版本是每个实例自己的计数器，关掉重开后新实例又从 1 开始数。
+   * 两者一起构成写入锚点：`{ version, incarnation }`。
    *
    * 为什么需要这条能力：`applyEdit` 的 `expectedVersion` 只能从对端读到的
    * `TextDocument.version` 来。没有读侧，写入锚点就成了"猜一个数字"。
@@ -683,6 +753,10 @@ export function createCapabilities(host, opts = {}) {
       // 与其它能力同一口径：回规范化绝对路径，不回调用方写的那一串。
       file: canonicalPath(abs),
       version: state.version,
+      // ★ T34：版本之外再给一个**文档实例身份**。调用方把它原样放进
+      //   `applyEdit.expectedIncarnation`，关掉重开（版本数字复用）就瞒不过去。
+      //   宿主没给（老适配器）就没有这个键 —— 消费方按"缺 = 没有化身可用"处理。
+      ...(typeof state.incarnation === 'string' ? { incarnation: state.incarnation } : {}),
       isDirty: state.isDirty,
       eol: state.eol,
       lineCount: state.lineCount,
@@ -714,6 +788,7 @@ export function createCapabilities(host, opts = {}) {
    *
    * params: { file: string, range: {start:{line,column}, end:{line,column}}（1-based）,
    *           text: string, **expectedVersion: number（必填，整数 ≥ 0）**,
+   *           expectedIncarnation?: string（文档实例身份，见下）,
    *           expectedRangeText?: string, grant: {id, epoch} }
    * result: { applied: boolean, file: string（规范化绝对路径）, saved: false, textLength: number }
    *
@@ -729,6 +804,15 @@ export function createCapabilities(host, opts = {}) {
    *    **前置检查里就不等** → 宿主零调用；**到了写入事务内才不等**（检查之后有人改了
    *    缓冲区）→ 宿主被调用但**零构造 edit**（`builder.replace` 一次都不执行，一个字没写）。
    *    后者才是 B1 的保证，见下面的"判序"。
+   * **化身锚点（T34）**：可选 `expectedIncarnation`，值取 `vscode.getDocumentState` 回的
+   * `incarnation`（文档**实例**身份）。给了就必须与目标文档实例逐字相等，否则 `-32012`：
+   *  - 前置 ③b 就不等 → `data = { file, reason:'incarnation-mismatch', expected, actual }`，
+   *    **宿主零写入**（连 `applyEditText` 都没调）；
+   *  - 到了 ⑦ 的事务内才不等（读完之后文档被关掉重开）→ **零构造 edit**，同一个 data 形状。
+   * 它补的是版本锚点的第二个盲区：`TextDocument.version` 是每个实例自己的计数器，
+   * 关掉重开后新实例又是 1 —— 数字相等，只有化身能把"旧视角的坐标"与"新实例"分开。
+   * 不传 = 不判化身（老调用方向后兼容）；**这不削弱版本门**，两道门各自独立。
+   *
    *  - 可选的 `expectedRangeText`（目标范围当前应有的文本）：给了就必须与
    *    `host.readRangeText` 读到的当前文本**逐字相等**，否则 `-32012`，
    *    `data = { file, expectedVersion, actualVersion, reason:'range-text-mismatch',
@@ -737,12 +821,13 @@ export function createCapabilities(host, opts = {}) {
    *
    * **校验顺序（契约：判序本身就是契约）**：
    *   ① 路径守卫（`resolveWorkspaceFile`）→ ② 锚点形状（-32602）
-   *   → ③ 版本等值（前置，-32012）→ ④ range 形状/越界（-32602）
+   *   → ③ 版本等值（前置，-32012）→ ③b 化身等值（前置，给了才判，-32012）
+   *   → ④ range 形状/越界（-32602）
    *   → ⑤ `expectedRangeText` 内容比对（-32012）→ ⑥ 授权绑定门（执行前复核）
-   *   → ⑦ 写宿主；**宿主在提交那一刻再判一次版本（事务内判定，-32012）**。
+   *   → ⑦ 写宿主；**宿主在提交那一刻再判一次版本与化身（事务内判定，-32012）**。
    *
    * ⚠️ **前置检查不是保证，事务内判定才是**（T32 / 评审 T31 的 B1）。
-   *   ③ 与 ⑦ 之间隔着 ④ 的 `readDocumentShape`、⑤ 的 `readRangeText` 两个 await ——
+   *   ③③b 与 ⑦ 之间隔着 ④ 的 `readDocumentShape`、⑤ 的 `readRangeText` 两个 await ——
    *   用户敲一个字、格式化插件跑一次，都发生在这些让出点里。所以 ③ 只是**便宜的早失败**
    *   （错误更早、宿主零调用、日志更好读），真正"绝不覆盖人工内容"的保证在
    *   `edit-transaction.js`：`TextEditor.edit` 的 callback 里同步读 `document.version`、
@@ -775,6 +860,10 @@ export function createCapabilities(host, opts = {}) {
     // 形状错误（-32602）与排队无关，放锁外：非法请求不必排在别人后面等。
     const expectedVersion = readExpectedVersion(params, method)
     const expectedRangeText = readExpectedRangeText(params, method)
+    // ★ T34 / **T35 收紧**：化身锚点**无条件必填** —— 缺失/非字符串/空串在调用
+    //   `applyEditText` **之前**就是 -32602（宿主零写入）。见 `readExpectedIncarnation`
+    //   的 JSDoc：这是有意的不兼容收紧，理由是没有化身就无法证明"同一个文档实例"。
+    const expectedIncarnation = readExpectedIncarnation(params, method)
 
     // ── 同一文件的写入排队（T32 建议 ③）──
     // 从这里到写宿主**整段串行**：第二个请求是在锁内才读版本的，所以它必然看到第一个
@@ -784,7 +873,9 @@ export function createCapabilities(host, opts = {}) {
     // 在 Windows 上会让同一文件进两条链（T33 / 评审 I1）。
     // 展示与错误 data 里的 `file` 仍然走 `canonicalPath(abs)`，锁键不参与对外输出。
     return serializeByPath(serializeKeyFor(real),
-      () => writeUnderLock({ method, abs, real, text, expectedVersion, expectedRangeText, params, ctx }))
+      () => writeUnderLock({
+        method, abs, real, text, expectedVersion, expectedRangeText, expectedIncarnation, params, ctx,
+      }))
   }
 
   /**
@@ -792,11 +883,19 @@ export function createCapabilities(host, opts = {}) {
    * 所以这里可以放心用"读版本 → 用坐标"的写法：同一文件的另一条写入不可能插进来。
    * 但**人工编辑**仍然可以插进来 —— 那只能由 ⑦ 的事务内判定挡住。
    */
-  async function writeUnderLock({ method, abs, real, text, expectedVersion, expectedRangeText, params, ctx }) {
+  async function writeUnderLock({
+    method, abs, real, text, expectedVersion, expectedRangeText, expectedIncarnation, params, ctx,
+  }) {
     // ── ③ 版本等值（前置检查：不是保证，见 JSDoc 的 ⚠️）──
     // 这里读到的是"这一刻"的版本；下面的 ④⑤ 都是让出点，人工编辑可以在其中发生。
     const state = await readDocumentState(host, real, { includeText: false }, method)
     assertVersionMatches(state.version, expectedVersion, canonicalPath(abs), method)
+    // ── ③b 化身等值（前置检查，T34；T35 起**无条件**）──
+    // 与 ③ 同一个理由、同一份 `state`：便宜的早失败（宿主零写入 + 错误更早更清楚）。
+    // **不是保证** —— 真正的保证在 ⑦ 的事务内，同一行同步区间里再判一次。
+    // T35：去掉了 `expectedIncarnation !== undefined` 这个条件。它曾是 H1 的一半：
+    // 省略字段 ⇒ 这里整段跳过 ⇒ 只剩整数版本比较。
+    assertIncarnationMatches(state.incarnation, expectedIncarnation, canonicalPath(abs), method)
 
     // ── ④ 范围形状 / 越界 ──
     const range = readRange(params?.range, method)
@@ -851,7 +950,9 @@ export function createCapabilities(host, opts = {}) {
     // 宿主/适配器在 `TextEditor.edit` 的同步 callback 里读 `document.version` 再比一次。
     // 上面 ④⑤ 已经跑过几个 await，人工编辑完全可能就发生在其中 —— 所以这一道不是重复劳动，
     // 而是唯一真正挡住 B1 的那一道（`edit-transaction.js`）。
-    const outcome = await host.applyEditText(writeTarget, toApiRange(range), text, expectedVersion)
+    const outcome = await host.applyEditText(
+      writeTarget, toApiRange(range), text, expectedVersion, expectedIncarnation,
+    )
     // ── 写后复核（评审 R2-1 ③） ──
     // 写入已经发生，本步阻止不了"落到了被换掉的目录"；它只是在**采样到路径差异/解析失败**
     // 时拒报成功（-32603）。它是采样而不是写入历史：替换持续到此刻才算数，

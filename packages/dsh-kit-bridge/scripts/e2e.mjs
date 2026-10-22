@@ -109,7 +109,9 @@ import { GrantStore } from '${toUrl(join(kitRoot, 'src/grant.js'))}'
 const WS = process.env.E2E_WS
 const DOC = j(WS, 'e2e.js')
 // 真文档状态（含版本号）：T30 的写入锚点必须以宿主自己的 version 为准。
-const doc = { version: 5, text: rf(DOC, 'utf8'), isDirty: false }
+// T34/T35：文档**实例身份**。这个假宿主一辈子只有一个实例 ⇒ 化身恒定；
+// 但 DSH 侧从此必须把它带回来（★ T35 起缺失 = -32602，写不进来）。
+const doc = { version: 5, text: rf(DOC, 'utf8'), isDirty: false, incarnation: 'inc-e2e' }
 // 假 VS Code 宿主：把“打开的文件”记到 stdout，供 E2E 断言
 const host = {
   fileExists: () => true,
@@ -131,17 +133,22 @@ const host = {
   },
   // T30：版本锚点的读侧
   readDocumentState: async (abs, { includeText = false } = {}) => ({
-    version: doc.version, isDirty: doc.isDirty, eol: 'lf',
+    version: doc.version, incarnation: doc.incarnation, isDirty: doc.isDirty, eol: 'lf',
     lineCount: doc.text.split(String.fromCharCode(10)).length, textLength: doc.text.length,
     byteLength: Buffer.byteLength(doc.text, 'utf8'),
     ...(includeText === true ? { text: doc.text } : {}),
   }),
   readRangeText: async () => '',
   // 等价于 vscode.workspace.applyEdit：只改缓冲区、版本 +1、绝不落盘
-  applyEditText: async (abs, range, text) => {
+  applyEditText: async (abs, range, text, expectedVersion, expectedIncarnation) => {
+    // 与真宿主同构：两条锚点都对上才落点（T35 起化身缺失在能力层就被 -32602 拒了，
+    // 走不到这里；这里判的是"实例不符"那一半）。
+    if (expectedIncarnation !== doc.incarnation) {
+      throw new Error('e2e host: incarnation ' + expectedIncarnation + ' != ' + doc.incarnation)
+    }
     doc.version += 1
     doc.isDirty = true
-    console.log('APPLIED ' + JSON.stringify({ version: doc.version, abs, text }))
+    console.log('APPLIED ' + JSON.stringify({ version: doc.version, abs, text, expectedIncarnation }))
     return { applied: true, documentPath: abs }
   },
   log: (m) => console.log('host: ' + m),
@@ -235,25 +242,38 @@ try {
   check('vscode.getDocumentState 跨进程成功（拿到宿主版本号）',
     typeof st0.result?.version === 'number' && st0.result.version === 5,
     JSON.stringify(st0.result ?? st0.error))
-  check('getDocumentState 形状齐全（version/isDirty/eol/lineCount/textLength/file）',
-    ['version', 'isDirty', 'eol', 'lineCount', 'textLength', 'file'].every((k) => k in (st0.result ?? {})),
+  check('getDocumentState 形状齐全（version/incarnation/isDirty/eol/lineCount/textLength/file）',
+    ['version', 'incarnation', 'isDirty', 'eol', 'lineCount', 'textLength', 'file'].every((k) => k in (st0.result ?? {})),
     JSON.stringify(Object.keys(st0.result ?? {})))
 
   const g = await rpc(dshProc, { id: 11, op: 'grant', sessionId: 'e2e' })
   check('editing.grant 跨进程发放（对端已存档）',
     g.result?.delivered === true && typeof g.result?.id === 'string', JSON.stringify(g.result ?? g.error))
   const grant = { id: g.result.id, epoch: g.result.epoch }
-  const write = (id, expectedVersion) => rpc(dshProc, {
+  // T35：写请求必须带**两条**锚点（版本 + 实例）。化身穿 end-to-end 不带加工。
+  const INC = st0.result.incarnation
+  const write = (id, expectedVersion, expectedIncarnation = INC) => rpc(dshProc, {
     id, method: 'vscode.applyEdit', sessionId: 'e2e',
     params: {
       file: docPath,
       range: { start: { line: 2, column: 1 }, end: { line: 2, column: 7 } },
-      text: 'SECOND', grant, expectedVersion,
+      text: 'SECOND', grant, expectedVersion, expectedIncarnation,
     },
   })
 
   const v0 = st0.result.version
   const ok = await write(12, v0)
+  // ★ T35：**省略字段**（不是给 null）—— 这正是终审复现 H1 的那条线。
+  const noInc = await rpc(dshProc, {
+    id: 14, method: 'vscode.applyEdit', sessionId: 'e2e',
+    params: {
+      file: docPath,
+      range: { start: { line: 2, column: 1 }, end: { line: 2, column: 7 } },
+      text: 'SECOND', grant, expectedVersion: v0 + 1,
+    },
+  })
+  check('★ T35 省略化身的写入跨进程被本地 -32602 拦下（宿主零调用）',
+    noInc.error?.code === -32602, JSON.stringify(noInc.result ?? noInc.error))
   check('版本相符的写入跨进程成功（applied 且 saved:false）',
     ok.result?.applied === true && ok.result?.saved === false,
     JSON.stringify(ok.result ?? ok.error))

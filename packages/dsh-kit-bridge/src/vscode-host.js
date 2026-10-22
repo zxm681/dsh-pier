@@ -7,6 +7,7 @@
 
 import path from 'node:path'
 import { existsSync, statSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 
 import * as vscode from 'vscode'
 
@@ -14,6 +15,41 @@ import { BridgeError, ERR } from '../../dsh-vscode-kit/src/protocol.js'
 import { GrantStore } from '../../dsh-vscode-kit/src/grant.js'
 import { createCapabilities } from './capabilities.js'
 import { applyEditAtomically } from './edit-transaction.js'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 文档化身（incarnation，T34）：每个 `TextDocument` **实例**一个不透明身份
+//
+// 为什么版本号不够（T5 的 Q3）：`TextDocument.version` 是**每个文档实例**自己的计数器。
+// 关闭再打开（或撤销回到初始态）拿到的是**新实例**，版本又从 1 开始数 —— 于是"旧实例
+// 的版本 1"与"新实例的版本 1"数字相等，版本门放行，写入按旧视角的坐标落进新缓冲区。
+//
+// 身份必须绑在**对象实例**上，而不是绑在 uri 上：同一个 uri 先后可以对应多个实例，
+// 而"我准备这组坐标时看到的是哪一份"只能由实例回答。`WeakMap` 恰好是这个语义 ——
+// 键是对象身份，实例被回收时条目自动消失，不占内存、不会把旧 id 分给新实例。
+//
+// 不透明、随机、与磁盘无关：`inc-<8字节 hex>`。它对外只作**等值比对**用，
+// 不携带任何文档内容，也不该被当成持久标识（进程重启即失效，这是特性不是缺陷）。
+// ─────────────────────────────────────────────────────────────────────────────
+const documentIncarnations = new WeakMap()
+
+/**
+ * 取（首次则分配）这个文档实例的 incarnation。
+ *
+ * 同一个实例永远回同一个 id；新实例（关闭重开 / 撤销到初始态 / 另一个窗口打开的
+ * 同一文件）必然是新 id。**只在宿主持有文档对象的地方调用** —— 本函数是
+ * `getDocumentState.incarnation` 与写入事务内比对的**唯一**生成点，两处必须同源，
+ * 否则"读到的 id"和"判的 id"会漂移成两套。
+ *
+ * @param {{}} doc `vscode.TextDocument`
+ * @returns {string}
+ */
+function incarnationOf(doc) {
+  const hit = documentIncarnations.get(doc)
+  if (hit) return hit.id
+  const id = `inc-${randomBytes(8).toString('hex')}`
+  documentIncarnations.set(doc, { id })
+  return id
+}
 
 /**
  * 建适配器。`output` 是扩展的日志通道（可选）。
@@ -169,6 +205,9 @@ export function createHost(output) {
     const text = doc.getText()
     return {
       version: doc.version,
+      // ★ T34：实例身份与版本同一次读取、同一个文档对象 —— 两半锚点必须同源，
+      //   否则"版本来自 A 实例、化身来自 B 实例"就是新的错配形态。
+      incarnation: incarnationOf(doc),
       isDirty: doc.isDirty === true,
       eol: doc.eol === vscode.EndOfLine.CRLF ? 'crlf' : 'lf',
       lineCount: doc.lineCount,
@@ -253,13 +292,23 @@ export function createHost(output) {
    * @param {{start:{line:number,column:number}, end:{line:number,column:number}}} range 0-based
    * @param {string} text
    * @param {number} expectedVersion 调用方准备这组坐标时所基于的 `document.version`（**必填**）
+   * @param {string} expectedIncarnation 同一刻这份**文档实例**的身份（T34 引入；
+   *        ★ T35 起**无条件必填**，能力层从 `vscode.getDocumentState.incarnation` 原样传下来）。
+   *        事务在提交那一刻**无条件**比对，不符 → 零构造 + `-32012`
+   *        （`data.reason === 'incarnation-mismatch'`）；缺 / 空串在能力层就是 `-32602`，
+   *        走到这里是"事务被绕过"的最后一道失败闭合。旧宿主给不出化身 ⇒ 拒写
+   *        （有意的不兼容收紧：没有实例身份就证明不了"写的是同一个文档实例"）。
    */
-  async function applyEditText(abs, range, text, expectedVersion) {
+  async function applyEditText(abs, range, text, expectedVersion, expectedIncarnation) {
     const editor = await editorFor(vscode.Uri.file(abs), abs)
     const outcome = await applyEditAtomically({
       editor,
       file: abs,
       expectedVersion,
+      expectedIncarnation,
+      // 与 `readDocumentState` **同一个** `incarnationOf`：读侧报的 id 与写侧判的 id
+      // 同源，否则"我读到的化身"和"你比对的化身"会是两套。
+      readIncarnation: (doc) => incarnationOf(doc),
       apply: (builder) => {
         // Range 在**事务的同步区间里**构造：坐标与版本属于同一刻，不许在事务外先算好。
         builder.replace(
@@ -274,11 +323,13 @@ export function createHost(output) {
     })
     log(`applyEditText: ${abs} [${range.start.line}:${range.start.column}-`
       + `${range.end.line}:${range.end.column}] ${text.length} chars → applied=${outcome.applied}`
-      + ` v${outcome.version} (not saved; document=${outcome.documentPath ?? 'unknown'})`)
+      + ` v${outcome.version}${outcome.incarnation ? ` ${outcome.incarnation}` : ''}`
+      + ` (not saved; document=${outcome.documentPath ?? 'unknown'})`)
     return {
       applied: outcome.applied === true,
       documentPath: outcome.documentPath,
       version: outcome.version,
+      incarnation: outcome.incarnation ?? null,
     }
   }
 

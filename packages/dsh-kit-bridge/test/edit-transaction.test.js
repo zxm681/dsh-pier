@@ -43,6 +43,13 @@ import { applyEditAtomically, TRANSACTION_METHOD } from '../src/edit-transaction
 const ID = 'c'.repeat(32)
 const EPOCH = 'd'.repeat(32)
 const LINES = ['line1', 'line2', 'line3']
+/**
+ * 假文档的实例身份（T34 引入；★ T35 起 `expectedIncarnation` **无条件必填**）。
+ *
+ * 脚手架默认带上它，与 `expectedVersion: 0` 同理：本文件要验的是"人工编辑能不能插进事务
+ * 的窗口"，而缺锚点会在**锚点形状门**就短路，那些窗口根本跑不到。
+ */
+const INCARNATION = 'inc-t32'
 
 /** 0-based range 的替换（等价 `vscode.Range` + `builder.replace` 的落点语义）。 */
 function applyReplace(doc, range, value) {
@@ -68,6 +75,8 @@ function humanInsert(doc, line, column, value) {
 function makeHost(root, abs, { hooks = {} } = {}) {
   const doc = {
     version: 0,
+    // ★ T35：化身无条件必填 ⇒ 假文档必须带实例身份（写侧在事务里比对的就是它）。
+    incarnation: INCARNATION,
     lines: readFileSync(abs, 'utf8').split(/\r?\n/),
     uri: { fsPath: abs },
   }
@@ -103,6 +112,7 @@ function makeHost(root, abs, { hooks = {} } = {}) {
       const text = doc.lines.join('\n')
       return {
         version: doc.version,
+        incarnation: doc.incarnation,
         isDirty: true,
         eol: 'lf',
         lineCount: doc.lines.length,
@@ -125,8 +135,10 @@ function makeHost(root, abs, { hooks = {} } = {}) {
      * 真事务的写宿主。`expectedVersion` 是能力层传下来的**锚点本身**（不是一个布尔值）；
      * 判定发生在 `applyEditAtomically` 里 —— 版本不等就**一次 edit 都不构造**。
      */
-    applyEditText: async (_abs, range, text, expectedVersion) => {
-      calls.push({ range, text, expectedVersion, versionAtEntry: doc.version })
+    applyEditText: async (_abs, range, text, expectedVersion, expectedIncarnation) => {
+      calls.push({
+        range, text, expectedVersion, expectedIncarnation, versionAtEntry: doc.version,
+      })
       // 让出点②：事务开始之前（最后一道 await 之外）。人工编辑落在这里也照样被挡住。
       await hooks.beforeTransaction?.(doc)
       const editor = {
@@ -141,7 +153,9 @@ function makeHost(root, abs, { hooks = {} } = {}) {
         },
       }
       const outcome = await applyEditAtomically({
-        editor, file: abs, expectedVersion, apply: (builder) => builder.replace(range, text),
+        editor, file: abs, expectedVersion, expectedIncarnation,
+        readIncarnation: (d) => d.incarnation,
+        apply: (builder) => builder.replace(range, text),
       })
       return { applied: outcome.applied, documentPath: abs, version: outcome.version }
     },
@@ -189,6 +203,7 @@ function params(abs, extra = {}) {
     range: { start: { line: 2, column: 1 }, end: { line: 2, column: 6 } },
     text: 'DSH!!',
     expectedVersion: 0,
+    expectedIncarnation: INCARNATION,
     grant: { id: ID, epoch: EPOCH },
     ...extra,
   }
@@ -251,7 +266,12 @@ test('T32 事务：从读版本到构造 edit 全在同步区间 —— 排队�
     },
   }
   const outcome = applyEditAtomically({
-    editor, file: '/tmp/x.js', expectedVersion: 3, apply: (b) => b.replace({}, 'X'),
+    editor,
+    file: '/tmp/x.js',
+    expectedVersion: 3,
+    expectedIncarnation: INCARNATION,
+    readIncarnation: (d) => d.incarnation ?? INCARNATION,
+    apply: (b) => b.replace({}, 'X'),
   })
   queueMicrotask(() => { sawMicrotask = true })
   await outcome
@@ -272,7 +292,14 @@ test('T32 事务：edit 返回 false 且版本已变 → 仍按冲突报；版�
       },
     }
     const err = await expectCode(
-      applyEditAtomically({ editor, file: '/tmp/x.js', expectedVersion: 1, apply: (b) => b.replace({}, 'X') }),
+      applyEditAtomically({
+        editor,
+        file: '/tmp/x.js',
+        expectedVersion: 1,
+        expectedIncarnation: INCARNATION,
+        readIncarnation: (d) => d.incarnation ?? INCARNATION,
+        apply: (b) => b.replace({}, 'X'),
+      }),
       ERR.DOCUMENT_VERSION_CONFLICT, 'rejected-by-cas',
     )
     assert.equal(err.data.actual, 2)
@@ -282,21 +309,35 @@ test('T32 事务：edit 返回 false 且版本已变 → 仍按冲突报；版�
     const doc = { ...base, version: 7 }
     const editor = { document: doc, edit: async (cb) => { cb({ replace: () => {} }); return false } }
     const outcome = await applyEditAtomically({
-      editor, file: '/tmp/x.js', expectedVersion: 7, apply: (b) => b.replace({}, 'X'),
+      editor,
+      file: '/tmp/x.js',
+      expectedVersion: 7,
+      expectedIncarnation: INCARNATION,
+      readIncarnation: (d) => d.incarnation ?? INCARNATION,
+      apply: (b) => b.replace({}, 'X'),
     })
-    assert.deepEqual(outcome, { applied: false, documentPath: '/tmp/x.js', version: 7 })
+    assert.deepEqual(outcome, {
+      applied: false, documentPath: '/tmp/x.js', version: 7, incarnation: INCARNATION,
+    })
   }
 })
 
 test('T32 事务：拿不到编辑器 / 锚点不是整数 → -32603 失败闭合（不许"当成没给"）', async () => {
   await expectCode(
-    applyEditAtomically({ editor: {}, file: '/tmp/x.js', expectedVersion: 1, apply: () => {} }),
+    applyEditAtomically({
+      editor: {}, file: '/tmp/x.js', expectedVersion: 1,
+      expectedIncarnation: INCARNATION, apply: () => {},
+    }),
     ERR.INTERNAL, 'not-an-editor',
   )
   await expectCode(
     applyEditAtomically({
       editor: { document: { version: 1 }, edit: async () => true },
-      file: '/tmp/x.js', expectedVersion: undefined, apply: () => {},
+      file: '/tmp/x.js',
+      expectedVersion: undefined,
+      expectedIncarnation: INCARNATION,
+      readIncarnation: () => INCARNATION,
+      apply: () => {},
     }),
     ERR.INTERNAL, 'no-anchor',
   )
@@ -429,9 +470,10 @@ test('T32 串行化按**文件**分键：不同文件并行（不是全局锁）
   host.readDocumentState = async (abs, opts) => (abs === other
     ? otherHost.readDocumentState(abs, opts)
     : readStateOf(e.host, abs, opts))
-  host.applyEditText = async (abs, range, text, expectedVersion) => (abs === other
-    ? otherHost.applyEditText(abs, range, text, expectedVersion)
-    : applyToMain(e, abs, range, text, expectedVersion))
+  host.applyEditText = async (abs, range, text, expectedVersion, expectedIncarnation) => (
+    abs === other
+      ? otherHost.applyEditText(abs, range, text, expectedVersion, expectedIncarnation)
+      : applyToMain(e, abs, range, text, expectedVersion, expectedIncarnation))
 
   const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('排队跨文件了：全局锁？')), 2000))
   try {
@@ -454,6 +496,7 @@ async function readStateOf(host, abs, { includeText = false } = {}) {
   const text = host.doc.lines.join('\n')
   return {
     version: host.doc.version,
+    incarnation: host.doc.incarnation,
     isDirty: true,
     eol: 'lf',
     lineCount: host.doc.lines.length,
@@ -464,7 +507,7 @@ async function readStateOf(host, abs, { includeText = false } = {}) {
 }
 
 /** 走真事务写主文件（上面覆盖 `applyEditText` 时复用）。 */
-async function applyToMain(e, abs, range, text, expectedVersion) {
+async function applyToMain(e, abs, range, text, expectedVersion, expectedIncarnation) {
   const doc = e.host.doc
   const editor = {
     document: doc,
@@ -477,7 +520,9 @@ async function applyToMain(e, abs, range, text, expectedVersion) {
     },
   }
   const outcome = await applyEditAtomically({
-    editor, file: abs, expectedVersion, apply: (builder) => builder.replace(range, text),
+    editor, file: abs, expectedVersion, expectedIncarnation,
+    readIncarnation: (d) => d.incarnation,
+    apply: (builder) => builder.replace(range, text),
   })
   return { applied: outcome.applied, documentPath: abs, version: outcome.version }
 }
@@ -587,9 +632,10 @@ test('★ T33 不同文件仍可并行（大写别名没把锁做成全局锁）
     host.readDocumentState = async (abs, opts) => (abs === other
       ? otherHost.readDocumentState(abs, opts)
       : readStateOf(host, abs, opts))
-    host.applyEditText = async (abs, range, text, expectedVersion) => (abs === other
-      ? otherHost.applyEditText(abs, range, text, expectedVersion)
-      : applyToMain(e, abs, range, text, expectedVersion))
+    host.applyEditText = async (abs, range, text, expectedVersion, expectedIncarnation) => (
+      abs === other
+        ? otherHost.applyEditText(abs, range, text, expectedVersion, expectedIncarnation)
+        : applyToMain(e, abs, range, text, expectedVersion, expectedIncarnation))
 
     const timeout = new Promise((_, rej) => setTimeout(
       () => rej(new Error('锁变全局了：两个不同文件没能同时进锁（键不是按文件身份分的？）')), 2000))

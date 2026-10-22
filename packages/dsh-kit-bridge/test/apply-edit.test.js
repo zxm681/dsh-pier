@@ -45,20 +45,39 @@ function tempWorkspace() {
 /** 假宿主的默认"文档版本"（T30：`applyEdit` 的 `expectedVersion` 必须与它一致）。 */
 const DEFAULT_VERSION = 1
 
+/**
+ * 假宿主的默认"文档实例身份"（T34 引入；**T35 起 `expectedIncarnation` 无条件必填**）。
+ *
+ * 脚手架默认带上它，理由与 `DEFAULT_VERSION` 相同：本文件绝大多数用例要验的不是
+ * "锚点缺失"而是范围/路径/授权/身份之类的别的东西，缺锚点会在**锚点形状门**就短路，
+ * 那些性质根本跑不到。想造化身场景的用例自己覆盖（`editParams(file, { expectedIncarnation: 'x' })`
+ * 或改 `host.setIncarnation`）。
+ */
+const DEFAULT_INCARNATION = 'inc-default'
+
 /** 假 VS Code 宿主（真文件系统校验 + 记录 applyEditText 调用）。 */
 function makeHost(
   roots,
-  { trusted = true, applied = true, applyEditText, documentShape, version = DEFAULT_VERSION } = {},
+  {
+    trusted = true, applied = true, applyEditText, documentShape,
+    version = DEFAULT_VERSION, incarnation = DEFAULT_INCARNATION,
+  } = {},
 ) {
   const calls = []
   // 每个文件一个可改的版本号（T30）：`host.setVersion(abs, n)` 模拟"缓冲区被人改过"。
   const versions = new Map()
   const versionOf = (abs) => (versions.has(abs) ? versions.get(abs) : version)
+  // 每个文件一个可改的化身（T34）：`host.setIncarnation(abs, s)` 模拟"关掉再打开"。
+  const incarnations = new Map()
+  const incarnationOf = (abs) => (incarnations.has(abs) ? incarnations.get(abs) : incarnation)
   const host = {
     calls,
     versions,
     versionOf,
     setVersion: (abs, v) => { versions.set(abs, v) },
+    incarnations,
+    incarnationOf,
+    setIncarnation: (abs, s) => { incarnations.set(abs, s) },
     fileExists: (p) => { try { return existsSync(p) && statSync(p).isFile() } catch { return false } },
     resolvePath: (p) => (isAbsolute(p) ? normalize(p) : join(roots[0], p)),
     workspaceRoots: () => roots.slice(),
@@ -74,6 +93,8 @@ function makeHost(
       const text = readFileSync(abs, 'utf8')
       return {
         version: versionOf(abs),
+        // T34/T35：读侧报的化身，与写侧比对的是同一份"文档实例"身份。
+        incarnation: incarnationOf(abs),
         isDirty: false,
         eol: text.includes('\r\n') ? 'crlf' : 'lf',
         lineCount: text.split('\n').length,
@@ -139,7 +160,10 @@ const FILE = (root) => join(root, 'a.js')
  * 入口参数一律 1-based（协议对外口径）。
  *
  * T30 起 `expectedVersion` 是**必填**字段，所以脚手架默认带上 `DEFAULT_VERSION`；
- * 想造版本冲突的用例自己覆盖（`editParams(file, { expectedVersion: 0 })`）。
+ * ★ **T35 起 `expectedIncarnation` 同样无条件必填**（缺/空串/非字符串 → `-32602`
+ * `reason:'expected-incarnation-missing'`），所以脚手架也默认带上 `DEFAULT_INCARNATION`。
+ * 想造版本冲突的用例自己覆盖（`editParams(file, { expectedVersion: 0 })`），
+ * 想造化身场景的用例覆盖 `expectedIncarnation`（传 `undefined` 就是"漏字段"）。
  */
 function editParams(file, extra = {}) {
   return {
@@ -147,6 +171,7 @@ function editParams(file, extra = {}) {
     range: { start: { line: 1, column: 1 }, end: { line: 1, column: 6 } },
     text: 'HELLO',
     expectedVersion: DEFAULT_VERSION,
+    expectedIncarnation: DEFAULT_INCARNATION,
     grant: { id: ID_A, epoch: EPOCH_A },
     ...extra,
   }
@@ -562,6 +587,8 @@ test('bridge.grant 入站：存下 DSH 发来的 id/epoch，之后的写入放�
       text: 'HELLO',
       // T30：写入必须带版本锚点（真链路上这条也是必填项，缺了会被 -32602 拒）。
       expectedVersion: ed.host.versionOf(join(ws.root, 'a.js')),
+      // ★ T35：化身锚点同样无条件必填 —— 这就是真链路上那份"两条锚点一起"的形状。
+      expectedIncarnation: ed.host.incarnationOf(join(ws.root, 'a.js')),
       grant: { id, epoch },
     })
     assert.equal(res.applied, true)

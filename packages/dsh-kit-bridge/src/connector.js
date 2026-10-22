@@ -27,6 +27,22 @@ export const CLIENT_ID = 'dsh-kit-bridge'
 export const EXTENSION_VERSION = '0.3.0'
 
 /**
+ * hello 里的 `features` 声明（T34）—— **能力清单之外**的语义能力公告。
+ *
+ * 为什么不能复用 `capabilities`（那是方法名清单）：`capabilities` 回答"你能接哪些方法"，
+ * 而这里要回答的是"你回的锚点里有没有化身身份、你会不会在写入时判它"。
+ * 两件事的含义不同，混在一起会让 `_assertCapability`（按方法名查表）语义漂移。
+ *
+ * DSH 侧读它做一件事：对端声明了 `document-incarnation` ⇒ `kit.vscode.applyEdit`
+ * **强制要求** `expectedIncarnation`（缺则本地拒，一个字节都不发）；对端没声明（老扩展）
+ * ⇒ 不强制，否则升级桥的两端会互相锁死。
+ *
+ * ⚠️ 这个字符串与 `packages/dsh-vscode-kit/src/index.js` 的
+ * `PEER_FEATURE_DOCUMENT_INCARNATION` **必须逐字相同**（test/t34-incarnation.test.js 守着）。
+ */
+export const PEER_FEATURES = Object.freeze(['document-incarnation'])
+
+/**
  * @param {object} deps
  * @param {(method, params) => Promise<any>} deps.dispatch   能力分派（capabilities.dispatch）
  * @param {(msg: string, level?: string) => void} [deps.log]
@@ -137,6 +153,8 @@ export function createConnector(deps) {
         extensionVersion: EXTENSION_VERSION,
         protocolVersion: PROTOCOL_VERSION,
         capabilities: CAPABILITIES,
+        // 语义能力公告（T34）：DSH 侧据此决定要不要强制化身锚点。
+        features: PEER_FEATURES,
       }
     },
   }
@@ -345,6 +363,7 @@ export function createConnector(deps) {
       extensionVersion: EXTENSION_VERSION,
       protocolVersion: PROTOCOL_VERSION,
       capabilities: CAPABILITIES,
+      features: PEER_FEATURES,
     }).catch((err) => log(`hello failed: ${err?.message ?? err}`, 'warn'))
   }
 

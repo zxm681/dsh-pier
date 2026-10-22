@@ -48,7 +48,8 @@ function makeHost(roots, { trusted = true } = {}) {
   const doc = (abs) => {
     if (!docs.has(abs)) {
       const text = readFileSync(abs, 'utf8')
-      docs.set(abs, { version: 1, text, isDirty: false, eol: 'lf', byteLength: null })
+      // ★ T35：化身无条件必填 ⇒ 假文档必须带实例身份（`edit(abs,{incarnation})` 换它）。
+      docs.set(abs, { version: 1, incarnation: 'inc-t30', text, isDirty: false, eol: 'lf', byteLength: null })
     }
     return docs.get(abs)
   }
@@ -56,9 +57,10 @@ function makeHost(roots, { trusted = true } = {}) {
     calls,
     docs,
     /** 测试用：直接改"编辑器里的文档"（版本 / 文本 / 字节数 / 脏标记）。 */
-    edit(abs, { version, text, byteLength, isDirty } = {}) {
+    edit(abs, { version, text, byteLength, isDirty, incarnation } = {}) {
       const d = doc(abs)
       if (text !== undefined) d.text = text
+      if (incarnation !== undefined) d.incarnation = incarnation
       if (version !== undefined) d.version = version
       if (byteLength !== undefined) d.byteLength = byteLength
       if (isDirty !== undefined) d.isDirty = isDirty
@@ -84,6 +86,7 @@ function makeHost(roots, { trusted = true } = {}) {
       const d = doc(abs)
       return {
         version: d.version,
+        incarnation: d.incarnation,
         isDirty: d.isDirty,
         eol: d.eol,
         lineCount: d.text.split('\n').length,
@@ -135,6 +138,7 @@ function editParams(file, extra = {}) {
     range: { start: { line: 1, column: 1 }, end: { line: 1, column: 6 } },
     text: 'HELLO',
     expectedVersion: 1,
+    expectedIncarnation: 'inc-t30',
     grant: { id: ID_A, epoch: EPOCH_A },
     ...extra,
   }
@@ -280,6 +284,7 @@ test('T30 ★ 判序：版本不符 + 范围越界 → 先报版本（-32012）�
     const err = await expectCode(
       caps.dispatch('vscode.applyEdit', editParams(file, {
         expectedVersion: 1,
+    expectedIncarnation: 'inc-t30',
         range: { start: { line: 1, column: 1 }, end: { line: 99, column: 1 } },
       }), { link }),
       ERR.DOCUMENT_VERSION_CONFLICT, 'version-before-range')
@@ -366,9 +371,11 @@ test('T30 ★ getDocumentState 形状：version 来自 TextDocument.version，�
     const file = join(ws.root, 'a.js')
     host.edit(file, { version: 12, isDirty: true })
     const state = await caps.dispatch('vscode.getDocumentState', { file }, { link })
+    // ★ T35：`incarnation` 是写侧必填锚点的来源，必须在读侧形状里（T34 起有，T35 起更不可缺）。
     assert.deepEqual(Object.keys(state).sort(),
-      ['eol', 'file', 'isDirty', 'lineCount', 'textLength', 'version'])
+      ['eol', 'file', 'incarnation', 'isDirty', 'lineCount', 'textLength', 'version'])
     assert.equal(state.version, 12)
+    assert.equal(state.incarnation, 'inc-t30', '化身原样透出，不加工')
     assert.equal(state.isDirty, true)
     assert.equal(state.eol, 'lf')
     assert.equal(state.lineCount, 3)

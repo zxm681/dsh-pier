@@ -199,12 +199,19 @@ async function withKit(n = 1, { onRequest } = {}) {
  */
 const VERSION = 4
 
+/**
+ * 假的对端化身（T34 引入；★ T35 起 `expectedIncarnation` **无条件必填**）。
+ * 本文件测的是**绑定门**那一层，锚点只是"让请求能走到门那里"的入场券。
+ */
+const INCARNATION = 'inc-kit-gate'
+
 function writeParams(extra = {}) {
   return {
     file: '/ws/a.js',
     range: { start: { line: 1, column: 1 }, end: { line: 1, column: 3 } },
     text: 'hello',
     expectedVersion: VERSION,
+    expectedIncarnation: INCARNATION,
     ...extra,
   }
 }

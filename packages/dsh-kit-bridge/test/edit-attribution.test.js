@@ -93,6 +93,7 @@ function makeBufferHost(roots) {
       const text = read(abs).join('\n')
       return {
         version: versionOf(abs),
+        incarnation: INCARNATION,
         isDirty: true,
         eol: 'lf',
         lineCount: read(abs).length,
@@ -115,9 +116,17 @@ function makeBufferHost(roots) {
     // 等价于 `vscode.workspace.applyEdit`：按坐标替换缓冲区，**绝不碰磁盘**；版本 +1。
     // T32：这一层**也**要收 `expectedVersion` 并在提交那一刻再判一次（真适配器在
     // `edit-transaction.js` 里做同一件事）。不等 → 不构造 edit、抛 `-32012`。
-    applyEditText: async (abs, range, text, expectedVersion) => {
+    // ★ T35：`expectedIncarnation` 也是锚点的一部分，无条件必填；这一层与真适配器一样
+    // 在"提交那一刻"再判一次（两条锚点都判）。
+    applyEditText: async (abs, range, text, expectedVersion, expectedIncarnation) => {
       const versionAtWrite = versionOf(abs)
-      calls.push({ abs, range, text, expectedVersion, versionAtWrite })
+      calls.push({ abs, range, text, expectedVersion, expectedIncarnation, versionAtWrite })
+      if (expectedIncarnation !== INCARNATION) {
+        throw new BridgeError(ERR.DOCUMENT_VERSION_CONFLICT,
+          `document incarnation is ${INCARNATION}, but the request was prepared for ${expectedIncarnation}`,
+          { method: 'vscode.applyEdit', file: abs, reason: 'incarnation-mismatch',
+            expected: expectedIncarnation, actual: INCARNATION })
+      }
       if (versionAtWrite !== expectedVersion) {
         throw new BridgeError(ERR.DOCUMENT_VERSION_CONFLICT,
           `document version is ${versionAtWrite}, but the request was prepared for version ${expectedVersion}`,
@@ -140,6 +149,14 @@ function makeBufferHost(roots) {
 const ID = 'a'.repeat(32)
 const EPOCH = 'b'.repeat(32)
 
+/**
+ * 假文档的实例身份（T34 引入；★ T35 起 `expectedIncarnation` **无条件必填**）。
+ *
+ * 脚手架默认带上它，与 `expectedVersion` 同理：本文件的故事是"人工编辑改了缓冲区"，
+ * 缺锚点会在**锚点形状门**就短路，那个故事根本讲不到。
+ */
+const INCARNATION = 'inc-attrib'
+
 function env() {
   const base = mkdtempSync(join(tmpdir(), 'dsh-t30-attrib-'))
   const root = join(base, 'ws')
@@ -154,10 +171,17 @@ function env() {
   return {
     root, host, caps, link,
     file: (n) => join(root, n),
-    /** 一次写入；`extra` 里给 `expectedVersion`（缺了会被 -32602 拒）。 */
+    /**
+     * 一次写入；`extra` 里给 `expectedVersion`（缺了会被 -32602 拒）。
+     * ★ T35：`expectedIncarnation` 同样必填，默认给 `INCARNATION`；要造漏字段就显式传
+     * `{ expectedIncarnation: undefined }`。
+     */
     edit(file, range, text, extra = {}) {
       return caps.dispatch('vscode.applyEdit',
-        { file, range, text, grant: { id: ID, epoch: EPOCH }, ...extra }, { link })
+        {
+          file, range, text, expectedIncarnation: INCARNATION,
+          grant: { id: ID, epoch: EPOCH }, ...extra,
+        }, { link })
     },
     /** 读文档状态（不需要 grant：纯读）。 */
     state(file, extra = {}) {
@@ -240,13 +264,15 @@ test('T32 ★ 锚点下到写宿主：宿主在提交那一刻自己再判一次
     assert.equal(e.host.calls.length, 1)
     assert.equal(e.host.calls[0].expectedVersion, 0, '锚点必须原样到达写宿主')
     assert.equal(e.host.calls[0].versionAtWrite, 0, '事务内读到的真实版本')
+    // ★ T35：两条锚点**一起**下到写宿主（化身不再是"想给才给"的可选字段）。
+    assert.equal(e.host.calls[0].expectedIncarnation, INCARNATION, '化身锚点也必须原样到达')
     assert.deepEqual(Object.keys(e.host.calls[0]).sort(),
-      ['abs', 'expectedVersion', 'range', 'text', 'versionAtWrite'])
+      ['abs', 'expectedIncarnation', 'expectedVersion', 'range', 'text', 'versionAtWrite'])
 
     // T4 报告里"能力清单没有读文本"的缺口现在补上了：状态里既有版本，也有（可选的）全文。
     const meta = await e.state(f)
     assert.deepEqual(Object.keys(meta).sort(),
-      ['eol', 'file', 'isDirty', 'lineCount', 'textLength', 'version'])
+      ['eol', 'file', 'incarnation', 'isDirty', 'lineCount', 'textLength', 'version'])
     assert.equal(meta.version, 1)
     assert.equal(meta.file, f, '出口是规范化绝对路径')
 
