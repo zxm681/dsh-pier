@@ -106,7 +106,8 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | `vscode.getSelection` | — | `{text, file, start:{line,column}, end, isEmpty}` |
 | `vscode.getDiagnostics` | `{path?, severity?, limit?}` | `{total, files:[{file, diagnostics:[…]}], truncated}` |
 | `vscode.listOpenEditors` | `{limit?}` | `{editors:[{file, isActive, isDirty, languageId?}], total, truncated}` |
-| `vscode.applyEdit` ⚠️写入 | `{file, range:{start,end}, text, grant:{id,epoch}}` | `{applied, file, saved:false, textLength}` —— 必须持 grant，见「写入路径的边界」 |
+| `vscode.applyEdit` ⚠️写入 | `{file, range:{start,end}, text, expectedVersion, expectedIncarnation, expectedRangeText?, grant:{id,epoch}}` —— `expectedVersion` 与 `expectedIncarnation` **必填**（缺一即 `-32602`，一个字节都不发；与当前文档/实例不符即 `-32012`），且必须持 grant，见「写入路径的边界」 | `{applied, file, saved:false, textLength}` |
+| `vscode.getDocumentState` | `{file, includeText?}` | `{file, version, incarnation?, isDirty, eol, lineCount, textLength, textUnavailable?, text?}` —— 写入锚点的读侧（版本与实例身份同一次读）；`includeText:true` 且超 8 MiB → `textUnavailable:true`（整份不给，不截断冒充全文） |
 
 **坐标约定**：协议对外一律 **1-based**（line/column），只在调用 VS Code API 的边界转 0-based。
 **路径约定**：对外一律 `C:\…` 大写盘符（出口归一化，见经验手册 §4.7）。
@@ -125,6 +126,7 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | -32008 | `protocol-incompatible` | 协议版本不兼容（兼容门） |
 | -32009 | `invalid-response` | 对端返回的响应形状不符合契约 |
 | -32010 | `edit-not-bound` | 写入没有有效的 grant 绑定（五种 `reason` 见下） |
+| -32012 | `document-version-conflict` | 文档版本或实例（`incarnation`）与调用方锚点不符；重读锚点后重发。`data` 只回长度/版本，不回文本 |
 
 `-32005` 与 `-32601` 的区别：前者是"能力协商没通过，你该降级"，
 后者是"方法名根本不存在，是编程错误"。

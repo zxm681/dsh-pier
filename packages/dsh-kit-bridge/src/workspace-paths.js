@@ -217,8 +217,15 @@ export function resolveWorkspaceFile(file, roots, opts = {}) {
   }
 
   // ── ④ 别名校验：realpath 只用来**对照**，不用来定义允许范围 ──
-  //    链上无链接时 realpath 至多改大小写 / 展开 8.3 短名；
-  //    段名对不上 = 别名（短名、UNC 别名、大小写以外的差异）→ 拒。
+  //    链上无链接时 realpath 只做归一化，**不改**段名语义。下面几条是实测（T33 / T31
+  //    复审）钉死的、与直觉相反的事实，别照旧版注释想：
+  //      ① 8.3 短名：普通 `fs.realpathSync` 在本机**并不展开**（`PROGRA~1` 原样返回，
+  //         只有 `realpathSync.native` 才还原成长名）。短名写法仍然写不进来，但拦住它的
+  //         不是本段：长根 + 短路径在 ① 的字面根边界就判 `outside-workspace`，根内混写
+  //         则由下面的逐段比对判成段名差异；
+  //      ② 符号链接 / junction：③ 的逐段 lstat 已经抛 `reason:'symlink'`，到不了这里；
+  //      ③ 卷别名 `\\localhost\C$\…` 不是同一条根链，判 `outside-workspace`。
+  //    所以本段只回答一件事：realpath 之后的段名与调用方写法对不上 = 别名 → 拒。
   const real = stripLongPrefix(realpathOf(fs, abs, method, abs))
   const realChain = splitAtVolume(real)
   const absChain = splitAtVolume(abs)
