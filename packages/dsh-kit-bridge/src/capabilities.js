@@ -11,9 +11,12 @@
  * 在调用 VSCode API 的边界上转成内部的 0-based。
  */
 
+import { createHash, randomBytes } from 'node:crypto'
+
 import { BridgeError, ERR } from '../../dsh-vscode-kit/src/protocol.js'
 import {
   GRANT_REASONS, editNotBoundError, extensionWriteGate, isWriteMethod,
+  grantAllowsDirtySave,
 } from '../../dsh-vscode-kit/src/grant.js'
 import {
   resolveWorkspaceFile, revalidateWriteTarget, assertTargetUnchanged,
@@ -30,6 +33,23 @@ export const CAPABILITIES = [
   // 写入锚点的读侧（T30）：`applyEdit` 的 `expectedVersion` 只能从这里拿。
   // 只读，不改宿主状态，因此**不要求** grant（写入才要求，契约 §6.1）。
   'vscode.getDocumentState',
+  // Tier 3 落盘（T39）：**写**能力，必须走绑定门（`WRITE_METHODS`）。
+  // 与 `applyEdit` 的区别只有一步 —— 它真的落盘（Buffer 之外的字节被改）。
+  //
+  // ⚠️ 磁盘锚点的读侧（`host.readDiskStat`）**不是**一条协议能力（§6.2.3 规定的是
+  //    "宿主新增 readDiskStat"，§6.2.8 待决 7 的"独立方法"也只说不许塞进
+  //    `getDocumentState`）。理由：它是 `vscode.save` 自己的前置门，调用方手里的
+  //    `expectedDisk` 来自它**自己观察到的那次 stat**（同机文件，读它不需要本通道）；
+  //    把它开成能力等于多一条"任何人都能读任意路径元数据"的面，收益为零。
+  'vscode.save',
+  // Tier 4 删除（T40；T44 把语义改成"移入隔离区，永不删"）。写能力，必须走绑定门，
+  // 白名单档位是最高档 `delete`（`whitelist.js` 的 `METHOD_TIERS` 早已登记）。
+  //
+  // ★ 契约 §6.2.5：**白名单是必要条件，不是充分条件**。这个能力必须**同时**有
+  //   「白名单 + 人工确认 + 内容快照」三者，缺一条提示注入（T-B）就能成功。
+  // ★ T44：动作从"删"改成"rename 进 `<root>/.dsh-quarantine/`，永不删"。名字与门槛
+  //   全部保留（外部合同不变：grant/确认/整份备份都要），但代码里**没有**删除调用。
+  'vscode.deleteFile',
 ]
 
 /**
@@ -41,6 +61,305 @@ export const CAPABILITIES = [
  * 危险得多的失败形态：调用方会拿它去算坐标、比对范围，然后在错的地方写字。
  */
 export const MAX_TEXT_BYTES = 8 * 1024 * 1024
+
+/**
+ * 删除前内容快照允许读进来的**总**字节上限（UTF-8 / 任意字节）。
+ *
+ * 超限**整份放弃**（`-32603 reason:'snapshot-unavailable'`），绝不"读了前半截也删" ——
+ * 半份快照比没有快照更坏：它会让人以为"我有恢复材料"，而那份材料缺了尾部。
+ * 8 MiB 与 `MAX_TEXT_BYTES` 同源（同一个理由：返回要过 ndjson + loopback + 消费者）。
+ *
+ * ★ 注意区分：这是**读**的上限。能不能**删**取决于能不能把整份字节交出去，
+ * 见 `DELETE_BACKUP_MAX_BYTES`（T42 / 评审 I1）。
+ */
+export const DELETE_SNAPSHOT_MAX_BYTES = MAX_TEXT_BYTES
+
+/**
+ * 能**完整交付**给调用方的备份字节上限 = 允许删除的上限（T42 / 评审 I1）。
+ *
+ * ## 为什么删除的上限现在由"交付能力"决定，而不是由"读取能力"决定
+ *
+ * 契约 §6.2.4 ③ 要的是**恢复材料**。旧实现里 >1 MiB 的文本只回 `sha256` + 长度，
+ * 非 UTF-8 只回 `sha256` + 长度 —— 然后**照样删**。那等于没有恢复材料：`sha256` 证明
+ * "是这份字节"，但**恢复不出**这份字节。评审 I1 已明确这条路不行。
+ *
+ * 所以现在的判据是：**在人工确认之前**先问"这份字节我能不能整份交出去？"
+ *   - 能（UTF-8 无损 → 回 `text`；非 UTF-8 → 回 `base64`）→ 带上，然后才允许确认与删除；
+ *   - 不能（超过本上限）→ **拒绝删除**并说明（`-32603 reason:'backup-undeliverable'`）。
+ * 没有第三条路："读过就算交过"不成立。
+ *
+ * ## 为什么是 1 MiB / 为什么非 UTF-8 走 base64
+ *
+ * - 1 MiB 的**原始字节**，UTF-8 文本形态最多 ~1 MiB 正文，二进制走 base64 约 1.37 MiB
+ *   字符串。加上 JSON/ndjson 分帧与响应外壳，单次响应稳定落在 ~1.5 MiB 以内 ——
+ *   这是"能真的过线路、也能被人/模型完整收下"的量级。
+ * - 再往上（哪怕 8 MiB 快照上限还能读）就不是"交付"而是"塞爆消费者"：一个 8 MiB
+ *   二进制 → 10.7 MiB base64 → 还得进模型上下文。**能读**不等于**能交付**，而删除
+ *   只允许发生在"能交付"之后。
+ * - base64 是唯一能无损过 JSON 字符串的形态（`toString('base64')` 往返逐字节相等，
+ *   测试里直接 `Buffer.from(base64,'base64')` 重算 sha256 自证）。
+ */
+export const DELETE_BACKUP_MAX_BYTES = 1024 * 1024
+
+/**
+ * 人工确认的默认超时（毫秒）。契约 §7 #5 的"独立长超时"：
+ * 确认走的是**人**，不能沿用请求级 30s 超时（人会离开工位，30s 太短会误伤正常操作）。
+ * 可被 `createCapabilities({deleteConfirmTimeoutMs})` / 扩展配置覆盖。
+ */
+export const DEFAULT_DELETE_CONFIRM_TIMEOUT_MS = 120_000
+
+/** `Promise.race` 里用来区分"超时"与"人的回答"的哨兵（不是任何合法回答）。 */
+const CONFIRM_TIMED_OUT = Symbol('delete-confirm-timeout')
+
+/** 人明确点了"删除"这个按钮 —— 也是哨兵，避免把宿主的任意真值当同意。 */
+const CONFIRM_ACCEPTED = Symbol('delete-confirm-accepted')
+
+/**
+ * 整份字节的身份（`sha256` + 长度）。**只用于比对**，不是恢复材料。
+ *
+ * 评审 I1 的教训写在这里以防又被当成材料用：`sha256` 只能回答"是不是同一份字节"，
+ * 它**恢复不出**任何字节。凡是要进 `result.snapshot` 的地方都必须用
+ * `buildSnapshot`（带完整载荷），不能用本函数的返回值冒充。
+ *
+ * @param {Buffer} buffer
+ * @returns {{sha256:string, byteLength:number}}
+ */
+function digestOf(buffer) {
+  return {
+    sha256: createHash('sha256').update(buffer).digest('hex'),
+    byteLength: buffer.length,
+  }
+}
+
+/**
+ * 把整份字节做成"删掉的到底是什么"的材料（契约 §6.2.4 ③）——
+ * **必须是可恢复的完整字节，否则不许删**（T42 / 评审 I1）。
+ *
+ * 交付形态只有两种，都是逐字节可逆的：
+ *   - `encoding:'utf8'`：`text` = 整份正文（UTF-8 往返无损时才走这条）；
+ *   - `encoding:'binary'`：`base64` = 整份字节的 base64。
+ * 拿 `toString('utf8')` 的结果冒充二进制"正文"会让恢复出来的是替换字符 —— 比不给更坏，
+ * 所以非 UTF-8 一律走 base64，不做替换字符工程。
+ *
+ * 超过 `DELETE_BACKUP_MAX_BYTES` → **直接拒绝删除**（`-32603 reason:'backup-undeliverable'`）。
+ * 从前这里回 `textOmitted:'too-large'` 然后照样删，那正是评审 I1 判定的"没有恢复材料"。
+ *
+ * @param {Buffer} buffer 整份字节
+ * @param {{method:string, file:string}} ctx 只用于错误体（调用方已经知道自己在删哪个文件）
+ * @returns {{sha256:string, byteLength:number, encoding:'utf8'|'binary',
+ *   textLength?:number, text?:string, base64?:string}}
+ */
+function buildSnapshot(buffer, ctx) {
+  const { sha256, byteLength } = digestOf(buffer)
+  if (byteLength > DELETE_BACKUP_MAX_BYTES) {
+    // 交付不了整份字节 ⇒ 没有恢复材料 ⇒ 不许删。**不**退化成"只给 sha256"。
+    throw new BridgeError(ERR.INTERNAL,
+      `${ctx.file} is ${byteLength} bytes, over the ${DELETE_BACKUP_MAX_BYTES}-byte `
+      + 'recoverable-backup limit; nothing was deleted — a sha256 is not recovery material, '
+      + 'so this delete would have no way back',
+      {
+        method: ctx.method,
+        file: ctx.file,
+        reason: 'backup-undeliverable',
+        why: 'too-large',
+        byteLength,
+        maxBytes: DELETE_BACKUP_MAX_BYTES,
+        backup: { delivered: false, reason: 'too-large' },
+        mayHaveApplied: false,
+      })
+  }
+  const text = buffer.toString('utf8')
+  const lossless = Buffer.from(text, 'utf8').equals(buffer)
+  if (!lossless) {
+    // 二进制：整份 base64（逐字节可逆）。绝不给"看起来像正文"的替换字符版本。
+    return { sha256, byteLength, encoding: 'binary', base64: buffer.toString('base64') }
+  }
+  return { sha256, byteLength, encoding: 'utf8', textLength: text.length, text }
+}
+
+/**
+ * 隔离目录名：工作区根下的 `.dsh-quarantine/`（T44）。
+ *
+ * ## 为什么不再用"同目录 + 随机名"
+ *
+ * T42 的隔离名是 `<同目录>/<原名>.dsh-deleting-<16 位十六进制>`，理由是"同目录必然同卷"。
+ * T44 把这条能力的语义从"删"改成"**移入隔离区，永不删**"之后，那个理由的重心变了：
+ * 跨卷 rename 失败**不再损失任何字节**（原件原地不动），于是"必须同卷"不再是数据安全的
+ * 必要条件；而"隔离体集中在一个可列举、可解释、不会被目录监听/构建工具/glob 扫到的地方"
+ * 变成了新要求 —— 挨着源文件的怪名字会被 watcher、`git status`、`glob('**\/*')` 捡进去。
+ *
+ * ## 跨卷怎么办
+ *
+ * 工作区根与源文件同卷是绝大多数情形（单根工作区，`resolveWorkspaceFile` 已把越界路径
+ * 拒掉）。真跨卷（junction / subst / 网络盘）时 rename 抛 `EXDEV`：**直接失败并报
+ * `-32603 reason:'quarantine-failed'`，原件原地不动** —— 绝不许退化成
+ * `copyFile + unlink`，那只是"删"的另一种写法，正是 T44 要消灭的东西。
+ */
+export const QUARANTINE_DIR_NAME = '.dsh-quarantine'
+
+/** UTC 时间戳 `yyyyMMdd-HHmmss`：文件名排序即时间顺序，且与本地时区/夏令时无关。 */
+function utcStampOf(now = new Date()) {
+  const two = (n) => String(n).padStart(2, '0')
+  return `${now.getUTCFullYear()}${two(now.getUTCMonth() + 1)}${two(now.getUTCDate())}`
+    + `-${two(now.getUTCHours())}${two(now.getUTCMinutes())}${two(now.getUTCSeconds())}`
+}
+
+/**
+ * 按 `dir` 自己的分隔符拼子路径（不引 `node:path`：`C:\a` / `C:/a` / 末尾带分隔符都认）。
+ * 隔离目录必须与工作区根同卷，所以分隔符必须跟根走，不能混。
+ */
+function joinUnder(dir, name) {
+  const trimmed = String(dir).replace(/[\\/]+$/, '')
+  const cut = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+  const sep = cut >= 0 && trimmed[cut] === '\\' ? '\\' : '/'
+  return `${trimmed}${sep}${name}`
+}
+
+/** `<root>/.dsh-quarantine` */
+function quarantineDirFor(rootAbs) {
+  return joinUnder(rootAbs, QUARANTINE_DIR_NAME)
+}
+
+/**
+ * 挑一个**此刻不存在**的隔离路径：
+ * `<root>/.dsh-quarantine/<UTC yyyyMMdd-HHmmss>-<原名>`。
+ *
+ * 同名冲突（同一秒内第二次归档同名文件、或之前归档过同名的）→ 追加 `-<8 位十六进制>`，
+ * 仍然"先探再用"，探满 8 次都不空就报 `quarantine-name-collision`（宁可失败，不覆盖）。
+ *
+ * ⚠️ 名字**不承担**任何身份绑定职责（评审 B1-a 明确否掉了"随机名/复算 hash = 绑定"这条路）。
+ * 绑定由 `readFileIdentity` 的 `(dev, ino)` 承担；这里只解决"不许覆盖已存在的文件"。
+ * rename 本身仍然 `overwrite:false` —— 探测与 rename 之间的竞争由宿主挡住。
+ */
+async function pickQuarantinePath(host, dir, realAbs, ctx) {
+  const stamp = utcStampOf()
+  const base = baseNameOf(realAbs)
+  const plain = joinUnder(dir, `${stamp}-${base}`)
+  if (!host.fileExists(plain)) return { path: plain, collided: false }
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const salted = joinUnder(dir, `${stamp}-${base}-${randomBytes(4).toString('hex')}`)
+    if (!host.fileExists(salted)) return { path: salted, collided: true }
+  }
+  throw new BridgeError(ERR.INTERNAL,
+    `could not find a free name for ${base} in the quarantine directory; nothing was moved`,
+    {
+      method: ctx.method,
+      file: ctx.file,
+      reason: 'quarantine-name-collision',
+      quarantineDir: canonicalPath(dir),
+      mayHaveApplied: false,
+      retryable: true,
+    })
+}
+
+/**
+ * 文件**对象身份** = `(dev, ino)`（宿主 `readFileIdentity` 注入）。
+ *
+ * ## 为什么是身份，而不是"再算一次 hash"（评审 B1-a）
+ *
+ * 评审否掉的正是"再算一次 hash 就算绑定"：hash 只能回答"这两个**名字**下的字节相同吗"，
+ * 而 B1 的两条实证（open-writer 写句柄、provider 消费窗口）换掉的是**对象**，
+ * 复算 hash 根本看不见。`(dev, ino)` 回答的是"这是不是**同一个 inode**"：
+ *   - `rename` 不改 `dev/ino`（只改目录项），所以"我移走的那个对象"必须与"预检时那个对象"
+ *     是同一对 `(dev, ino)`；
+ *   - 把原件挪走、拿**同字节**的另一份顶名，`(dev, ino)` 必然变 —— 那是另一个对象，
+ *     即便字节完全相同也必须拒（人批准的是那个 inode，不是那段字节）。
+ *
+ * 取不到（文件已消失）返回 `null`：调用方据此判断"对象不在了"，**不许**把 null 当"一致"。
+ */
+async function readFileIdentityOf(host, abs) {
+  const raw = await host.readFileIdentity(abs)
+  if (raw === null || raw === undefined) return null
+  if (typeof raw !== 'object' || raw.dev === undefined || raw.ino === undefined) {
+    throw new BridgeError(ERR.INTERNAL,
+      'host.readFileIdentity must return {dev, ino} or null', { reason: 'host-contract' })
+  }
+  return { dev: String(raw.dev), ino: String(raw.ino) }
+}
+
+function sameFileObject(before, after) {
+  return before !== null && after !== null
+    && before.dev === after.dev && before.ino === after.ino
+}
+
+/**
+ * 移动完成后在**隔离体当前位置**重新测量 sha256 / 字节数。
+ *
+ * 诚实性要求（T44）：返回值里的 `quarantinedSha256` 必须来自这里，绝不复用确认时那份 ——
+ * 归档之后隔离体仍可能被就地改写（open-writer 的 fd 写、provider 消费窗口），
+ * 复用旧值就是"报成功却隐瞒差异"。
+ *
+ * 读不动（超过 `DELETE_BACKUP_MAX_BYTES` / 权限 / 已消失）→ `-32603
+ * reason:'quarantine-unreadable'`，错误体带隔离体的**真实路径**：字节没被删，
+ * 只是我们测不了它。
+ */
+async function measureQuarantined(read, abs, { method, file, quarantine }) {
+  // `read` 是调用方的整份字节读（`readSnapshotBytes`），而不是这里的 `host.readFileBytes`
+  // 直连：两份实现分头写必然漂移（同一个 `backup-undeliverable` 判据会有两个版本）。
+  try {
+    return digestOf(await read(abs))
+  } catch (err) {
+    throw new BridgeError(ERR.INTERNAL,
+      `the file was moved to ${quarantine.path} but could not be re-measured `
+      + `(${err?.message ?? err}); nothing was deleted — the bytes are still there`,
+      {
+        method,
+        file,
+        reason: 'quarantine-unreadable',
+        quarantine,
+        measureReason: err?.data?.reason ?? null,
+        mayHaveApplied: false,
+        retryable: true,
+      })
+  }
+}
+
+/** 隔离文件此刻在哪 —— 错误体/返回体共用的一种说法，避免各处自行编。 */
+function quarantineInfo(quarantineAbs, originalAbs) {
+  return {
+    path: canonicalPath(quarantineAbs),
+    original: canonicalPath(originalAbs),
+    restored: false,
+    retained: true,
+  }
+}
+
+/**
+ * 验证没过时把隔离文件放回原名 —— **绝不再删**（T42 / 评审 B1 第 3 条）。
+ *
+ * `host.fileExists` 先查原名：POSIX 的 `rename` 会**静默覆盖**已存在的目标，
+ * 拿"拒绝删错文件"的机会去顶掉另一份文件是反向的数据丢失。Windows 上 rename 到
+ * 已存在目标会失败，但依赖平台差异不是一回事 —— 判据写在代码里。
+ *
+ * 回不去（原名被占 / rename 又失败）→ **保留隔离文件**并把它的真实路径交出去：
+ * 字节还在，只是名字难看。这比"为了把名字弄回原样而删掉它"安全得多。
+ *
+ * @returns {Promise<{path:string, original:string, restored:boolean, retained:boolean,
+ *   reason:string|null}>}
+ */
+async function restoreQuarantined(host, quarantineAbs, originalAbs) {
+  if (host.fileExists(originalAbs)) {
+    return { ...quarantineInfo(quarantineAbs, originalAbs), reason: 'original-occupied' }
+  }
+  try {
+    await host.quarantineRename(quarantineAbs, originalAbs)
+    return {
+      path: canonicalPath(originalAbs),
+      original: canonicalPath(originalAbs),
+      restored: true,
+      retained: false,
+      reason: null,
+    }
+  } catch {
+    return { ...quarantineInfo(quarantineAbs, originalAbs), reason: 'rename-back-failed' }
+  }
+}
+
+/** `C:\a\b.txt` → `b.txt`（只用于给人看的确认文案，不参与任何判定）。 */
+function baseNameOf(p) {
+  const cut = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
+  return cut === -1 ? p : p.slice(cut + 1)
+}
 
 /** 二进制文件的扩展名黑名单：这些用普通文本编辑器打开会报 "File seems to be binary"（issue #33 教训）。 */
 const BINARY_EXT = new Set([
@@ -376,6 +695,124 @@ function assertIncarnationMatches(actual, expected, file, method) {
 }
 
 /**
+ * 读并校验**必填**的 `params.expectedDisk`（T39 / 契约 §6.2.3）。
+ *
+ * 形状固定为 `{mtime, size}`，两个字段都是**非负整数**：
+ *  - `mtime` = 毫秒时间戳（`stat.mtimeMs` 取整）。用整数而不是 Date/ISO 串，是因为它要
+ *    走 JSON、还要**逐字等值比较**；浮点毫秒在序列化/解析后可能差一个 ULP，那种"永远
+ *    差一点点"的锚点等于永远冲突（而且看起来像磁盘一直在变）。
+ *  - `size` = 字节数。
+ *
+ * 缺字段 / 类型不对 / 负数 → `-32602`（调用方自己的参数错误，**宿主零调用**），
+ * 不许"当成没给"静默降级 —— 那等于让一个拼错的字段名把磁盘锚点整道关掉。
+ *
+ * @returns {{mtime: number, size: number}}
+ * @throws {BridgeError} -32602
+ */
+function readExpectedDisk(params, method) {
+  const v = params?.expectedDisk
+  if (v === undefined) {
+    throw new BridgeError(ERR.INVALID_PARAMS,
+      'vscode.save requires the disk anchor: params.expectedDisk = {mtime, size} '
+      + '(read it from vscode.readDiskStat and pass it back unchanged)',
+      { method, reason: 'expected-disk-missing', got: { type: 'undefined' } })
+  }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) {
+    throw new BridgeError(ERR.INVALID_PARAMS,
+      'params.expectedDisk must be an object {mtime, size}',
+      { method, reason: 'expected-disk-not-an-object', got: { type: typeof v } })
+  }
+  for (const key of ['mtime', 'size']) {
+    const n = v[key]
+    if (typeof n !== 'number') {
+      throw new BridgeError(ERR.INVALID_PARAMS,
+        `params.expectedDisk.${key} must be a number`,
+        { method, reason: `expected-disk-${key}-not-a-number`, got: { type: typeof n } })
+    }
+    if (!Number.isInteger(n) || n < 0) {
+      throw new BridgeError(ERR.INVALID_PARAMS,
+        `params.expectedDisk.${key} must be an integer >= 0`,
+        { method, reason: `expected-disk-${key}-not-a-non-negative-integer`, got: { type: typeof n } })
+    }
+  }
+  return { mtime: v.mtime, size: v.size }
+}
+
+/**
+ * 读**磁盘**上的 `{mtime, size}`（T39 / 契约 §6.2.3 的 `readDiskStat`）。
+ *
+ * 这是 `vscode.save` 的磁盘锚点读侧：返回 `null` 表示磁盘上**没有这个文件**
+ * （被删了 / 还没落过盘 / 宿主读不到）—— 调用方必须把它当成"锚点不可能匹配"，
+ * 而不是"跳过判定"。
+ *
+ * @param {object} host
+ * @param {string} abs
+ * @param {string} method
+ * @returns {Promise<{mtime: number, size: number}|null>}
+ * @throws {BridgeError} -32603 宿主没实现 / 返回形状不对
+ */
+async function readDiskStatOf(host, abs, method) {
+  if (typeof host.readDiskStat !== 'function') {
+    throw new BridgeError(ERR.INTERNAL,
+      'host does not implement readDiskStat; refusing to save without a disk anchor',
+      { method, hostField: 'readDiskStat' })
+  }
+  let stat
+  try {
+    stat = await host.readDiskStat(abs)
+  } catch (err) {
+    throw new BridgeError(ERR.INTERNAL,
+      `cannot stat ${abs}: ${err?.message ?? err}`,
+      { method, path: abs, reason: 'disk-stat-unavailable' })
+  }
+  if (stat === null || stat === undefined) return null
+  if (!stat || typeof stat !== 'object' || Array.isArray(stat)
+    || !Number.isInteger(stat.mtime) || stat.mtime < 0
+    || !Number.isInteger(stat.size) || stat.size < 0) {
+    throw new BridgeError(ERR.INTERNAL,
+      `host returned an invalid disk stat for ${abs}`,
+      { method, path: abs, fields: ['mtime', 'size'], reason: 'invalid-disk-stat' })
+  }
+  return { mtime: stat.mtime, size: stat.size }
+}
+
+/**
+ * 磁盘锚点判定（契约 §6.2.3）—— **新码 `-32013`，永不复用 `-32012`**。
+ *
+ * 为什么必须是新码：`-32012` 的处置是"重读锚点、重发"；磁盘冲突**永远不能自动重试**
+ * （本端不知道磁盘上那份内容是谁写的，重发就是拿没见过的内容换掉别人的改动）。
+ * 复用同一个码 = 让两条处置相反的失败共用一套重试逻辑（§6.2.7 已写明）。
+ *
+ * `actual: null` = 磁盘上已经没这个文件（被删/被移走）—— 同样冲突，处置相同。
+ *
+ * @param {object} [opts] 措辞覆盖（**判定只有一处实现**，措辞按动作换）。`vscode.deleteFile`
+ *   传 `{action:'delete'}` —— 删除没有"覆盖"这个出路，**绝不能**让调用方读到"要不要覆盖"，
+ *   那会把人引向一个不存在的选项。
+ */
+function assertDiskMatches(actual, expected, file, method, opts = {}) {
+  if (actual && actual.mtime === expected.mtime && actual.size === expected.size) return
+  const action = opts.action ?? 'save'
+  // 删除侧的诚实结论：**什么都没删**（本比对发生在 `workspace.fs.delete` 之前）。
+  const outcome = opts.outcome ?? (action === 'delete' ? 'nothing was deleted' : 'nothing was saved')
+  const advice = opts.advice ?? (action === 'delete'
+    ? 're-read the file and decide deliberately whether it is still the file you mean to delete'
+    : 're-read the file and decide deliberately whether to overwrite it')
+  throw new BridgeError(ERR.DISK_STATE_CONFLICT,
+    `the file on disk is not the one this ${action} was prepared against `
+    + `(mtime/size ${actual ? `${actual.mtime}/${actual.size}` : 'absent'}, `
+    + `expected ${expected.mtime}/${expected.size}); ${outcome} — ${advice}`,
+    {
+      method,
+      file,
+      // 只给锚点本身（mtime/size 是元数据，不是内容），对端要拿它判断"是不是我上次看到的那份"。
+      expected: { ...expected },
+      actual: actual ? { ...actual } : null,
+      ...(opts.extra ?? {}),
+    })
+}
+
+
+/**
  * 读**文档**状态（版本 / 脏标记 / 换行 / 行数 / 长度 / 可选全文）。
  *
  * 形状校验与 `readDocumentShape` 同一套理由（评审 R2-3）：宿主回的字段缺一个就说明
@@ -418,6 +855,12 @@ async function readDocumentState(host, abs, wanted, method) {
     if (state.incarnation !== undefined
       && (typeof state.incarnation !== 'string' || state.incarnation === '')) {
       bad.push('incarnation')
+    }
+    // ★ T39：`untitled` 同样**可选**，但"给了就必须是布尔" —— 它决定 `vscode.save`
+    //   要不要在动手前报 `untitled-document`；让 `undefined`/`'false'` 混进来，
+    //   这个判据就会时灵时不灵。
+    if (state.untitled !== undefined && typeof state.untitled !== 'boolean') {
+      bad.push('untitled')
     }
   }
   if (bad.length > 0) {
@@ -518,6 +961,16 @@ export function createCapabilities(host, opts = {}) {
   const grants = opts.grants ?? null
   // 信任来源优先取调用方注入（connector 侧无 host），否则用宿主自己那份。
   const isTrusted = opts.isTrusted ?? (typeof host.isTrusted === 'function' ? host.isTrusted : null)
+
+  /**
+   * 人工确认的等待上限（§7 #5「独立长超时」）。配错值不 brick 扩展，回落默认值 ——
+   * 但**只回落成更保守的那个**（默认 120s 比任何一个"短到会误伤真人"的值都长，
+   * 也比任何一个"长到许可实质永久"的值都短）。
+   */
+  const deleteConfirmTimeoutMs = Number.isInteger(opts.deleteConfirmTimeoutMs)
+    && opts.deleteConfirmTimeoutMs > 0
+    ? opts.deleteConfirmTimeoutMs
+    : DEFAULT_DELETE_CONFIRM_TIMEOUT_MS
 
   /**
    * 同文件写入串行化（T32 / 评审 T31-B1 建议 ③）：`规范化路径 → promise 链尾`。
@@ -977,6 +1430,667 @@ export function createCapabilities(host, opts = {}) {
     }
   }
 
+  /**
+   * vscode.save —— **Tier 3 落盘**（T39；契约 §6.2.1 的 Tier 3 行）。
+   * params:  { file, expectedVersion, expectedIncarnation, expectedDisk: {mtime, size} }
+   * result:  { saved: true, file, disk: {mtime, size}, dirtyBefore: boolean }
+   *
+   * 判序（就是契约 §6.2.1 列的那一串，**顺序即语义**）：
+   *   ① 信任（-32006）→ ② 参数形状（`file` / `expectedVersion` / `expectedIncarnation` /
+   *   `expectedDisk`，任何一项坏都是 `-32602`，宿主**零调用**）→ ③ 路径守卫（工作区/真路径/
+   *   非链接）→ ④ 文档状态：版本不等或化身不等 → `-32012`；`untitled` → `-32602
+   *   reason:'untitled-document'` → ⑤ **意图门**：缓冲区脏且 grant 没有 `allowDirtySave`
+   *   → `-32012 reason:'buffer-dirty'` → ⑥ **磁盘锚点**：真实 stat 与 `expectedDisk`
+   *   不符 → `-32013` → ⑦ 绑定门**执行前**再判一次（`-32010`）→ ⑧ 写前重验路径 →
+   *   ⑨ `host.saveDocument`（**无 CAS**）→ ⑩ 写后复核路径/文档身份 → ⑪ 重新 stat 得到
+   *   `disk` **真值**（不是回显参数）。
+   *
+   * 为什么磁盘锚点是**独立的新码**（`-32013`，契约 §6.2.3 / §6.2.7）：`-32012` 的处置是
+   * "重读锚点、重发请求"；磁盘冲突**永远不能自动重试** —— 本端不知道磁盘上那份字节是谁
+   * 写的，重发等于拿没见过的内容覆盖别人的改动。两条处置相反，就不能共用一个码。
+   *
+   * ★ **诚实标注（§6.2.6 的硬上限，别把这道门当成它做不到的东西）**：
+   *   这是**善意防护**。`TextDocument.save()` 没有 CAS 参数（`vscode.d.ts:160`），
+   *   我们能做的只是"在保存之前尽早发现状态不对"。**检查之后被保存参与者改写**
+   *   （`editor.formatOnSave` / `files.trimTrailingWhitespace` / `onWillSaveTextDocument`
+   *   监听者在保存瞬间插入的编辑）**导致的磁盘字节与本端锚定的缓冲区内容之间的差异，
+   *   不在本门的保证范围内**。同理，磁盘在本端 stat 之后、`save()` 真正落盘之前被外部
+   *   改写，也拦不住（无 CAS ⇒ 没有"写到我才认的那一版上"这个语义）。本门保证的是
+   *   「**保存之前**，我看到的那份缓冲区与那份磁盘字节都还是我以为的那一份」，以及
+   *   「**保存之后**，磁盘上现在是什么就是什么（真值回传，不粉饰）」。
+   */
+  async function save(params, ctx) {
+    const method = 'vscode.save'
+    assertTrusted(method)
+
+    // ── ② 参数形状（纯同步，零宿主调用）──
+    const file = params?.file
+    if (typeof file !== 'string' || file.trim() === '') {
+      throw new BridgeError(ERR.INVALID_PARAMS, 'params.file must be a non-empty string', { method })
+    }
+    const expectedVersion = readExpectedVersion(params, method)
+    // 双锚点照旧必填（§6.2.2 / §6.2.3）：缺一即 -32602，宿主零调用。
+    const expectedIncarnation = readExpectedIncarnation(params, method)
+    // 磁盘锚点必填（§6.2.3）：形状坏 = 参数错，不是"跳过这道门"。
+    const expectedDisk = readExpectedDisk(params, method)
+
+    // ── ③ 路径守卫（与 applyEdit 同一套：单根、工作区内、真路径、链上无链接）──
+    const { abs, real } = resolveWorkspaceFile(file, host.workspaceRoots(), { method })
+
+    // ── 同文件排队（与 applyEdit 共用同一条链）──
+    // 保存与编辑都必须串行：否则"读版本 → 保存"之间可以插进一次 applyEdit，
+    // 保存下去的就不是本端锚定的那份缓冲区了。键同样是 `serializeKeyFor(real)`。
+    return serializeByPath(serializeKeyFor(real), () => saveUnderLock({
+      method, abs, real, params, ctx, expectedVersion, expectedIncarnation, expectedDisk,
+    }))
+  }
+
+  /** `vscode.save` 的主体：判序 ④–⑪（说明见 `save` 的 JSDoc）。只在该文件的排队链里跑。 */
+  async function saveUnderLock({
+    method, abs, real, params, ctx, expectedVersion, expectedIncarnation, expectedDisk,
+  }) {
+    // ── ④ 文档状态：版本 + 化身（便宜且更早的失败；不是保证）──
+    const state = await readDocumentState(host, real, { includeText: false }, method)
+    // 未落盘文档（untitled）**先报**：它不是"修一下再试"的冲突，而是"根本没有盘可落"，
+    // 拿去和版本冲突比先后只会误导下一步动作。§6.2.1 把 ⑭ 排在最后是按"能走到那一步"
+    // 的默认路径列的，这里提前是因为判据已经拿到了手（`state.untitled`）。
+    if (state.untitled === true) {
+      throw new BridgeError(ERR.INVALID_PARAMS,
+        'the document has never been saved to disk (untitled); this capability only saves '
+        + 'documents that already have a file path inside the workspace',
+        { method, file: canonicalPath(abs), reason: 'untitled-document' })
+    }
+    assertVersionMatches(state.version, expectedVersion, canonicalPath(abs), method)
+    assertIncarnationMatches(state.incarnation, expectedIncarnation, canonicalPath(abs), method)
+
+    // ── ⑤ 意图门（§6.2.2 的结论）──
+    // `isDirty` 是宿主给的**布尔汇总**，分不清"DSH 自己改的"与"人敲的"。所以：
+    // 脏 = 缓冲区里有本端不能证明来源的内容，默认**拒**；只有**授权方**在 grant 上
+    // 显式给了 `allowDirtySave: true` 才放行。★ 这个位**不许**从 `params` 读 ——
+    // 那样等于调用方自己给自己授权，这道门就等于不存在。
+    const dirtyBefore = state.isDirty === true
+    if (dirtyBefore && !grantAllowsDirtySave(grants, params?.grant)) {
+      throw new BridgeError(ERR.DOCUMENT_VERSION_CONFLICT,
+        'the buffer has unsaved changes that this request is not authorized to write to disk; '
+        + 'either save with a grant issued with allowDirtySave:true, or discard/re-read the '
+        + 'buffer first (nothing was saved)',
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'buffer-dirty',
+          // 回显版本只用于"我基于哪一版"的对照；不把文本/差异放进来。
+          expectedVersion,
+          actualVersion: state.version,
+          allowDirtySave: false,
+        })
+    }
+
+    // ── ⑥ 磁盘锚点（§6.2.3）：真实 stat 比 {mtime, size}，不符即 -32013 ──
+    // 放在 `save()` 之前是它能起作用的唯一位置 —— 之后就没有"拒绝"这个选项了。
+    const diskBefore = await readDiskStatOf(host, real, method)
+    assertDiskMatches(diskBefore, expectedDisk, canonicalPath(abs), method)
+
+    if (typeof host.saveDocument !== 'function') {
+      throw new BridgeError(ERR.INTERNAL,
+        'host does not implement saveDocument; this extension build cannot write to disk',
+        { method, hostField: 'saveDocument' })
+    }
+
+    // ── ⑦ 执行前复核（§6.1.1 ②B / ③）：动手那一刻凭证还得是好的 ──
+    // 与 applyEdit 同位置、同理由：进门时好，不代表现在还好（中间有多个 await）。
+    grantGate(method, params, ctx)
+
+    // ── ⑧ 写前重验路径，并把**刚验过的那个字符串**交给宿主 ──
+    const writeTarget = revalidateWriteTarget({ abs, real }, host.workspaceRoots(), { method })
+
+    // ── ⑨ 线性化点：`save()`。它没有 CAS，所以这里**不提供**"只写在锚定的那一版上"，
+    //    只提供"走到这里之前，两边的锚点都还对得上"。──
+    const outcome = await host.saveDocument(writeTarget, { expectedVersion, expectedIncarnation })
+
+    // `save()` 的返回值只可能是布尔（`Thenable<boolean>`）。非布尔 = 适配器坏了 → -32009，
+    // 不许把 `undefined` 当成"大概成功了吧"（§5.1「成功外形的错误结果」同一条禁令）。
+    if (typeof outcome?.saved !== 'boolean') {
+      throw new BridgeError(ERR.INVALID_RESPONSE,
+        'host.saveDocument must resolve {saved: boolean}; got '
+        + `${outcome?.saved === undefined ? 'undefined' : typeof outcome.saved}`,
+        { method, field: 'saved', got: { type: typeof outcome?.saved } })
+    }
+    if (outcome.saved !== true) {
+      // 宿主明确说"没存成"。untitled 单独给形状（§6.2.1 ⑭），其余一律 host-save-failed。
+      if (outcome.reason === 'untitled-document') {
+        throw new BridgeError(ERR.INVALID_PARAMS,
+          'the document has never been saved to disk (untitled); nothing to write to',
+          { method, file: canonicalPath(abs), reason: 'untitled-document' })
+      }
+      throw new BridgeError(ERR.INTERNAL,
+        'the editor refused to save the document; the file on disk may be unchanged '
+        + '(nothing is reported as saved)',
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'host-save-failed',
+          hostReason: outcome.reason ?? null,
+          // `false` 是宿主对"我没写下去"的明确表态（`Thenable<boolean>`），
+          // 所以这里可以负责任地说"没应用"；报不出来（非布尔）那条分支才说"未知"。
+          mayHaveApplied: false,
+        })
+    }
+
+    // ── ⑩ 写后复核（与 applyEdit 同一对判据：路径采样 + 文档身份）──
+    assertTargetUnchanged(writeTarget, { method })
+    assertWrittenDocumentIdentity(outcome, writeTarget, { method })
+
+    // ── ⑪ 重新 stat：`disk` 必须是**保存后的真值**，不是回显 `expectedDisk` ──
+    // 回显等于骗人：`formatOnSave` / 保存参与者改过字节、或保存根本没改变文件时，
+    // 回显会让调用方以为"磁盘现在就是我给的那个锚点"。
+    const disk = await readDiskStatOf(host, real, method)
+    if (!disk) {
+      // 报了保存成功、磁盘上却 stat 不到 —— 失败闭合：不许返回 `{saved:true}` 配一个瞎编的 disk。
+      throw new BridgeError(ERR.INTERNAL,
+        `the editor reported a successful save, but ${canonicalPath(abs)} cannot be stat-ed `
+        + 'afterwards; refusing to report what cannot be observed',
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'disk-stat-unavailable',
+          // save() 已经调过了，结果无法观测 —— 只能说"可能已写"，不能说"没写"。
+          mayHaveApplied: true,
+          retryable: false,
+        })
+    }
+
+    log(`save: ${abs} v${state.version}${dirtyBefore ? ' (dirty, allowDirtySave)' : ''} `
+      + `disk ${expectedDisk.mtime}/${expectedDisk.size} -> ${disk.mtime}/${disk.size}`)
+    return {
+      saved: true,
+      file: canonicalPath(abs),
+      disk,
+      dirtyBefore,
+    }
+  }
+
+  /**
+   * 读**整份**字节（删除备份用）。超限**整份放弃**，绝不截断 —— 半份快照比没有更坏：
+   * 它让人误以为手里有恢复材料，而那份材料缺了尾部。
+   *
+   * ⚠️ 上限用的是 `DELETE_BACKUP_MAX_BYTES`（交付上限），**不是** `DELETE_SNAPSHOT_MAX_BYTES`
+   * （读上限）。T42 / 评审 I1 之后这两件事必须一致：读得进来却交不出去，等于白读一遍
+   * 然后删掉（旧实现就是这样）。见 `buildSnapshot` 的注释。
+   *
+   * 失败一律 `-32603`，并且**此时还没删** —— 调用方读到的 `mayHaveApplied:false` 是真的：
+   * 读不了（`reason:'snapshot-unavailable'`）或交不出（`reason:'backup-undeliverable'`）。
+   */
+  async function readSnapshotBytes(host, abs, method) {
+    let read
+    try {
+      read = await host.readFileBytes(abs, { maxBytes: DELETE_BACKUP_MAX_BYTES })
+    } catch (err) {
+      // 文件已经没了 → 那是 -32003（"没有可删的东西"），不是"快照失败"。
+      if (err?.code === ERR.NOT_FOUND) throw err
+      throw new BridgeError(ERR.INTERNAL,
+        `could not read ${abs} to take a delete snapshot (${err?.message ?? err}); nothing was `
+        + 'deleted — without the bytes there is no recovery material',
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'snapshot-unavailable',
+          why: 'unreadable',
+          mayHaveApplied: false,
+        })
+    }
+    if (read && read.tooLarge === true) {
+      throw new BridgeError(ERR.INTERNAL,
+        `${abs} is ${read.size ?? 'more than ' + DELETE_BACKUP_MAX_BYTES} bytes, over the `
+        + `${DELETE_BACKUP_MAX_BYTES}-byte deliverable-backup limit; nothing was deleted — `
+        + 'a backup that cannot be handed over is not recovery material',
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'backup-undeliverable',
+          why: 'too-large',
+          size: Number.isInteger(read.size) ? read.size : null,
+          maxBytes: DELETE_BACKUP_MAX_BYTES,
+          backup: { delivered: false, reason: 'too-large' },
+          mayHaveApplied: false,
+        })
+    }
+    const buffer = read?.buffer
+    if (!Buffer.isBuffer(buffer)) {
+      throw new BridgeError(ERR.INTERNAL,
+        'host.readFileBytes must resolve {buffer: Buffer} or {tooLarge: true}',
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'snapshot-unavailable',
+          why: 'invalid-read',
+          got: { type: typeof buffer },
+          mayHaveApplied: false,
+        })
+    }
+    if (buffer.length > DELETE_BACKUP_MAX_BYTES) {
+      throw new BridgeError(ERR.INTERNAL,
+        `host.readFileBytes returned ${buffer.length} bytes, over the `
+        + `${DELETE_BACKUP_MAX_BYTES}-byte deliverable-backup limit; nothing was deleted`,
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'backup-undeliverable',
+          why: 'too-large',
+          size: buffer.length,
+          maxBytes: DELETE_BACKUP_MAX_BYTES,
+          backup: { delivered: false, reason: 'too-large' },
+          mayHaveApplied: false,
+        })
+    }
+    return buffer
+  }
+
+  /**
+   * vscode.deleteFile —— **Tier 4 删除**（T40；契约 §6.2.1 的 Tier 4 行）。
+   *
+   * ⚠️ 这是本项目**第一个不可逆操作**，也是第一条"只靠往工作区里写文件内容就能被驱动"
+   * 的不可逆通道（§6.2.5 的 T-B 提示注入：路径守卫挡得住工作区**之外**，挡不住工作区里
+   * 一个完全正确的路径）。所以四道闸**同时**在，缺一不可（§6.2.5 `[规定]`：
+   * 白名单是必要条件，不是充分条件）：
+   *   ① 白名单最高档 `delete`（`whitelist.js`；身份由消费者自报，是 advisory）；
+   *   ② 绑定门（`WRITE_METHODS` → `-32010`，与 `applyEdit` / `save` 共用同一套）；
+   *   ③ **人工确认**（扩展侧 modal `showWarningMessage`，人点"删除"才继续，否则 `-32002`）；
+   *   ④ **内容快照**（删前把字节读进结果；读不到/超限就**不删**）。
+   *
+   * ★ 诚实标注（不许被后来的文案优化掉）：
+   *   - **不保证进回收站**：`workspace.fs.delete(uri,{useTrash:true})` 的契约措辞是
+   *     "whenever possible"，扩展侧没有能探测 `Trash` 能力位的 API —— 所以返回体里
+   *     `trashed` 的唯一诚实取值是 `'unknown'`（**禁写 `true`**，§6.2.4 ①）。
+   *   - **不提供撤销**：`FileSystem` 没有 restore，Explorer 的撤销栈我们也驱动不了。
+   *     返回值里不许出现任何"可恢复"措辞 —— 这句话本身就是在防止人误以为能撤销。
+   *   - **不支持目录 / 递归**：只删单个已存在的真实文件（空目录档本期不开，§6.2.8 #5）；
+   *     目录 → `-32602 reason:'recursive-delete-unsupported'`，symlink/junction 本身 → `'symlink'`。
+   *   - **由扩展发起**：删除的 actor 是扩展进程而不是编辑器里那个人，归因上事后**无法区分**
+   *     "人自己删的"与"DSH 删的"（T-C）。
+   *
+   *   - **由扩展发起**：删除的 actor 是扩展进程而不是编辑器里那个人，归因上事后**无法区分**
+   *     "人自己删的"与"DSH 删的"（T-C）。
+   *
+   * ## ★ T44 语义裁决：`vscode.deleteFile` **不删任何字节**，只"移入隔离区，永不删"
+   *
+   * 名字与档位保留（要求 `grant`、白名单最高档 `delete`、人工确认、整份备份），
+   * 但**动作**变了：把目标 rename 进 `<工作区根>/.dsh-quarantine/<UTC 时间戳>-<原名>`，
+   * 然后**在隔离体的新位置上重新测量** sha256/长度并如实返回。代码里没有任何
+   * `unlink` / `workspace.fs.delete` —— 没有不可逆动作，就没有"删错"这件事。
+   *
+   * 为什么放弃"隔离后按隔离名删除"（T42 的写法，评审 T43 B1-a 否决）：
+   *   1. **open-writer 窗口**：隔离前对原件 `openSync(f,'r+')` 拿到的写句柄不因 rename
+   *      失效。验完字节、`unlink` 之前用那个 fd 写同长度新字节，新字节就是被删掉且没有
+   *      任何留存的那一份，而旧快照冒充"删掉的就是它"。
+   *   2. **provider 消费窗口**：`workspace.fs.delete(uri)` 消费 URI 的那一刻，先 rename
+   *      走隔离体、在同一隔离名上写新字节、再删 —— 随机名挡不住"名字还在、内容已换"。
+   *   两条都不是"再算一次 hash"能挡的：校验对象与销毁对象之间隔着时间，而 hash 只描述
+   *   名称下的字节。**不销毁**才是结构性的解法（T44 裁决）。
+   *
+   * ## 剩下的唯一判据：被移走的是不是人批准的那个**对象**
+   *
+   * 归档前取 `(dev, ino)`（`readFileIdentity`），归档后在隔离体上再取一次：
+   *   - 相同 ⇒ 同一个 inode ⇒ 完成，随后**重新测量**（结果与确认时不同就
+   *     `bytesChanged:true`，两份都不丢：确认时那份在 `snapshot`，现在这份在 `to`）；
+   *   - 不同 ⇒ 被人"挪走原件 + 同字节顶名"⇒ 归还隔离体并报 `-32013`
+   *     （`reason:'target-replaced-before-quarantine'`，**两份文件都在**）。
+   *
+   * 判序（Tier 3 全部 + ⑯–㉑）：路径与形态 → 双锚点 → 脏缓冲区意图门 → 磁盘锚点 →
+   * 绑定门 → **备份（交不出整份字节就拒，评审 I1）** → **人工确认（独立长超时，超时作废
+   * 许可）** → 动手前重验（路径/锚点/字节同一个 sha256）→ 取对象身份 →
+   * **rename 进隔离区（线性化点，也是全部动作）** → 归档后认对象、重测字节 → 返回。
+   *
+   * ⚠️ 快照(⑱)排在确认(⑰)**之前**：确认框要展示预览，没有快照就没有预览。硬按编号顺序
+   * 排会让"人看着文件名点删除"，而 §6.2.4 ② 要的正是"人看着**内容**点删除"。
+   * （同 `save` 把 `⑭ untitled` 提前的理由：判据已经在手，先报更有用的那个事实。）
+   *
+   * params: { file: string,
+   *           expectedVersion: number, expectedIncarnation: string,   // 双锚点（-32012）
+   *           expectedDisk: {mtime, size},                            // 磁盘锚点（-32013）
+   *           grant?: {id, epoch} }
+   * result: { quarantined: true, file: string,
+   *           from: string, to: string,                    // 原名 → 隔离体路径（都不存在删除）
+   *           confirmedSha256, confirmedByteLength,        // 人确认时那份（与 backup 同源）
+   *           quarantinedSha256, quarantinedByteLength,    // 移动**完成后**在隔离体上实测
+   *           bytesChanged: boolean,                       // 两者不同 = 归档后被就地改写
+   *           bytesChangedNote?: string,                   // bytesChanged 时如实说明两份都在
+   *           snapshot: {sha256, byteLength, encoding, text|base64},  // 完整备份（I1）
+   *           backup: { delivered: true, form, byteLength, sha256 },  // 交付形态
+   *           quarantine: {path, original, retained: true, restored: false},
+   *           nameCollision: boolean }                     // 同名冲突是否用过随机后缀
+
+   */
+  async function deleteFile(params, ctx) {
+    const method = 'vscode.deleteFile'
+    assertTrusted(method)
+
+    if (typeof params?.file !== 'string' || params.file.trim() === '') {
+      throw new BridgeError(ERR.INVALID_PARAMS, 'params.file must be a non-empty string', { method })
+    }
+    const expectedVersion = readExpectedVersion(params, method)
+    const expectedIncarnation = readExpectedIncarnation(params, method)
+    const expectedDisk = readExpectedDisk(params, method)
+
+    // ── ⑯ 路径与形态（规则 0 单根 / 规则 2 整链 lstat / 拒绝非普通文件）──
+    // 契约 §6.2.4 ④：多根与 symlink 全拒，**不需要新机制** —— 这两条规则对删除恰好
+    // 是最没争议的用法（删掉一个链接 = 删掉一个"指向别处"的入口，爆炸半径不可评估）。
+    const { abs, real, root } = resolveWorkspaceFile(params.file, host.workspaceRoots(), {
+      method,
+      nonFileReason: 'recursive-delete-unsupported',
+    })
+
+    // 与 applyEdit / save 共用同一条按文件串行化的链：确认期间**持有**这条链是有意的 ——
+    // 否则"人看着的那份内容"与"真正要删的那份"之间可以插进一次写。
+    return serializeByPath(serializeKeyFor(real), () => deleteUnderLock({
+      method, abs, real, root, params, ctx, expectedVersion, expectedIncarnation, expectedDisk,
+    }))
+  }
+
+  /** `vscode.deleteFile` 的主体：判序见 `deleteFile` 的 JSDoc。只在该文件的排队链里跑。 */
+  async function deleteUnderLock({
+    method, abs, real, root, params, ctx, expectedVersion, expectedIncarnation, expectedDisk,
+  }) {
+    // ── 双锚点（Tier 3 的 ⑫ 前半）──
+    const state = await readDocumentState(host, real, { includeText: false }, method)
+    if (state.untitled === true) {
+      throw new BridgeError(ERR.INVALID_PARAMS,
+        'the document has never been saved to disk (untitled); there is no file to delete',
+        { method, file: canonicalPath(abs), reason: 'untitled-document' })
+    }
+    assertVersionMatches(state.version, expectedVersion, canonicalPath(abs), method)
+    assertIncarnationMatches(state.incarnation, expectedIncarnation, canonicalPath(abs), method)
+
+    // ── 意图门（Tier 3 的 ⑪）：脏缓冲区默认拒 ──
+    // 删除比 save 更严的地方：save 的出路是"把缓冲区写下去"，delete **没有**这个出路 ——
+    // 脏缓冲区意味着"磁盘上那份不是人眼下的全部内容"，快照盖不住未保存的编辑。
+    // 仍然只由**授权方**在 grant 上给的 `allowDirtySave` 放行（不许从 `params` 读）。
+    const dirtyBefore = state.isDirty === true
+    if (dirtyBefore && !grantAllowsDirtySave(grants, params?.grant)) {
+      throw new BridgeError(ERR.DOCUMENT_VERSION_CONFLICT,
+        'the buffer has unsaved changes that are not on disk; the snapshot would not cover them, '
+        + 'so nothing was deleted — save/discard first, or delete with a grant issued with '
+        + 'allowDirtySave:true',
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'buffer-dirty',
+          expectedVersion,
+          actualVersion: state.version,
+          allowDirtySave: false,
+        })
+    }
+
+    // ── 磁盘锚点（Tier 3 的 ⑫ 后半）：真实 stat 比 {mtime, size}，不符即 -32013 ──
+    const diskBefore = await readDiskStatOf(host, real, method)
+    assertDiskMatches(diskBefore, expectedDisk, canonicalPath(abs), method, { action: 'delete' })
+
+    for (const field of ['readFileBytes', 'confirmDelete', 'quarantineRename',
+      'ensureDirectory', 'readFileIdentity']) {
+      if (typeof host[field] !== 'function') {
+        throw new BridgeError(ERR.INTERNAL,
+          `host does not implement ${field}; this extension build cannot archive files`,
+          { method, file: canonicalPath(abs), hostField: field })
+      }
+    }
+
+    // ── 执行前复核 ①：动手那一刻凭证还得是好的（§6.1.1 ②B）。排在人被骚扰之前 ──
+    grantGate(method, params, ctx)
+
+    // ── ⑱ 内容备份：**读不到 / 交不出去就不删**（评审 I1）──
+    // `buildSnapshot` 只在"整份字节能随响应交出"时才返回（UTF-8 → text；二进制 → base64）；
+    // 超 `DELETE_BACKUP_MAX_BYTES` 直接抛 `backup-undeliverable`。旧实现回
+    // `textOmitted:'too-large'` 然后照删，那等于没有恢复材料 —— 现在没有第二条路。
+    const snapshot = buildSnapshot(await readSnapshotBytes(host, abs, method),
+      { method, file: canonicalPath(abs) })
+
+    // ── ⑰ 人工确认（独立长超时；超时**作废**这次许可，迟到的"同意"不生效）──
+    await askHumanToDelete({ abs, snapshot, method })
+
+    // ── 动手前重验（确认期间人可能离开了 2 分钟，世界会变）──
+    // ① 路径：同一个字符串再解析一次（链接/别名/越界都在这里重新过一遍）
+    const deleteTarget = revalidateWriteTarget({ abs, real }, host.workspaceRoots(), {
+      method, nonFileReason: 'recursive-delete-unsupported',
+    })
+    // ② 磁盘锚点：人看到的 {mtime,size} 必须还是现在这份
+    const diskNow = await readDiskStatOf(host, real, method)
+    assertDiskMatches(diskNow, expectedDisk, canonicalPath(abs), method, { action: 'delete' })
+    // ③ 字节：锚点只到"同一时刻且同样大小"，改完再改回来（同 mtime 同 size）它也认不出来。
+    //    重读一次比 sha256 —— 这里用 `digestOf`（只要身份，不重复造备份载荷）。
+    //    ⚠️ 这一步**不是**原子性来源（评审 B1 已否掉"再算一次 hash"）：它只挡"确认框开着
+    //    的时候内容变了"，挡不住"验完之后、按路径删之前被换掉"—— 那件事由 ⑲ 的改名隔离解决。
+    const bytesNow = digestOf(await readSnapshotBytes(host, abs, method))
+    if (bytesNow.sha256 !== snapshot.sha256 || bytesNow.byteLength !== snapshot.byteLength) {
+      throw new BridgeError(ERR.DISK_STATE_CONFLICT,
+        'the file bytes changed while the delete confirmation was open; nothing was deleted — '
+        + 'what the user approved is not what is on disk now',
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'bytes-changed',
+          expected: { sha256: snapshot.sha256, byteLength: snapshot.byteLength },
+          actual: { sha256: bytesNow.sha256, byteLength: bytesNow.byteLength },
+        })
+    }
+
+    // ── 执行前复核 ②：确认框开着的时候授权可能已经死了（另一条 await）──
+    grantGate(method, params, ctx)
+
+    // ── 对象身份（T44 / 评审 B1-a）：**紧贴归档之前**取一次 (dev, ino) ──
+    // 为什么不是"再算一次 hash"：hash 只说明"这两个名字下的字节相同"，而 B1 的两条实证
+    // （open-writer 写句柄 / provider 消费窗口）换掉的是**对象**，复算看不见。
+    // rename 不改 dev+ino，于是"我移走的那个对象"必须与"这一刻的对象"是同一对。
+    // 取在 grantGate 之后的最后一刻：中间只剩"建目录 + 挑名字 + rename"三小步。
+    const identityBefore = await readFileIdentityOf(host, deleteTarget)
+    if (identityBefore === null) {
+      throw new BridgeError(ERR.NOT_FOUND,
+        'the file disappeared before it could be archived; nothing was deleted or moved',
+        { method, file: canonicalPath(abs), reason: 'target-vanished' })
+    }
+
+    // ── ⑲ 归档：rename 进 `<root>/.dsh-quarantine/`（T44 的**唯一**动作）──
+    //
+    // ★ T44 的语义裁决：`vscode.deleteFile` **不删任何字节**，只把目标移进隔离区。
+    //   理由在评审 T43 B1-a 的实证里：按路径删除 + 任何"名字/复算"型绑定都挡不住
+    //   "验完之后被就地改写"（open-writer 的 fd 写不因 rename 失效）。不删就没有
+    //   不可逆动作 —— 剩下的问题只是"移走的对象对不对"，那由 (dev, ino) 判定。
+    const quarantineDir = quarantineDirFor(root)
+    try {
+      await host.ensureDirectory(quarantineDir)
+    } catch (err) {
+      throw new BridgeError(ERR.INTERNAL,
+        `could not create the quarantine directory ${canonicalPath(quarantineDir)} `
+        + `(${err?.message ?? err}); nothing was moved`,
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'quarantine-dir-failed',
+          quarantineDir: canonicalPath(quarantineDir),
+          mayHaveApplied: false,
+          retryable: true,
+        })
+    }
+    const picked = await pickQuarantinePath(host, quarantineDir, deleteTarget,
+      { method, file: canonicalPath(abs) })
+    const quarantineAbs = picked.path
+    const quarantine = quarantineInfo(quarantineAbs, deleteTarget)
+    try {
+      await host.quarantineRename(deleteTarget, quarantineAbs)
+    } catch (err) {
+      const hostCode = String(err?.data?.hostCode ?? err?.code ?? 'unknown')
+      throw new BridgeError(ERR.INTERNAL,
+        `could not move ${baseNameOf(abs)} into the quarantine directory (${hostCode}); `
+        + 'nothing was deleted and nothing was moved — the file is still at its original path'
+        + (hostCode === 'EXDEV'
+          ? ' (the quarantine directory is on another volume; a cross-volume move is refused '
+            + 'rather than emulated with copy+delete)'
+          : ''),
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'quarantine-failed',
+          hostCode,
+          crossVolume: hostCode === 'EXDEV',
+          quarantineDir: canonicalPath(quarantineDir),
+          quarantine: { ...quarantine, retained: false, reason: 'rename-failed' },
+          mayHaveApplied: false,
+          retryable: true,
+        })
+    }
+
+    // ── ㉑ 归档后：先认对象，再认字节 ──
+    const identityAfter = await readFileIdentityOf(host, quarantineAbs)
+    if (identityAfter === null) {
+      throw new BridgeError(ERR.INTERNAL,
+        `the move to ${quarantine.path} was not observed; nothing was deleted, but the file is `
+        + 'not where we left it — look at `quarantine` before retrying',
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'quarantine-not-observed',
+          quarantine,
+          mayHaveApplied: false,
+          retryable: true,
+        })
+    }
+    if (!sameFileObject(identityBefore, identityAfter)) {
+      // 移过来的**不是**人批准的那个对象（原件被挪走、同字节顶名）。
+      // 判据是身份不是字节：字节完全相同也必须拒 —— 人批准的是那个 inode。
+      // 归还（原名被占就保留隔离体并报出真实路径），然后按 -32013 报"磁盘状态冲突"。
+      const putBack = await restoreQuarantined(host, quarantineAbs, deleteTarget)
+      throw new BridgeError(ERR.DISK_STATE_CONFLICT,
+        'the file that was moved into quarantine is not the object the user approved (its '
+        + '(dev, ino) identity changed between the last pre-check and the move); nothing was '
+        + 'deleted — both files are still on disk',
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'target-replaced-before-quarantine',
+          confirmed: { sha256: snapshot.sha256, byteLength: snapshot.byteLength },
+          identity: { expected: identityBefore, actual: identityAfter },
+          quarantine: putBack,
+          mayHaveApplied: false,
+          retryable: false,
+        })
+    }
+    // 同一个对象 → 在它**现在的位置**重新测量。这一步产出的才是 quarantined*，
+    // 与 confirmed*（人看着点确认的那份）分开报，差异如实写进 `bytesChanged`。
+    const measured = await measureQuarantined(
+      (target) => readSnapshotBytes(host, target, method), quarantineAbs,
+      { method, file: canonicalPath(abs), quarantine })
+    const bytesChanged = measured.sha256 !== snapshot.sha256
+      || measured.byteLength !== snapshot.byteLength
+
+    log(`quarantine: ${abs} -> ${baseNameOf(quarantineAbs)} bytes=${measured.byteLength} `
+      + `sha256=${measured.sha256.slice(0, 12)} confirmed=${snapshot.sha256.slice(0, 12)} `
+      + `bytesChanged=${bytesChanged} collided=${picked.collided}`)
+    return {
+      // ★ T44 的语义：移动 + 永不删。字段名用 `quarantined` 而不是 `deleted` ——
+      //   让"没有删除"这件事在返回体里就是字面事实，而不是注释里的承诺。
+      quarantined: true,
+      file: canonicalPath(abs),
+      from: canonicalPath(deleteTarget),
+      to: quarantine.path,
+      // 人确认时那份字节的身份（与 backup 同源，取自 snapshot）。
+      confirmedSha256: snapshot.sha256,
+      confirmedByteLength: snapshot.byteLength,
+      // ★ 归档**完成之后**在隔离体上实测的那份。绝不复用 confirmed*。
+      quarantinedSha256: measured.sha256,
+      quarantinedByteLength: measured.byteLength,
+      // 两者不同 ⇔ 归档之后隔离体被就地改写过（open-writer 的 fd 写、provider 消费窗口
+      // 都是这种情形）。此时**两份都在**：确认时的那份在 `snapshot` 里，现在这份在 `to` 下。
+      bytesChanged,
+      ...(bytesChanged === true
+        ? {
+          bytesChangedNote: 'the quarantined bytes differ from the bytes the user confirmed; '
+            + 'nothing was deleted — the confirmed bytes are in this response (`snapshot`) and '
+            + 'the bytes on disk now are at `to`',
+        }
+        : {}),
+      // 完整字节（utf8 → text；二进制 → base64）。**不是** hash：评审核对过 §6.2.4 ③，
+      // "读过一遍"不等于"交出了恢复材料"。
+      snapshot,
+      backup: {
+        delivered: true,
+        form: snapshot.encoding === 'binary' ? 'base64' : 'utf8-text',
+        byteLength: snapshot.byteLength,
+        sha256: snapshot.sha256,
+      },
+      // 隔离体现在在哪 —— 成功时它**就是要保留**的那一份，`retained:true`。
+      quarantine,
+      // 同名冲突是否触发过随机后缀（诊断用；不影响任何判据）。
+      nameCollision: picked.collided,
+    }
+  }
+
+
+  /**
+   * 人工确认（§6.2.4 ② / §6.2.5）。**过了这一关才允许有不可逆动作。**
+   *
+   * 超时语义选的是"**作废许可**"而不是"到期默认同意/默认拒绝后还能被迟到同意翻案"：
+   *   - 超时 → `-32004 reason:'confirm-timeout'`（复用既有 TIMEOUT 码，§6.2.7 不许新增码）。
+   *   - 超时那一刻起，这次许可**结构上**失效：`Promise.race` 已经把对话框的 promise
+   *     丢掉，人在 121 秒点的"删除"不会落到任何 await 上 —— 不是"忽略一个布尔"，是
+   *     没有任何代码在等它。**不选 `-32002 declined`**：人并没有拒绝，"超时"和"拒绝"
+   *     要能分开（前者该重试/延长，后者重试没有意义），这也是 §7 #5 把"作废"与
+   *     "拒绝"分列的原因。
+   *
+   * ⚠️ 定时器**故意不 unref()**（与铁律 4 的默认相反）：它是"超时作废"语义的唯一载体。
+   *    unref 之后，若进程里只剩它在等（单测/一次性脚本里就是这样），事件循环会先退出，
+   *    超时永远不发生 = "人可以无限期不回答、许可永久有效"，与 §7 #5 的结论相反。
+   *    它在 `finally` 里一定会被清掉，所以不会延长进程寿命（铁律 4 想保的东西没丢）。
+   */
+  async function askHumanToDelete({ abs, snapshot, method }) {
+    // 把对话框规整成一个**永不 reject** 的 promise：① 宿主抛错 = 没得到同意（不是同意）；
+    // ② 超时之后才 reject 的 promise 必须有人接住，否则是 unhandledRejection。
+    const dialog = Promise.resolve()
+      .then(() => host.confirmDelete(abs, { snapshot }))
+      .then(
+        (answer) => (answer && answer.choice === 'delete'
+          ? CONFIRM_ACCEPTED
+          : { choice: (answer && answer.choice) || 'dismissed' }),
+        (err) => ({ choice: 'error', error: err?.message ?? String(err) }),
+      )
+
+    let timer = null
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(CONFIRM_TIMED_OUT), deleteConfirmTimeoutMs)
+    })
+
+    let answer
+    try {
+      answer = await Promise.race([dialog, timeout])
+    } finally {
+      clearTimeout(timer)
+    }
+
+    if (answer === CONFIRM_TIMED_OUT) {
+      throw new BridgeError(ERR.TIMEOUT,
+        `the delete of ${baseNameOf(abs)} was not confirmed within ${deleteConfirmTimeoutMs}ms; `
+        + 'the permission is void and nothing was deleted — a late confirmation will NOT be '
+        + 'honoured, ask again if the delete is still wanted',
+        {
+          method,
+          file: canonicalPath(abs),
+          reason: 'confirm-timeout',
+          timeoutMs: deleteConfirmTimeoutMs,
+          mayHaveApplied: false,
+          retryable: true,
+        })
+    }
+    if (answer === CONFIRM_ACCEPTED) return
+
+    // 取消 / 关闭 / 宿主抛错 / 不认识的形状 —— 一律"没得到明确的删除同意"。
+    throw new BridgeError(ERR.DECLINED,
+      `the delete of ${baseNameOf(abs)} was not confirmed; nothing was deleted`,
+      {
+        method,
+        file: canonicalPath(abs),
+        choice: answer?.choice ?? null,
+        mayHaveApplied: false,
+      })
+  }
+
+
   const handlers = {
     'vscode.openFile': openFile,
     'vscode.getSelection': getSelection,
@@ -984,6 +2098,8 @@ export function createCapabilities(host, opts = {}) {
     'vscode.listOpenEditors': listOpenEditors,
     'vscode.applyEdit': applyEdit,
     'vscode.getDocumentState': getDocumentState,
+    'vscode.save': save,
+    'vscode.deleteFile': deleteFile,
   }
 
   /**

@@ -28,6 +28,22 @@ import {
   editNotBoundError,
 } from '../src/grant.js'
 
+/**
+ * 测试消费者身份（T38 白名单落地后，**写类调用必须来自已绑定身份的入口**）。
+ *
+ * 这一行不是"为了跑通而加的胶水"：它把既有 135 处调用点的身份显式化 ——
+ * 以前它们全都经 `ctx.provide` 出去的共享 facade，而那个 facade 现在**只能是 read**。
+ * 档位给到 `delete` 是为了让本文件继续测**它本来要测的那道门**（会话授权绑定 / 锚点 / 响应形状），
+ * 不被白名单挡在前面；白名单自己的用例在 `test/t38-whitelist.test.js`。
+ */
+const TEST_CONSUMER = 'dsh-kit-test'
+const TEST_CONSUMERS = { [TEST_CONSUMER]: 'delete' }
+const boundSvc = (ctx) => {
+  const shared = ctx.provided.get('dshVscodeKit').v
+  return shared.forPlugin(TEST_CONSUMER, { declared: 'delete' })
+}
+
+
 const HEX_32 = /^[0-9a-f]{32}$/
 
 /**
@@ -155,9 +171,9 @@ async function announce(editor, { ptv = 1, capabilities = ['vscode.applyEdit', '
 async function withKit(n = 1, { onRequest } = {}) {
   const home = tempHome()
   const ctx = fakeCtx()
-  const handle = apply(ctx, { dshHome: home, connectWaitMs: 50, onLog: () => {} })
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, connectWaitMs: 50, onLog: () => {} })
   await handle.boot
-  const svc = ctx.provided.get('dshVscodeKit').v
+  const svc = boundSvc(ctx)
   const server = handle.kit.server
   const editors = []
   for (let i = 0; i < n; i++) {
@@ -310,9 +326,17 @@ test('GrantStore：墓碑上限 32，最老的被淘汰后按「id 查不到」�
 })
 
 test('写入类清单：只有登记进 WRITE_METHODS 的方法过门（读操作不要求 grant）', () => {
-  assert.deepEqual([...WRITE_METHODS], ['vscode.applyEdit'])
+  // ★ T39：`vscode.save` 是第二件写入类 —— 它接进门的唯一方式就是往这张表里加名字
+  //   （契约 §6.2.6：「判据是一张表，不是一个开关」，门自己就会生效）。
+  // ★ T40：`vscode.deleteFile` 是第三件，也是第一件**不可逆**的。它进这张表的后果要看清：
+  //   绑定门 + `request()` 里"写入类必带 expectedIncarnation"（T35）两条同时继承，
+  //   所以删除的双锚点是这张表**顺带**守住的，不是删除自己另加的规矩。
+  assert.deepEqual([...WRITE_METHODS], ['vscode.applyEdit', 'vscode.save', 'vscode.deleteFile'])
   assert.equal(isWriteMethod('vscode.applyEdit'), true)
+  assert.equal(isWriteMethod('vscode.save'), true)
+  assert.equal(isWriteMethod('vscode.deleteFile'), true)
   assert.equal(isWriteMethod('vscode.getSelection'), false)
+  assert.equal(isWriteMethod('vscode.getDocumentState'), false)
   assert.equal(isWriteMethod('bridge.ping'), false)
   // 门对非写入方法必须原样放过（不抛），否则读操作会被误伤
   const gate = dshWriteGate(new GrantStore())
@@ -344,9 +368,9 @@ test('editNotBoundError：code 恒为 -32010，data 带 reason/method', () => {
 test('grant：没有目标连接 → -32007 且不缓存（再调还是抛，表里始终为空）', async () => {
   const home = tempHome()
   const ctx = fakeCtx()
-  const handle = apply(ctx, { dshHome: home, connectWaitMs: 0, onLog: () => {} })
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, connectWaitMs: 0, onLog: () => {} })
   await handle.boot
-  const svc = ctx.provided.get('dshVscodeKit').v
+  const svc = boundSvc(ctx)
   try {
     for (let i = 0; i < 2; i++) {
       await assert.rejects(
@@ -367,9 +391,9 @@ test('grant：没有目标连接 → -32007 且不缓存（再调还是抛，表
 test('grant：目标已准入但没报协议版本 → -32008，且不发任何 grant 帧', async () => {
   const home = tempHome()
   const ctx = fakeCtx()
-  const handle = apply(ctx, { dshHome: home, connectWaitMs: 50, onLog: () => {} })
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, connectWaitMs: 50, onLog: () => {} })
   await handle.boot
-  const svc = ctx.provided.get('dshVscodeKit').v
+  const svc = boundSvc(ctx)
   const editor = await fakeEditor(handle.kit.server)
   try {
     // 报身份但**不报** protocolVersion：这是「准入 ≠ 可授权」的最小反例。
@@ -887,8 +911,8 @@ test('epoch 不一致（连接没换，同一 id 换了 epoch）→ grant-genera
 
 test('未就绪：facade.editing.grant/revoke 抛 -32007 server-not-ready，list 返回空表', () => {
   const ctx = fakeCtx()
-  apply(ctx, { dshHome: join(tmpdir(), 'never-listening'), enabled: false, onLog: () => {} })
-  const svc = ctx.provided.get('dshVscodeKit').v
+  apply(ctx, { consumers: TEST_CONSUMERS, dshHome: join(tmpdir(), 'never-listening'), enabled: false, onLog: () => {} })
+  const svc = boundSvc(ctx)
   assert.throws(() => svc.editing.grant(), (e) => e.code === ERR.DISCONNECTED
     && e.data.reason === 'server-not-ready')
   assert.throws(() => svc.editing.revoke('x'), (e) => e.code === ERR.DISCONNECTED)

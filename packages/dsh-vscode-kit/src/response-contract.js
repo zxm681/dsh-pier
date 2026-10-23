@@ -61,6 +61,15 @@ const isBoolean = (v) => typeof v === 'boolean'
 const oneOf = (...allowed) => (v) => allowed.includes(v)
 const isIntegerAtLeast = (min) => (v) => Number.isInteger(v) && v >= min
 
+/**
+ * 64 位小写十六进制 —— `sha256` 的形状。
+ *
+ * 为什么要这么死：这个值唯一的用途是**和别的工具算出来的 sha256 对照**
+ * （`sha256sum`、`git hash-object`、恢复脚本）。大写、省略前导零、带 `0x` 前缀
+ * 全都是"看起来像但对不上"，而排查它的人会去怀疑文件本身，不会怀疑编码。
+ */
+const isSha256Hex = (v) => typeof v === 'string' && /^[0-9a-f]{64}$/.test(v)
+
 /** 本模块的「对象」口径：排除 null 与顶层数组（契约 §5.1 第 2 条）。 */
 const isObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v)
 
@@ -172,6 +181,165 @@ const RESPONSE_CONTRACTS = Object.freeze({
       ['file', isNonEmptyString, 'file:string(non-empty)'],
       ['saved', (v) => v === false, 'saved===false'],
       ['textLength', isIntegerAtLeast(0), 'textLength:int>=0'],
+    ],
+  },
+
+  /**
+   * 落盘（T39 / 契约 §6.2.1 Tier 3）。
+   *
+   * ★ 谓词方向与 `applyEdit` **相反**，这是有意的一对：
+   *   `applyEdit` 承诺"我只碰缓冲区" ⇒ `saved` 必须是 `false`；
+   *   `vscode.save` 承诺"我真的落盘了" ⇒ `saved` 必须是 `true`。
+   *   两边都写成"值断言"而不是 `isBoolean`：对端回错方向的布尔不是小毛病，
+   *   是**成功外形的错误结果**（§5.1），必须判 `-32009` 而不是替它猜。
+   *
+   * `disk` 是**保存之后重新 stat 的真值**（不是回显 `expectedDisk`），所以两个字段
+   * 都必须是整数：`mtime` 是毫秒，`size` 是字节。让浮点/字符串混进来，消费者下一次
+   * 拿它当锚点就会"永远冲突"。
+   * `dirtyBefore` = 保存**之前**缓冲区是否脏（`true` 说明这次落盘把人工改动一起写下去了，
+   * 也正是 grant 上 `allowDirtySave` 才放行的情形）。
+   */
+  'vscode.save': {
+    expected: 'object with saved===true, file:string(non-empty), '
+      + 'disk:{mtime:int>=0, size:int>=0}, dirtyBefore:boolean',
+    fields: [
+      ['saved', (v) => v === true, 'saved===true'],
+      ['file', isNonEmptyString, 'file:string(non-empty)'],
+      ['disk.mtime', isIntegerAtLeast(0), 'disk.mtime:int>=0'],
+      ['disk.size', isIntegerAtLeast(0), 'disk.size:int>=0'],
+      ['dirtyBefore', isBoolean, 'dirtyBefore:boolean'],
+    ],
+  },
+
+  /**
+   * 归档（T40 / 契约 §6.2.1 Tier 4；**T44 改成"移入隔离区，永不删"**）。
+   *
+   * ★ 为什么不再有 `deleted` / `trashed`：T44 的裁决是"这条能力不销毁任何字节"。
+   *   返回体里出现 `deleted:true` 就等于替一个不存在的动作作证；`trashed` 更是必须
+   *   消失的字段 —— 隔离区**不是**回收站（没有 `restore` 入口、没有系统集成），
+   *   说"进回收站了"会让人去找一个找不到的东西。旧口径里"`trashed` 只接受 `'unknown'`"
+   *   的整段论证因此作废：字段本身没了，就没有"诚实的取值"这回事。
+   *
+   * 所以判据换成三个**可核对的事实**：
+   *  - `quarantined===true` + `from`/`to`：移动真的发生了，新位置在 `to`；
+   *  - `confirmedSha256`/`confirmedByteLength`：**人看着点确认**的那份字节（= `snapshot`
+   *    与 `backup` 指的那份，三处必须一致 —— 见 `consistency`）；
+   *  - `quarantinedSha256`/`quarantinedByteLength`：**移动完成之后**在隔离体上实测的。
+   *    它必须来自归档后的实测，而 `bytesChanged` 就是"两者是否相同"的判定结果 ——
+   *    不是对端可以自选的布尔。T43 评审的 open-writer 窗口正是"两份不同"的情形
+   *    （用写句柄在归档后改了隔离体）：此时**两份都没丢**（确认时那份在 `snapshot` 里，
+   *    现在这份在 `to` 下），所以这是一次**成功**，但必须 `bytesChanged:true` 并给出
+   *   说明（`bytesChangedNote`），不许隐瞒差异。
+   *
+   * `snapshot` 是**恢复材料**（§6.2.4 ③），不是"关于这份字节的元数据"：
+   *  - `sha256` 必须是 64 位小写十六进制：它要能直接和 `sha256sum` / `git hash-object`
+   *    的结果对照，混进大写或长度不对就等于没给（人拿去核时会"永远对不上"）；
+   *  - `byteLength` 非负整数：交出去的是 0 字节文件还是 2 MB 文件是两件事；
+   *  - `encoding` 必须是 `utf8` / `binary` 之一：`binary` 表示"没有文本形态"，
+   *    此时**不给** `text` / `textLength`，整份字节走 `base64`（见 `consistency`）。
+   *
+   * ★ T42 / 评审 I1 的结论继续有效：`sha256` **恢复不出**任何字节，它只证明"是同一份"。
+   *   所以合同要求**整份字节必须在响应里**（`text` 或 `base64`），并用
+   *   `backup.delivered===true` 显式声明"我交出来了"。做不到就该是一次失败
+   *   （`-32603 reason:'backup-undeliverable'`），而不是一次"归档了但没材料"的成功。
+   */
+  'vscode.deleteFile': {
+    expected: "object with quarantined===true, file:string(non-empty), from:string(non-empty), "
+      + 'to:string(non-empty), confirmedSha256:64-hex, confirmedByteLength:int>=0, '
+      + 'quarantinedSha256:64-hex, quarantinedByteLength:int>=0, bytesChanged:boolean, '
+      + 'backup:{delivered===true, form:in{utf8-text,base64}, byteLength:int>=0, sha256:64-hex}, '
+      + 'snapshot:{sha256:64-hex-lowercase, byteLength:int>=0, encoding:in{utf8,binary}, '
+      + 'textLength?:int>=0, text?:string, base64?:string}',
+    fields: [
+      ['quarantined', (v) => v === true, 'quarantined===true'],
+      ['file', isNonEmptyString, 'file:string(non-empty)'],
+      ['from', isNonEmptyString, 'from:string(non-empty)'],
+      ['to', isNonEmptyString, 'to:string(non-empty)'],
+      ['confirmedSha256', isSha256Hex, 'confirmedSha256:64-hex-lowercase'],
+      ['confirmedByteLength', isIntegerAtLeast(0), 'confirmedByteLength:int>=0'],
+      ['quarantinedSha256', isSha256Hex, 'quarantinedSha256:64-hex-lowercase'],
+      ['quarantinedByteLength', isIntegerAtLeast(0), 'quarantinedByteLength:int>=0'],
+      ['bytesChanged', isBoolean, 'bytesChanged:boolean'],
+      ['snapshot.sha256', isSha256Hex, 'snapshot.sha256:64-hex-lowercase'],
+      ['snapshot.byteLength', isIntegerAtLeast(0), 'snapshot.byteLength:int>=0'],
+      ['snapshot.encoding', oneOf('utf8', 'binary'), 'snapshot.encoding:in{utf8,binary}'],
+      // ★ 备份交付声明（I1）。`delivered:false` 的归档返回是畸形，不是"小瑕疵"。
+      ['backup.delivered', (v) => v === true, 'backup.delivered===true'],
+      ['backup.form', oneOf('utf8-text', 'base64'), 'backup.form:in{utf8-text,base64}'],
+      ['backup.byteLength', isIntegerAtLeast(0), 'backup.byteLength:int>=0'],
+      ['backup.sha256', isSha256Hex, 'backup.sha256:64-hex'],
+    ],
+    optional: [
+      ['snapshot.textLength', isIntegerAtLeast(0), 'snapshot.textLength:int>=0'],
+      // 空文件是合法的（`text:''`），所以 isString 而不是非空。
+      ['snapshot.text', isString, 'snapshot.text:string'],
+      // 二进制整份字节的 base64（逐字节可逆；比"替换字符版正文"诚实得多）。
+      ['snapshot.base64', isString, 'snapshot.base64:string'],
+      // `bytesChanged:true` 时的**人话说明**（"两份都在"）。见 consistency。
+      ['bytesChangedNote', isNonEmptyString, 'bytesChangedNote:string(non-empty)'],
+      // 隔离体现在在哪（`{path, original, retained, restored}`）。
+      ['quarantine', (v) => typeof v === 'object' && v !== null, 'quarantine:object'],
+      ['nameCollision', isBoolean, 'nameCollision:boolean'],
+    ],
+    consistency: [
+      // 声明的"人确认过的那份"必须就是交出去的那份（三处同源，对不上 = 对端在猜）。
+      [
+        (r) => r.snapshot.sha256 === r.confirmedSha256
+          && r.snapshot.byteLength === r.confirmedByteLength,
+        'snapshot.{sha256,byteLength} === {confirmedSha256,confirmedByteLength}',
+      ],
+      // `bytesChanged` 是**判定结果**，不是自选布尔：必须等于两个 hash/长度比出来的事实。
+      [
+        (r) => r.bytesChanged === (r.quarantinedSha256 !== r.confirmedSha256
+          || r.quarantinedByteLength !== r.confirmedByteLength),
+        'bytesChanged === (quarantined* !== confirmed*)',
+      ],
+      // 差异必须被说出来（不许报成功却隐瞒）。反方向不要求：没差异就不该有说明。
+      [
+        (r) => r.bytesChanged !== true || (typeof r.bytesChangedNote === 'string'
+          && r.bytesChangedNote.length > 0),
+        "bytesChanged===true ⇒ bytesChangedNote 非空",
+      ],
+      // 移动必须有两端，而且不是同一个位置（否则"归档"是空话）。
+      [
+        (r) => r.from !== r.to,
+        'from !== to',
+      ],
+      // `encoding:'binary'` 不许带文本形态：`toString('utf8')` 的结果不是"正文"。
+      [
+        (r) => r.snapshot.encoding !== 'binary'
+          || (!('text' in r.snapshot) && !('textLength' in r.snapshot)),
+        "snapshot.encoding==='binary' ⇒ 无 text / textLength",
+      ],
+      // 给了正文，长度就必须等于正文长度（UTF-16 code unit 口径，与 JS 消费者一致）。
+      [
+        (r) => !('text' in r.snapshot) || r.snapshot.text.length === r.snapshot.textLength,
+        'snapshot.text.length === snapshot.textLength',
+      ],
+      // ★ I1 的核心：**整份字节必须在响应里** —— hash 不是恢复材料。
+      [
+        (r) => (r.snapshot.encoding === 'utf8'
+          ? 'text' in r.snapshot
+          : 'base64' in r.snapshot),
+        '完整备份：encoding==utf8 ⇒ snapshot.text / encoding==binary ⇒ snapshot.base64',
+      ],
+      // base64 反解回来必须正好是声明的字节数（挡"半截 base64 冒充整份"）。
+      [
+        (r) => !('base64' in r.snapshot)
+          || Buffer.from(r.snapshot.base64, 'base64').length === r.snapshot.byteLength,
+        'snapshot.base64 解码后长度 === snapshot.byteLength',
+      ],
+      // 备份声明与载荷必须指同一份字节（两处 sha256/长度对不上 = 对端在猜）。
+      [
+        (r) => r.backup.sha256 === r.snapshot.sha256
+          && r.backup.byteLength === r.snapshot.byteLength,
+        'backup.{sha256,byteLength} === snapshot.{sha256,byteLength}',
+      ],
+      // 形态声明与载荷一致（utf8-text ↔ text / base64 ↔ base64）。
+      [
+        (r) => (r.backup.form === 'base64') === ('base64' in r.snapshot),
+        "backup.form==='base64' ⇔ snapshot.base64 存在",
+      ],
     ],
   },
 

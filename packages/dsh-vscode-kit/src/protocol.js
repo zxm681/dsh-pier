@@ -59,6 +59,24 @@ export const ERR = Object.freeze({
    * 那三个说的是"这次没谈成"，本码说的是"谈成了，但你的锚点过期了"。
    */
   DOCUMENT_VERSION_CONFLICT: -32012,
+  /**
+   * 磁盘状态锚点冲突（契约 §6.2.3 / §6.2.7：`vscode.save` 的前置条件）。
+   * **新增**码位，不动既有码语义。
+   *
+   * `params.expectedDisk = {mtime, size}` 与保存前 `workspace.fs.stat` 的真值不符
+   * （文件被别的进程/别的编辑器改过、删掉了、或换成了目录）→ 本码，
+   * `data = { file, expected, actual }`（`actual` 为 `null` 表示磁盘上已经没有了）。
+   *
+   * ★ **不许复用 `-32012`**（契约 §6.2.3 / §6.2.7 的结论）：
+   * `-32012` 的处置是"重读锚点、用新版本**重发**"——它对缓冲区冲突成立，因为重读
+   * `getDocumentState` 就能拿到新锚点；而磁盘冲突**永远不能自动重试**：本端无从知道
+   * 磁盘上那份内容是谁写的（不是它写的），拿旧缓冲区内容覆盖一份没见过的人工改动
+   * 正是 Tier 3 要挡的事。复用同一个码等于让两条处置完全相反的失败共用一套自动重试逻辑。
+   *
+   * 也不许拿 -32003（不存在）/ -32004（超时）/ -32603（宿主错误）代替：
+   * 那三个说的是"没读到 / 没谈成"，本码说的是"读到了，但磁盘已经不是你以为的那一份"。
+   */
+  DISK_STATE_CONFLICT: -32013,
 })
 
 /** 错误码 → 稳定诊断串（日志与测试断言都用它，改动即破坏契约）。 */
@@ -79,6 +97,7 @@ export const ERR_NAME = Object.freeze({
   [ERR.INVALID_RESPONSE]: 'invalid-response',
   [ERR.EDIT_NOT_BOUND]: 'edit-not-bound',
   [ERR.DOCUMENT_VERSION_CONFLICT]: 'document-version-conflict',
+  [ERR.DISK_STATE_CONFLICT]: 'disk-state-conflict',
 })
 
 /**

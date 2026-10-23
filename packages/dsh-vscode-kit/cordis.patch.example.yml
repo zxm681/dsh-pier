@@ -1,0 +1,33 @@
+# per-plugin 能力白名单 —— 配置示例（copy 到**宿主 profile** 的 `cordis.patch.yml`）
+#
+# 这份文件是**示例**，不会被任何进程自动加载：真正生效的位置是 DSH 宿主的
+# 补丁层，例如 `~/.dsh/profiles/<profile>/cordis.patch.yml`（loader 按
+# package.json 的 dsh.profile.bundles → cordis.patch.yml → --patch overlay 的顺序叠）。
+#
+# 为什么配置落在宿主侧而不是扩展侧（契约 §6.2.8 第 3 条）：VS Code 扩展
+# 不知道"DSH 的插件是谁"，它只认 bridge token；只有宿主知道是哪个 cordis 插件
+# 在调用。所以白名单只能由宿主这份配置说了算。
+#
+# 语义（契约 §6.2.5）：
+#   档位有序   read < buffer-edit < disk-write < delete
+#   判定      消费者声明的最高档位 ≤ 这里给它的档位   才算放行
+#   未列出    → read（只读四能力照常；buffer-edit 及以上一律拒）
+#   写错档位  → 该条目被忽略并打 error 日志，落回 read（收紧，绝不放松）
+#   身份自报  → 消费者用 kit.forPlugin('<自己的插件名>', { declared }) 报名；
+#               名字不匹配这里的键 = 未列出 = read。所以键要跟插件名逐字一致。
+#
+# 这一层是 advisory（减少误用 / 拦住模型幻觉调错方法），**不是**防恶意插件：
+# 插件自己能改 declared，也能自己去 dial bridge。它挡的是"手滑"和"幻觉"，
+# 挡不住"存心"。契约 §6.2.5 的原话：白名单是必要条件，不是充分条件。
+
+- id: dsh-vscode-kit
+  name: dsh-vscode-kit
+  config:
+    consumers:
+      # 示例消费者（packages/dsh-kit-demo）：只用 getSelection / openFile，声明 read。
+      dsh-kit-demo: read
+      # 需要 vscode.applyEdit 的插件给到 buffer-edit（改内存里的 buffer，不落盘）。
+      # acme-refactor: buffer-edit
+      # disk-write / delete 目前没有实现方（vscode.save / vscode.deleteFile 尚未落地），
+      # 先写在这里当占位：能力没实现时开档也不会多出任何动作，但档位模型已经定死。
+      # acme-formatter: disk-write

@@ -33,6 +33,22 @@ import { join } from 'node:path'
 import { apply } from '../src/index.js'
 import { BridgeError, ERR, connect, createLineSplitter } from '../src/protocol.js'
 
+/**
+ * 测试消费者身份（T38 白名单落地后，**写类调用必须来自已绑定身份的入口**）。
+ *
+ * 这一行不是"为了跑通而加的胶水"：它把既有 135 处调用点的身份显式化 ——
+ * 以前它们全都经 `ctx.provide` 出去的共享 facade，而那个 facade 现在**只能是 read**。
+ * 档位给到 `delete` 是为了让本文件继续测**它本来要测的那道门**（会话授权绑定 / 锚点 / 响应形状），
+ * 不被白名单挡在前面；白名单自己的用例在 `test/t38-whitelist.test.js`。
+ */
+const TEST_CONSUMER = 'dsh-kit-test'
+const TEST_CONSUMERS = { [TEST_CONSUMER]: 'delete' }
+const boundSvc = (ctx) => {
+  const shared = ctx.provided.get('dshVscodeKit').v
+  return shared.forPlugin(TEST_CONSUMER, { declared: 'delete' })
+}
+
+
 const S1 = 'sess-alpha'
 const FILE = '/ws/a.js'
 
@@ -153,9 +169,9 @@ async function windowClient(server, { label, docVersion, docIncarnation }) {
 async function withKit() {
   const home = tempHome()
   const ctx = fakeCtx()
-  const handle = apply(ctx, { dshHome: home, connectWaitMs: 50, onLog: () => {} })
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, connectWaitMs: 50, onLog: () => {} })
   await handle.boot
-  const svc = ctx.provided.get('dshVscodeKit').v
+  const svc = boundSvc(ctx)
   const server = handle.kit.server
   const clients = []
   const open = async (opts) => {

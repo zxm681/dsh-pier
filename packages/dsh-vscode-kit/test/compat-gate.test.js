@@ -20,6 +20,22 @@ import {
   ERR, ERR_NAME, PROTOCOL_VERSION, connect, createLineSplitter, judgeProtocolVersion,
 } from '../src/protocol.js'
 
+/**
+ * 测试消费者身份（T38 白名单落地后，**写类调用必须来自已绑定身份的入口**）。
+ *
+ * 这一行不是"为了跑通而加的胶水"：它把既有 135 处调用点的身份显式化 ——
+ * 以前它们全都经 `ctx.provide` 出去的共享 facade，而那个 facade 现在**只能是 read**。
+ * 档位给到 `delete` 是为了让本文件继续测**它本来要测的那道门**（会话授权绑定 / 锚点 / 响应形状），
+ * 不被白名单挡在前面；白名单自己的用例在 `test/t38-whitelist.test.js`。
+ */
+const TEST_CONSUMER = 'dsh-kit-test'
+const TEST_CONSUMERS = { [TEST_CONSUMER]: 'delete' }
+const boundSvc = (ctx) => {
+  const shared = ctx.provided.get('dshVscodeKit').v
+  return shared.forPlugin(TEST_CONSUMER, { declared: 'delete' })
+}
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 脚手架：与 apply.test.js 同构的最小 cordis ctx + 假编辑器（单文件独立，避免
 // import 测试文件把对方的用例也跑一遍）。
@@ -102,11 +118,11 @@ async function fakeEditor(server) {
 async function withKit({ helloWaitMs = 60 } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'dsh-kit-gate-'))
   const ctx = fakeCtx()
-  const handle = apply(ctx, {
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS,
     dshHome: home, connectWaitMs: 200, helloWaitMs, onLog: () => {},
   })
   await handle.boot
-  const svc = ctx.provided.get('dshVscodeKit').v
+  const svc = boundSvc(ctx)
   const server = handle.kit.server
   const editors = []
   const connectEditor = async () => {

@@ -9,6 +9,22 @@ import { apply, name, inject, VscodeKit, replayPendingAuthorized } from '../src/
 import { ERR, connect, createLineSplitter } from '../src/protocol.js'
 import { discoveryDir, listLiveBridges } from '../src/server.js'
 
+/**
+ * 测试消费者身份（T38 白名单落地后，**写类调用必须来自已绑定身份的入口**）。
+ *
+ * 这一行不是"为了跑通而加的胶水"：它把既有 135 处调用点的身份显式化 ——
+ * 以前它们全都经 `ctx.provide` 出去的共享 facade，而那个 facade 现在**只能是 read**。
+ * 档位给到 `delete` 是为了让本文件继续测**它本来要测的那道门**（会话授权绑定 / 锚点 / 响应形状），
+ * 不被白名单挡在前面；白名单自己的用例在 `test/t38-whitelist.test.js`。
+ */
+const TEST_CONSUMER = 'dsh-kit-test'
+const TEST_CONSUMERS = { [TEST_CONSUMER]: 'delete' }
+const boundSvc = (ctx) => {
+  const shared = ctx.provided.get('dshVscodeKit').v
+  return shared.forPlugin(TEST_CONSUMER, { declared: 'delete' })
+}
+
+
 function tempHome() {
   return mkdtempSync(join(tmpdir(), 'dsh-kit-apply-'))
 }
@@ -121,13 +137,13 @@ test('端到端：apply → 服务注册 → 假编辑器连上 → 消费者 vs
   const home = tempHome()
   const logs = []
   const ctx = fakeCtx()
-  const handle = apply(ctx, { dshHome: home, onLog: (l, m) => logs.push(`${l}:${m}`) })
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, onLog: (l, m) => logs.push(`${l}:${m}`) })
   await handle.boot
   assert.equal(handle.disposed, false)
 
   // 服务已注册且就绪
   assert.ok(ctx.provided.has('dshVscodeKit'))
-  const svc = ctx.provided.get('dshVscodeKit').v
+  const svc = boundSvc(ctx)
   assert.equal(svc.ready, true)
 
   // 假编辑器：应答 vscode.getSelection
@@ -228,9 +244,9 @@ test('回归（R1）：目标按连接序号挑，不按 trusted 的插入（准
 async function withKit(editorTexts) {
   const home = tempHome()
   const ctx = fakeCtx()
-  const handle = apply(ctx, { dshHome: home, connectWaitMs: 50, onLog: () => {} })
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, connectWaitMs: 50, onLog: () => {} })
   await handle.boot
-  const svc = ctx.provided.get('dshVscodeKit').v
+  const svc = boundSvc(ctx)
   const server = handle.kit.server
   const editors = []
   for (const text of editorTexts) {
@@ -342,9 +358,9 @@ test('回归（S1）：启动空窗期准入后断线的连接被跳过，pendin
 test('安全回归：裸连接（不带 token、不发消息）抢不到 active 位', async () => {
   const home = tempHome()
   const ctx = fakeCtx()
-  const handle = apply(ctx, { dshHome: home, connectWaitMs: 50, onLog: () => {} })
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, connectWaitMs: 50, onLog: () => {} })
   await handle.boot
-  const svc = ctx.provided.get('dshVscodeKit').v
+  const svc = boundSvc(ctx)
 
   // 攻击者：裸 socket，不认识协议库，一个字节都不发
   const attacker = createConnection({ port: handle.kit.server.port, host: '127.0.0.1' })
@@ -371,9 +387,9 @@ test('安全回归：裸连接（不带 token、不发消息）抢不到 active 
 test('安全回归：带错 token 的连接也不算准入', async () => {
   const home = tempHome()
   const ctx = fakeCtx()
-  const handle = apply(ctx, { dshHome: home, connectWaitMs: 50, onLog: () => {} })
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, connectWaitMs: 50, onLog: () => {} })
   await handle.boot
-  const svc = ctx.provided.get('dshVscodeKit').v
+  const svc = boundSvc(ctx)
 
   const editor = await fakeEditor(handle.kit.server, { bypassToken: 'not-the-real-token' })
   // 用错 token 发一条请求：服务端会拒 -32001，但连接本身不断（协议 §3.3）
@@ -397,9 +413,9 @@ test('安全回归：带错 token 的连接也不算准入', async () => {
 test('安全回归：真编辑器准入后抢位失败（active 位只认 token 通过者）', async () => {
   const home = tempHome()
   const ctx = fakeCtx()
-  const handle = apply(ctx, { dshHome: home, connectWaitMs: 50, onLog: () => {} })
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, connectWaitMs: 50, onLog: () => {} })
   await handle.boot
-  const svc = ctx.provided.get('dshVscodeKit').v
+  const svc = boundSvc(ctx)
 
   // 1) 真编辑器先来并报身份 → 准入
   const editor = await fakeEditor(handle.kit.server, {
@@ -441,9 +457,9 @@ test('安全回归：真编辑器准入后抢位失败（active 位只认 token 
 test('无编辑器连接时 request 得到结构化 -32007，不静默挂起', async () => {
   const home = tempHome()
   const ctx = fakeCtx()
-  const handle = apply(ctx, { dshHome: home, connectWaitMs: 100, onLog: () => {} })
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, connectWaitMs: 100, onLog: () => {} })
   await handle.boot
-  const svc = ctx.provided.get('dshVscodeKit').v
+  const svc = boundSvc(ctx)
 
   await assert.rejects(
     svc.request('vscode.openFile', { path: 'x' }),
@@ -456,8 +472,8 @@ test('无编辑器连接时 request 得到结构化 -32007，不静默挂起', a
 test('enabled:false 只注册服务不监听，request 得到 server-not-ready', async () => {
   const home = tempHome()
   const ctx = fakeCtx()
-  apply(ctx, { dshHome: home, enabled: false, onLog: () => {} })
-  const svc = ctx.provided.get('dshVscodeKit').v
+  apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, enabled: false, onLog: () => {} })
+  const svc = boundSvc(ctx)
   assert.equal(svc.ready, false)
   assert.equal(await svc.waitReady(100), false, 'enabled:false 时 waitReady 必须超时返回 false，不许挂住')
   await assert.rejects(
@@ -476,7 +492,7 @@ test('enabled:false 只注册服务不监听，request 得到 server-not-ready',
 test('provide 不得传 check 谓词（否则异步就绪的消费者永久 pending）', async () => {
   const home = tempHome()
   const ctx = fakeCtx()
-  const handle = apply(ctx, { dshHome: home, connectWaitMs: 100, onLog: () => {} })
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, connectWaitMs: 100, onLog: () => {} })
   const entry = ctx.provided.get('dshVscodeKit')
   assert.ok(entry, '服务必须注册')
   assert.equal(entry.check, undefined, 'provide 不应带 check，否则监听未就绪时消费者永远拿不到服务')

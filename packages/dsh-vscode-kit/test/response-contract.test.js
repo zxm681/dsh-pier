@@ -24,6 +24,22 @@ import {
   MIN_RESPONSE_EXPECTED, REGISTERED_METHODS, validateResponse,
 } from '../src/response-contract.js'
 
+/**
+ * 测试消费者身份（T38 白名单落地后，**写类调用必须来自已绑定身份的入口**）。
+ *
+ * 这一行不是"为了跑通而加的胶水"：它把既有 135 处调用点的身份显式化 ——
+ * 以前它们全都经 `ctx.provide` 出去的共享 facade，而那个 facade 现在**只能是 read**。
+ * 档位给到 `delete` 是为了让本文件继续测**它本来要测的那道门**（会话授权绑定 / 锚点 / 响应形状），
+ * 不被白名单挡在前面；白名单自己的用例在 `test/t38-whitelist.test.js`。
+ */
+const TEST_CONSUMER = 'dsh-kit-test'
+const TEST_CONSUMERS = { [TEST_CONSUMER]: 'delete' }
+const boundSvc = (ctx) => {
+  const shared = ctx.provided.get('dshVscodeKit').v
+  return shared.forPlugin(TEST_CONSUMER, { declared: 'delete' })
+}
+
+
 const HERE = dirname(fileURLToPath(import.meta.url))
 
 /** 四条能力的**合法**响应（形状逐字对照契约 §5.1 第 3 条表格 + bridge handler 的真实返回）。 */
@@ -569,9 +585,9 @@ function fakeCtx() {
 test('真 socket：对端回一条「既无 result 也无 error」的响应帧 → 消费者拿到 -32009', async () => {
   const home = tempHome()
   const ctx = fakeCtx()
-  const handle = apply(ctx, { dshHome: home, connectWaitMs: 50, onLog: () => {} })
+  const handle = apply(ctx, { consumers: TEST_CONSUMERS, dshHome: home, connectWaitMs: 50, onLog: () => {} })
   await handle.boot
-  const svc = ctx.provided.get('dshVscodeKit').v
+  const svc = boundSvc(ctx)
 
   const socket = createConnection({ port: handle.kit.server.port, host: '127.0.0.1' })
   const link = connect({

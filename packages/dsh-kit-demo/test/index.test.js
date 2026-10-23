@@ -16,19 +16,26 @@ test('插件形状：name / inject / apply 符合 DSH 插件契约', () => {
   assert.equal(typeof apply, 'function')
 })
 
-/** 假 kit：只暴露公开 API（request/notify/vscode/ready），验证 demo 不越界。 */
+/**
+ * 假 kit：只暴露公开 API（request/notify/vscode/ready/forPlugin），验证 demo 不越界。
+ * `forPlugin` 记录绑定参数 —— demo 必须显式声明身份与档位，这是 T38 白名单的入口契约。
+ */
 function fakeKit(handlers) {
   const calls = []
-  return {
+  const bindings = []
+  const kit = {
     calls,
+    bindings,
     ready: true,
     request: (m, p) => { calls.push([m, p]); return Promise.resolve({}) },
     notify: () => {},
+    forPlugin: (n, opts) => { bindings.push([n, opts]); return kit },
     vscode: {
       getSelection: async () => { calls.push(['getSelection']); return handlers.getSelection() },
       openFile: async (args) => { calls.push(['openFile', args]); return handlers.openFile(args) },
     },
   }
+  return kit
 }
 
 function fakeCtx(kit) {
@@ -95,4 +102,21 @@ test('demo 注册了 dshKitDemo 服务供别的插件使用', () => {
   const ctx = fakeCtx(fakeKit({ getSelection: () => ({}), openFile: () => ({}) }))
   apply(ctx, {})
   assert.ok(ctx.provided.has('dshKitDemo'))
+})
+
+test('demo 显式声明身份与档位：forPlugin("dsh-kit-demo", { declared: "read" })', () => {
+  const kit = fakeKit({ getSelection: () => ({}), openFile: () => ({}) })
+  apply(fakeCtx(kit), {})
+  // 白名单按插件名 × 最高档位判（契约 §6.2.8 第 3 条）：没名字 = 永远只能 read，
+  // 所以消费者必须自己报名字；档位如实声明成它真正用到的最高档。
+  assert.deepEqual(kit.bindings, [['dsh-kit-demo', { declared: 'read' }]])
+})
+
+test('旧版 kit 没有 forPlugin 时退回共享 facade，不崩也不静默提权', async () => {
+  const kit = fakeKit({ getSelection: () => ({ file: '/ws/a.js', text: 'x', isEmpty: false }), openFile: () => ({}) })
+  delete kit.forPlugin
+  const demo = apply(fakeCtx(kit), {})
+  const r = await demo.readSelection()
+  assert.equal(r.ok, true)
+  assert.equal(r.text, 'x')
 })

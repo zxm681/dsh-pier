@@ -14,3 +14,12 @@ work/t25-*
 work/t31-*
 work/t32-*
 work/t33-*
+work/t34-*
+work/t35-*
+work/t36-*
+work/t37-*
+work/t38-*
+work/t39-*
+work/t4[0-9]-*
+work/t41-*.mjs
+work/t4[0-9]-source-before.sha256

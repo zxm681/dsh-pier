@@ -338,10 +338,10 @@ test('★ T5 Q3 版本数字不相等时被拒（说明门只靠这一个整数�
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ★ Q4 删除 / 保存能力仍然不存在
+// ★ Q4 删除能力仍然不存在（保存已于 T39 落地，见 test/t39-save.test.js）
 // ─────────────────────────────────────────────────────────────────────────────
 
-test('★ T5 Q4 删除/保存能力不存在：save/deleteFile/getDocumentText 一律 -32005（可信 + 有 grant 也一样）', async () => {
+test('★ T5 Q4 删除/改名/写文件能力仍不存在：deleteFile/renameFile/writeFile/getDocumentText 一律 -32005', async () => {
   const e = env()
   try {
     // 前置：工作区可信、grant 有效 —— 授权与信任都拉满。
@@ -351,8 +351,11 @@ test('★ T5 Q4 删除/保存能力不存在：save/deleteFile/getDocumentText �
     })
     assert.equal(ok.applied, true)
 
+    // ① 仍然未实现的能力：给多少授权都是 -32005（「对端不支持」，不是「你没权限」）。
+    //    ★ T40 把 `vscode.deleteFile` 从这张名单里移走了（它现在是真能力，见 ②b）——
+    //    这张名单是"能力清单变了"的守门人，加能力的人必须回来改它，这是有意的摩擦。
     for (const method of [
-      'vscode.save', 'vscode.deleteFile', 'vscode.getDocumentText',
+      'vscode.getDocumentText',
       'vscode.renameFile', 'vscode.writeFile', 'fs.delete', 'bridge.save',
     ]) {
       const err = await expectCode(
@@ -362,14 +365,33 @@ test('★ T5 Q4 删除/保存能力不存在：save/deleteFile/getDocumentText �
       assert.equal(err.data.method, method)
     }
 
+    // ② `vscode.save`（T39 已实现）不再是 -32005：它现在是一条**写入类**能力，
+    //    没有 grant 时由绑定门拒（-32010）。这条是"能力清单变了"的可观测证据 ——
+    //    免得以后有人把它误加回"未实现"名单里。
+    const noGrant = await expectCode(
+      e.caps.dispatch('vscode.save', { file: e.abs }, { link: e.link }),
+      ERR.EDIT_NOT_BOUND, 'vscode.save 没有 grant 时必须 -32010（不是 -32005）',
+    )
+    assert.equal(noGrant.data.reason, 'no-grant')
+
+    // ②b `vscode.deleteFile`（T40 已实现，**不可逆**）同理：没有 grant ⇒ -32010。
+    //    顺序上看不出区别（门在 handler 之前），但这一点对删除格外重要：
+    //    拒发生在**弹确认框之前**，所以未授权的删除连"骚扰人一下"都做不到。
+    const delNoGrant = await expectCode(
+      e.caps.dispatch('vscode.deleteFile', { file: e.abs }, { link: e.link }),
+      ERR.EDIT_NOT_BOUND, 'vscode.deleteFile 没有 grant 时必须 -32010（不是 -32005）',
+    )
+    assert.equal(delNoGrant.data.reason, 'no-grant')
+
     // 能力清单与 handler 表里都没有它们；`CAPABILITIES` 是唯一对外声明源。
     assert.deepEqual([...CAPABILITIES], [
       'vscode.openFile', 'vscode.getSelection', 'vscode.getDiagnostics',
       'vscode.listOpenEditors', 'vscode.applyEdit', 'vscode.getDocumentState',
+      'vscode.save', 'vscode.deleteFile',
     ])
     const own = Object.keys(e.caps.handlers)
     assert.deepEqual(own.sort(), [...CAPABILITIES].sort(), 'handler 表与能力清单必须一一对应')
-    for (const method of ['save', 'deleteFile', 'writeFile', 'renameFile']) {
+    for (const method of ['vscode.writeFile', 'vscode.renameFile', 'deleteFile']) {
       assert.equal(Object.hasOwn(e.caps.handlers, method), false, `handlers 不得有 ${method}`)
     }
 

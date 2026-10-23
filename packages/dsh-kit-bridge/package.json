@@ -69,6 +69,12 @@
           "type": "boolean",
           "default": false,
           "description": "启动时在真实 VS Code 里跑一次能力自检，结果写到 ~/.dsh/dsh-vscode-kit/selftest-<pid>.json（仅供排障，默认关）。"
+        },
+        "dshKit.deleteConfirmTimeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 1000,
+          "description": "删除文件时等待人工确认的上限（毫秒）。超时后本次许可作废、文件不删，迟到的同意不会生效。改动需重载窗口。"
         }
       }
     }

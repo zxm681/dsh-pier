@@ -124,8 +124,12 @@ export function createConnector(deps) {
         link: ctx?.link ?? null,
         sessionId: g?.sessionId ?? null,
         windowId: g?.windowId ?? null,
+        // ★ T39：意图位跟着授权一起过来。**只存、不补默认值**（与 id/epoch 同一条原则）：
+        // DSH 没给 = 没有这个位 = `vscode.save` 对脏缓冲区默认拒（fail closed）。
+        allowDirtySave: g?.allowDirtySave,
       })
-      log(`edit grant adopted (id ${String(record.id).slice(0, 8)}…)`, 'info')
+      log(`edit grant adopted (id ${String(record.id).slice(0, 8)}…`
+        + `${record.allowDirtySave ? ', allowDirtySave' : ''})`, 'info')
       return { ok: true, id: record.id }
     },
     /**

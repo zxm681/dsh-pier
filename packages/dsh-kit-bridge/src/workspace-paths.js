@@ -169,6 +169,10 @@ function stripLongPrefix(p) {
  * @param {object} [opts]
  * @param {typeof fsSync} [opts.fs] 注入 fs（测试用；默认真 fs）
  * @param {string} [opts.method]    报错里带的方法名
+ * @param {string} [opts.nonFileReason] 目标存在但**不是普通文件**时 `data.reason` 的取值
+ *   （默认 `'not-a-file'`）。`vscode.deleteFile` 传 `'recursive-delete-unsupported'`：
+ *   契约 §6.2.4 ③ 要求删除对目录给专用理由 —— 处置不同（`not-a-file` = "这里只能写文件"，
+ *   `recursive-delete-unsupported` = "删除只做单个文件，要删目录请自己动手"）。
  * @returns {{abs: string, real: string, root: string}} abs=规范化后的对外路径，
  *   real=真实路径（已证明与 abs 逐段同名），root=**字面**工作区根（已证明链上无链接）
  * @throws {BridgeError} -32602 路径不合法/越界/是链接/多根；-32003 文件不存在
@@ -254,7 +258,7 @@ export function resolveWorkspaceFile(file, roots, opts = {}) {
     throw new BridgeError(ERR.NOT_FOUND, `file not found: ${abs}`, { method, path: abs })
   }
   if (typeof st.isFile === 'function' && !st.isFile()) {
-    throw outsideError(method, abs, 'not-a-file')
+    throw outsideError(method, abs, opts.nonFileReason ?? 'not-a-file')
   }
 
   // root 用**字面根**：它已被证明链上无链接，等价于「可信物理根」；

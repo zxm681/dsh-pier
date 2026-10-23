@@ -7,11 +7,12 @@
  */
 
 import * as vscode from 'vscode'
-import { writeFileSync, mkdirSync, readFileSync } from 'node:fs'
+import { existsSync, writeFileSync, mkdirSync, readFileSync, statSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
+import { ERR, ERR_NAME } from '../../dsh-vscode-kit/src/protocol.js'
 import { createDispatcher } from './vscode-host.js'
 import { createConnector } from './connector.js'
 
@@ -19,7 +20,7 @@ import { createConnector } from './connector.js'
 const ctx = { connector: null, output: null }
 
 /** 这些配置键改变后必须重建扩展宿主（改 dshHome / 轮询间隔需要新连接器）。 */
-const RESTART_KEYS = ['dshHome', 'pollIntervalMs']
+const RESTART_KEYS = ['dshHome', 'pollIntervalMs', 'deleteConfirmTimeoutMs']
 
 function readConfig() {
   const cfg = vscode.workspace.getConfiguration('dshKit')
@@ -28,6 +29,8 @@ function readConfig() {
     dshHome: cfg.get('dshHome', '') || undefined,
     pollIntervalMs: cfg.get('pollIntervalMs', 2000),
     selfTestOnStart: cfg.get('selfTestOnStart', false),
+    // T40：删除的人工确认超时（§7 #5 的独立长超时）。0/缺省 = 交给能力层默认 120s。
+    deleteConfirmTimeoutMs: cfg.get('deleteConfirmTimeoutMs', 120000),
   }
 }
 
@@ -158,6 +161,10 @@ async function runSelfTest(dispatch, { grants } = {}) {
         range: { start: { line: 2, column: 1 }, end: { line: 2, column: 6 } },
         text: 'DSH!!',
         expectedVersion,
+        // T35 起化身无条件必填：自检也得给，否则它先栽在锚点形状门（-32602），
+        // 根本走不到这一刀真正要验的版本冲突。2026-10-22 那次真机 PASS 之后 T35 落地，
+        // 这一步就一直红着，本轮 T39 复跑真机才发现。
+        expectedIncarnation: state.incarnation,
         grant,
       }, { link })
     } catch (err) {
@@ -183,6 +190,229 @@ async function runSelfTest(dispatch, { grants } = {}) {
     }
     if (!evidence.nothingWritten) throw new Error('stale write landed: DSH!! is in the buffer')
     if (!evidence.versionUnchangedByRefusedWrite) throw new Error('the refused write still bumped the version')
+    return evidence
+  })
+
+  // 4) T39：**真实落盘**（`vscode.save`）。这一刀单测和 E2E 都证明不了：
+  //    真 `document.save()`、真 `statSync`、真保存参与者。判据是「返回值等于保存后
+  //    的真值」而不是「跑通了」，所以两件坏事都会被抓到：
+  //      · 返回体回显 `expectedDisk`（而不是重新 stat）→ `returnedDisk !== actualAfter`
+  //      · 磁盘锚点门被绕过 → 第二次过期锚点调用**成功**（拿不到 -32013）
+  await step('save:diskAnchor', async () => {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath
+    if (!root) return { skipped: 'no workspace folder open (writes must land inside a trusted root)' }
+    if (!vscode.workspace.isTrusted) return { skipped: 'workspace not trusted' }
+
+    const file = join(root, `dsh-selftest-save-${process.pid}.txt`)
+    writeFileSync(file, 'alpha\nbeta\n', 'utf8')
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file))
+    const editor = await vscode.window.showTextDocument(doc, { preserveFocus: true, preview: true })
+
+    // ① 锚点：版本/化身走消费者同一条路（getDocumentState），磁盘锚点走真 stat
+    const state = await dispatch('vscode.getDocumentState', { file })
+    const st = statSync(file)
+    const expectedDisk = { mtime: Math.floor(st.mtimeMs), size: st.size }
+
+    // ② 人工改缓冲区 → 脏（意图门的输入）
+    const edited = await editor.edit((b) => b.insert(new vscode.Position(0, 0), 'DSH-SAVED '))
+    const versionAfterEdit = doc.version
+
+    // ③ 授权：`allowDirtySave` 只长在 grant 上（放 params 等于自己给自己授权）
+    const grant = { id: randomBytes(16).toString('hex'), epoch: randomBytes(16).toString('hex') }
+    const link = { name: 'selftest-save-link' }
+    grants?.adopt({ id: grant.id, epoch: grant.epoch, link, allowDirtySave: true })
+
+    const res = await dispatch('vscode.save', {
+      file,
+      expectedVersion: versionAfterEdit,
+      expectedIncarnation: state.incarnation,
+      expectedDisk,
+      grant,
+    }, { link })
+
+    const after = statSync(file)
+    const actualAfter = { mtime: Math.floor(after.mtimeMs), size: after.size }
+    const diskText = readFileSync(file, 'utf8')
+    const evidence = {
+      expectedDisk,
+      returnedDisk: res.disk,
+      actualAfter,
+      saved: res.saved,
+      dirtyBefore: res.dirtyBefore,
+      versionBefore: state.version,
+      versionAfterEdit,
+      bufferEdited: edited === true,
+      sizeChanged: actualAfter.size !== expectedDisk.size,
+      mtimeChanged: actualAfter.mtime !== expectedDisk.mtime,
+      diskTextHasMarker: diskText.includes('DSH-SAVED '),
+    }
+    if (res.saved !== true) throw new Error(`expected saved:true, got ${String(res.saved)}`)
+    if (res.disk?.mtime !== actualAfter.mtime || res.disk?.size !== actualAfter.size) {
+      throw new Error(`returned disk is not the post-save stat truth: ${JSON.stringify(res.disk)} vs ${JSON.stringify(actualAfter)}`)
+    }
+    if (!evidence.sizeChanged) throw new Error('disk size did not change after save')
+    if (!evidence.diskTextHasMarker) throw new Error('saved bytes do not contain the edited buffer content')
+    if (res.dirtyBefore !== true) throw new Error('dirtyBefore must be true (the buffer was edited before save)')
+
+    // ④ 故意用**过期磁盘锚点**复跑：必须 -32013，且文件一个字节都不许动
+    const bytesBefore = readFileSync(file)
+    const statBefore = statSync(file)
+    let staleCode = null
+    let staleData = null
+    try {
+      await dispatch('vscode.save', {
+        file,
+        expectedVersion: doc.version,
+        expectedIncarnation: state.incarnation,
+        expectedDisk,
+        grant,
+      }, { link })
+    } catch (err) {
+      staleCode = err?.code ?? null
+      staleData = err?.data ?? null
+    }
+    const bytesAfter = readFileSync(file)
+    const statAfter = statSync(file)
+    const staleRetry = {
+      code: staleCode,
+      name: ERR_NAME[staleCode] ?? null,
+      reason: staleData?.reason ?? null,
+      expected: staleData?.expected ?? null,
+      actual: staleData?.actual ?? null,
+      mtimeUnchanged: statAfter.mtimeMs === statBefore.mtimeMs,
+      sizeUnchanged: statAfter.size === statBefore.size,
+      bytesUnchanged: bytesAfter.equals(bytesBefore),
+    }
+    if (staleCode !== -32013) {
+      throw new Error(`expected -32013 for a stale disk anchor, got ${String(staleCode)} (${JSON.stringify(staleData)})`)
+    }
+    if (!staleRetry.bytesUnchanged) throw new Error('stale save modified the file on disk')
+    return { ...evidence, staleRetry }
+  })
+
+  // 5) T40：**真实删除**（`vscode.deleteFile`）。这是本项目的第一个不可逆操作，
+  //    单测与 E2E 都用假宿主，证明不了这三件事：真确认框真的会拦住人、真
+  //    `workspace.fs.delete(uri,{useTrash:true})` 真的把文件从盘上拿走、
+  //    走完回收站之后我们**仍然**只能说 `trashed:'unknown'`。
+  //    ⚠️ 只删本步骤自己刚造出来的 fixture（工作区根下 `dsh-selftest-delete-*`）：
+  //       真机验证绝不许碰仓库里任何既有文件。
+  await step('delete:confirm', async () => {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath
+    if (!root) return { skipped: 'no workspace folder open (deletes must land inside a trusted root)' }
+    if (!vscode.workspace.isTrusted) return { skipped: 'workspace not trusted' }
+
+    const file = join(root, `dsh-selftest-delete-accept-${process.pid}.txt`)
+    writeFileSync(file, 'delete me\nsecond line\n', 'utf8')
+    // 打开它：人要能看见"要删的是这个"才谈得上同意。
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file))
+    await vscode.window.showTextDocument(doc, { preserveFocus: true, preview: true })
+
+    const state = await dispatch('vscode.getDocumentState', { file })
+    const st = statSync(file)
+    const expectedDisk = { mtime: Math.floor(st.mtimeMs), size: st.size }
+    const grant = { id: randomBytes(16).toString('hex'), epoch: randomBytes(16).toString('hex') }
+    const link = { name: 'selftest-delete-link' }
+    grants?.adopt({ id: grant.id, epoch: grant.epoch, link })
+
+    // ★ 人在这里点"删除"（模态，超时 120s）。这一行会真的等一个人。
+    const startedAt = Date.now()
+    let res = null
+    let failure = null
+    try {
+      res = await dispatch('vscode.deleteFile', {
+        file,
+        expectedVersion: state.version,
+        expectedIncarnation: state.incarnation,
+        expectedDisk,
+        grant,
+      }, { link })
+    } catch (err) {
+      failure = err
+    }
+    const waitedMs = Date.now() - startedAt
+    const evidence = {
+      file,
+      waitedMs,
+      beforeStat: expectedDisk,
+      existsAfter: existsSync(file),
+      result: res ?? null,
+      error: failure
+        ? {
+            code: failure.code ?? null,
+            name: ERR_NAME[failure.code] ?? null,
+            reason: failure.data?.reason ?? null,
+            message: failure.message,
+          }
+        : null,
+    }
+    if (failure) {
+      throw new Error(`real delete failed: ${String(failure.code)} `
+        + `${String(failure.data?.reason ?? '')} ${failure.message}`)
+    }
+    if (res.deleted !== true) throw new Error(`expected deleted:true, got ${String(res.deleted)}`)
+    // ★ 唯一诚实的取值：`useTrash` 是 "whenever possible"，扩展侧没有 Trash 能力位可探。
+    if (res.trashed !== 'unknown') {
+      throw new Error(`trashed must be 'unknown', got ${JSON.stringify(res.trashed)}`)
+    }
+    if (evidence.existsAfter) throw new Error('the file still exists after a reported delete')
+    if (typeof res.snapshot?.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(res.snapshot.sha256)) {
+      throw new Error(`snapshot.sha256 missing/malformed: ${JSON.stringify(res.snapshot)}`)
+    }
+    return evidence
+  })
+
+  // 6) T40：**取消确认**也必须真机走一遍 —— 这是 `-32002` 在项目里第一次真正被抛出，
+  //    "人拒绝了所以什么都没发生"只有真文件还在才算证明（假宿主的"还在"是假话）。
+  await step('delete:decline', async () => {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath
+    if (!root) return { skipped: 'no workspace folder open' }
+    if (!vscode.workspace.isTrusted) return { skipped: 'workspace not trusted' }
+
+    const file = join(root, `dsh-selftest-delete-cancel-${process.pid}.txt`)
+    const text = 'keep me\nthis one must survive\n'
+    writeFileSync(file, text, 'utf8')
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file))
+    await vscode.window.showTextDocument(doc, { preserveFocus: true, preview: true })
+
+    const state = await dispatch('vscode.getDocumentState', { file })
+    const st = statSync(file)
+    const expectedDisk = { mtime: Math.floor(st.mtimeMs), size: st.size }
+    const grant = { id: randomBytes(16).toString('hex'), epoch: randomBytes(16).toString('hex') }
+    const link = { name: 'selftest-delete-decline-link' }
+    grants?.adopt({ id: grant.id, epoch: grant.epoch, link })
+
+    // ★ 人在这里点"取消"（或关掉对话框）。
+    let code = null
+    let detail = null
+    try {
+      await dispatch('vscode.deleteFile', {
+        file,
+        expectedVersion: state.version,
+        expectedIncarnation: state.incarnation,
+        expectedDisk,
+        grant,
+      }, { link })
+    } catch (err) {
+      code = err?.code ?? null
+      detail = err?.data ?? null
+    }
+    const stillThere = existsSync(file)
+    const textAfter = stillThere ? readFileSync(file, 'utf8') : null
+    const evidence = {
+      file,
+      code,
+      name: ERR_NAME[code] ?? null,
+      reason: detail?.reason ?? null,
+      mayHaveApplied: detail?.mayHaveApplied ?? null,
+      stillThere,
+      bytesIntact: textAfter === text,
+    }
+    if (code !== ERR.DECLINED) {
+      throw new Error(`expected -32002 declined after cancelling, got ${String(code)} `
+        + `(${JSON.stringify(detail)})`)
+    }
+    if (!stillThere) throw new Error('the declined delete removed the file anyway')
+    if (!evidence.bytesIntact) throw new Error('the declined delete changed the file content')
     return evidence
   })
 
@@ -213,7 +443,7 @@ export function activate(context) {
 
   // 授权表与"当前活连接"共享槽都由 dispatcher 建：能力层（执行前复核）与连接层
   // （收 bridge.grant / 断线置失效）**必须共用同一份**，否则判定与状态各说各话。
-  const { dispatch, capabilities, grants, linkState } = createDispatcher(output)
+  const { dispatch, capabilities, grants, linkState } = createDispatcher(output, { deleteConfirmTimeoutMs: readConfig().deleteConfirmTimeoutMs })
   log(`capabilities: ${capabilities.join(', ')}`)
 
   const connector = createConnector({

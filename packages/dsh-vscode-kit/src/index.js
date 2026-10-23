@@ -21,6 +21,7 @@ import {
   judgeGrant, judgeSession, dshWriteGate, editNotBoundError, rejectParamsSessionId,
   assertWritableNotNotified,
 } from './grant.js'
+import { Whitelist, UNBOUND_CONSUMER, HOST_CONSUMER } from './whitelist.js'
 
 /** cordis 插件名，必须与 package.json 的 name 一致。 */
 export const name = 'dsh-vscode-kit'
@@ -158,6 +159,69 @@ function assertLocalExpectedIncarnation(method, params) {
 }
 
 /**
+ * 归一化 `vscode.save` 的两种调用形态（T39）：
+ *   `save(file, { expectedVersion, expectedIncarnation, expectedDisk, grant?, timeoutMs? })`
+ *   `save({ file, expectedVersion, expectedIncarnation, expectedDisk, grant? }, opts?)`
+ *
+ * 与 `normalizeApplyEditArgs` 同一条理由：锚点是**请求参数**，不是传输选项 ——
+ * 留在 opts 里就等于宿主根本收不到（T30 的 `includeText` 踩过一次）。`timeoutMs` /
+ * `waitForEditor` / `sessionId` 这类传输选项继续走 opts。
+ *
+ * ★ T40：`vscode.deleteFile` **复用本函数**。它的锚点字段全集与 `vscode.save` 完全相同
+ * （双锚点 + 磁盘锚点 + grant），复制一份只会让两处慢慢漂移；名字带 save 是历史，判定
+ * 是"哪些字段属于请求参数"，与具体能力无关。
+ */
+function normalizeSaveArgs(args) {
+  const first = args[0]
+  if (typeof first === 'string') {
+    const opts = isPlainObject(args[1]) ? args[1] : {}
+    const params = { file: first }
+    for (const k of SAVE_ANCHOR_FIELDS) if (opts[k] !== undefined) params[k] = opts[k]
+    return { params, opts }
+  }
+  const params = isPlainObject(first) ? { ...first } : {}
+  const opts = isPlainObject(args[1]) ? args[1] : {}
+  for (const k of SAVE_ANCHOR_FIELDS) {
+    if (params[k] === undefined && opts[k] !== undefined) params[k] = opts[k]
+  }
+  return { params, opts }
+}
+
+/**
+ * 「落盘必须有磁盘锚点」的本地闸门（T39 / 契约 §6.2.3）—— 与版本/化身闸门同族：
+ * 在这里抛 = 一个字节都没发出去，宿主零调用。
+ *
+ * 形状固定 `{mtime, size}`，两个非负整数：
+ *  - 缺 / 不是对象 / 字段类型不对 → 各自一个 `reason`，**不回显值**（错误 data 会进日志）；
+ *  - 整数与 `>= 0` 一起判：`NaN`、`Infinity`、浮点毫秒进来都会让"等值比较"变成
+ *    "永远不等"（看起来像磁盘一直在变，实际是参数算错了）。
+ *
+ * @param {string} method
+ * @param {object} params
+ * @throws {BridgeError} ERR.INVALID_PARAMS（`data.stage === 'local'`）
+ */
+function assertLocalExpectedDisk(method, params) {
+  const v = params?.expectedDisk
+  let reason = null
+  if (v === undefined) reason = 'expected-disk-missing'
+  else if (!isPlainObject(v)) reason = 'expected-disk-not-an-object'
+  else {
+    for (const key of ['mtime', 'size']) {
+      const n = v[key]
+      if (typeof n !== 'number') { reason = `expected-disk-${key}-not-a-number`; break }
+      if (!Number.isInteger(n) || n < 0) { reason = `expected-disk-${key}-not-a-non-negative-integer`; break }
+    }
+  }
+  if (reason === null) return
+  const action = method === 'vscode.deleteFile' ? 'delete' : 'save'
+  throw new BridgeError(ERR.INVALID_PARAMS,
+    `${method} requires the disk anchor: pass expectedDisk = {mtime, size} `
+    + '(integer mtime in ms and byte size) — the values you observed on disk just now. '
+    + `Refusing to send a ${action} that cannot tell "the bytes I saw" from "bytes someone changed".`,
+    { method, reason, stage: 'local', got: { type: typeof v } })
+}
+
+/**
  * 调用方上下文里的会话身份（`opts.sessionId`）。
  *
  * 唯一可信来源是**调用方自己的 DSH 上下文**，不是线路数据：`params.sessionId` 由
@@ -184,6 +248,31 @@ function isPlainObject(v) {
  * 宿主收不到，那就等于这道门从来没开过。真机踩过同一形态的坑（`includeText`，T30）。
  */
 const ANCHOR_FIELDS = ['expectedVersion', 'expectedIncarnation', 'expectedRangeText', 'grant']
+
+/**
+ * `vscode.save` 的锚点字段 = 双锚点 + **磁盘锚点**（T39 / 契约 §6.2.3）。
+ *
+ * 单列一份而不是往 `ANCHOR_FIELDS` 里加 `expectedDisk`：那是 `applyEdit` 的白名单，
+ * 往里塞一个 `applyEdit` 根本不用的字段，会让"这里列的就是写锚点全集"这句话变模糊。
+ */
+const SAVE_ANCHOR_FIELDS = [...ANCHOR_FIELDS, 'expectedDisk']
+
+/**
+ * `vscode.deleteFile` 请求的**线路**超时（T40 / 契约 §7 #5(b)）。
+ *
+ * 为什么删除要一条自己的长超时，而不是沿用 `DEFAULT_TIMEOUT_MS = 30s`：
+ * 这条请求**中间夹着一个人**。执行端弹 modal、等人点"删除"，30s 到点会拒绝一次完全
+ * 正常的操作 —— 而"人反应慢"与"通道坏了"必须分辨清楚（后者才该快速失败）。
+ *
+ * 为什么是 180s 而不是跟执行端的确认超时一样 120s：这里要比对端**宽**。对端 120s 到期
+ * 会回 `-32004 reason:'confirm-timeout'`（一个能读懂、说明"许可作废、文件没删"的错误）；
+ * 如果本端先超时，调用方只会拿到一个光秃秃的 `-32004 request timed out`，**分不清**
+ * "人没点"与"连接断了"。留 60s 余量让对端那个更具体的错误先到。
+ *
+ * ⚠️ 推论（写在这里免得以后被当成 bug）：`dshKit.deleteConfirmTimeoutMs` 若配到
+ * ≥180s，本端会先超时，`reason:'confirm-timeout'` 就看不到了 —— 两者要一起调。
+ */
+export const DELETE_REQUEST_TIMEOUT_MS = 180_000
 
 /**
  * 归一化 `applyEdit` 的两种调用形态。
@@ -244,13 +333,97 @@ function withDocStateFields(params, opts) {
 }
 
 /**
+ * 是不是协商通道方法（`bridge.*`）。
+ *
+ * `bridge.ping` / `bridge.hello` / `bridge.grant` / `bridge.grantRevoke` / `bridge.setTrust`…
+ * 是**协议自身的协商面**，不是编辑器能力：把它们纳入白名单只会让"未绑定身份的插件
+ * 连 hello 都发不出去"，而 §6.2.5 收口的是「拿到服务就能调任何 `vscode.*`」。
+ */
+function isBridgeMethod(method) {
+  return typeof method === 'string' && method.startsWith('bridge.')
+}
+
+/**
+ * 造一个**身份已绑定**的 facade（`kit.forPlugin(name, { declared })` 的返回值）。
+ *
+ * 形状与 `ctx.provide` 出去的那个 facade 完全一致（铁律 2：方法必须稳定存在），
+ * 区别只有一个：每个方法都把**这个身份**作为第 4 个实参传下去，调用方改不了。
+ * `snapshot` / `waitReady` / `editing` 全部委托给宿主 facade
+ * （授权面不随插件身份变化 —— 谁能 `grant()` 由持有 kit 实例的那一方决定，那不是插件）。
+ *
+ * @param {() => any} getKit 取实例（未就绪时返回 null）
+ * @param {{name: string, declared: string, source: string}} consumer
+ * @param {any} host 宿主 facade（提供 ready / waitReady / snapshot / editing）
+ */
+function boundFacade(getKit, consumer, host) {
+  const readyErr = (method) => new BridgeError(ERR.DISCONNECTED,
+    'dsh-vscode-kit is not listening yet', { method, reason: 'server-not-ready' })
+  const request = (method, params, opts) => {
+    const kit = getKit()
+    return kit
+      ? kit.request(method, params, opts, consumer)
+      : Promise.reject(readyErr(method))
+  }
+  const read = (method) => (params, opts) => request(method, params, opts)
+  const facade = {
+    /** 这个 facade 绑的是谁（诊断用；不是判据）。 */
+    consumer: { ...consumer },
+    get ready() { return host.ready },
+    waitReady: (timeoutMs) => host.waitReady(timeoutMs),
+    get editing() { return host.editing },
+    get vscode() {
+      return {
+        openFile: read('vscode.openFile'),
+        getSelection: read('vscode.getSelection'),
+        getDiagnostics: read('vscode.getDiagnostics'),
+        listOpenEditors: read('vscode.listOpenEditors'),
+        // 写入类：**唯一**入口是实例上的 `applyEditAs` —— 本地锚点门（版本 / 化身 / 来源）
+        // 与普通调用共用同一份实现，绑身份只多做一件事：把 consumer 盖进 opts。
+        applyEdit: (...args) => {
+          const kit = getKit()
+          return kit ? kit.applyEditAs(consumer, args) : Promise.reject(readyErr('vscode.applyEdit'))
+        },
+        getDocumentState: (...args) => {
+          const { params, opts } = normalizeDocStateArgs(args)
+          return request('vscode.getDocumentState', params, opts)
+        },
+        // 落盘（T39）：与 `applyEdit` 同一条路 —— 本地闸门共用 `saveAs`，
+        // 绑身份只多做一件事：把 consumer 盖进 request 的第 4 个实参。
+        save: (...args) => {
+          const kit = getKit()
+          return kit ? kit.saveAs(consumer, args) : Promise.reject(readyErr('vscode.save'))
+        },
+        // 归档（T40 / Tier 4；T44 起语义是**移入隔离区，永不删**）：与 `save` 同一条路。
+        // **不可逆的是"移动"，不是"销毁"** —— 所以本端要多做一件事：线路超时垫长到 180s
+        // （要盖住人看确认框的时间）。返回体里没有 `deleted`/`trashed`：这条能力不销毁
+        // 任何字节（想让文件回来，人自己去 `.dsh-quarantine/` 挪回原位，没有 `restore` 入口）。
+        deleteFile: (...args) => {
+          const kit = getKit()
+          return kit ? kit.deleteFileAs(consumer, args) : Promise.reject(readyErr('vscode.deleteFile'))
+        },
+      }
+    },
+    request,
+    notify: (method, params) => {
+      const kit = getKit()
+      if (!kit) throw readyErr(method)
+      return kit.notify(method, params, consumer)
+    },
+    snapshot: () => host.snapshot(),
+  }
+  // 再绑一层没有意义（身份已经定了），但"方法必须稳定存在"（铁律 2）：返回自己。
+  facade.forPlugin = () => facade
+  return facade
+}
+
+/**
  * 消费者拿到的服务对象。
  *
  * 只暴露两个入口：request（万能）与 vscode（糖衣）。其余字段以 `_` 前缀标为内部，
  * 消费者插件不该碰，但排障时可读。
  */
 class VscodeKit {
-  constructor({ server, dshVersion, connectWaitMs, helloWaitMs, grantAckTimeoutMs, onLog }) {
+  constructor({ server, dshVersion, connectWaitMs, helloWaitMs, grantAckTimeoutMs, onLog, whitelist }) {
     this.server = server
     this.dshVersion = dshVersion
     this.connectWaitMs = connectWaitMs
@@ -260,6 +433,17 @@ class VscodeKit {
       ? grantAckTimeoutMs
       : DEFAULT_GRANT_ACK_TIMEOUT_MS
     this.onLog = onLog
+
+    /**
+     * per-plugin 能力白名单（契约 §6.2.5）。**唯一判定点**在 `_assertConsumer()`，
+     * 由 `request()` / `notify()` 在发线路之前调用；配置由 `apply()` 从 cordis 传进来
+     * （本库不读文件，铁律 3 零依赖）。
+     *
+     * 类直构（`new VscodeKit(...)`，测试与 E2E 用）没有配置可传：那就一个消费者都不登记，
+     * 而它自己的调用走 `HOST_CONSUMER` 通道（owner，不受配置约束） —— 这正是"宿主不是插件"
+     * 的边界，见 `whitelist.js` 里 `HOST_CONSUMER` 的论证。
+     */
+    this.whitelist = whitelist ?? new Whitelist(undefined, { onLog })
 
     // 这里**故意没有** lastEditor 槽：对端身份（协议版本 / 能力清单）挂在
     // 「这条连接」自己身上（`link.editor`，由 protocol.js 的 `ctx.link` 落位），
@@ -312,25 +496,10 @@ class VscodeKit {
       //   applyEdit({ file, range, text, expectedVersion, expectedRangeText?, grant }, opts?)
       // 写成 `async` 是有意的：让"本地拒绝"与"对端拒绝"都表现为**被拒的 Promise**，
       // 调用方只需一种处理方式（否则一半要 try/catch、一半要 .catch，总会有人漏）。
-      applyEdit: async (...args) => {
-        const { params, opts } = normalizeApplyEditArgs(args)
-        assertLocalExpectedVersion('vscode.applyEdit', params)
-        // ★ T34：锚点的**另一半**——文档实例身份，以及"这个锚点是从哪读的"。
-        // 三个本地闸门，顺序有意：形状 → 必填 → 来源（最贵的放最后）。
-        // 都在 request() 之前 ⇒ 抛在这里 = 一个字节都没发出去（与 expectedVersion 同族）。
-        // ★ T35：必填**不再看对端公告**（原先 `required: this._peerRequiresIncarnation(...)`）
-        //   —— 公告不是强制条件，"对端一沉默本端就少判一半"正是 H1 的形态。
-        //   真正的兜底在 `request()` 的写分支里（raw request 走的是那条路），
-        //   这里是同一判据的**更早一道**（糖衣调用方不必先摸到发送路径才看到错误）。
-        const sessionId = readSessionId(opts)
-        const bound = this._bindWriteTarget(params, sessionId)
-        assertLocalExpectedIncarnation('vscode.applyEdit', params)
-        this._assertAnchorSource('vscode.applyEdit', params, {
-          link: bound.link,
-          sessionId,
-        })
-        return this.request('vscode.applyEdit', params, opts)
-      },
+      // 类实例自己的糖衣 = **宿主通道**（`HOST_CONSUMER`）。插件永远拿不到实例，
+      // 它拿到的是 `ctx.provide` 出去的 facade 或 `forPlugin()` 绑定的 facade —— 那两个
+      // 各自带着自己的身份调 `applyEditAs()`。实现在下面那一个方法里，只有一份。
+      applyEdit: (...args) => this.applyEditAs(HOST_CONSUMER, args),
       // 读取版本号（写入锚点的读侧）。同样是双形态：
       //   getDocumentState(file, { includeText?, timeoutMs? })
       //   getDocumentState({ file, includeText? }, opts?)
@@ -338,6 +507,136 @@ class VscodeKit {
         const { params, opts } = normalizeDocStateArgs(args)
         return this.request('vscode.getDocumentState', params, opts)
       },
+      // Tier 3 落盘（T39）。与 applyEdit 同构：本地闸门在**发送之前**，实现在 saveAs 一处。
+      //   save(file, { expectedVersion, expectedIncarnation, expectedDisk, grant?, ... })
+      //   save({ file, expectedVersion, expectedIncarnation, expectedDisk, grant? }, opts?)
+      save: (...args) => this.saveAs(HOST_CONSUMER, args),
+      // Tier 4 删除（T40）：形态与 `save` 完全一致（同一套本地闸门 + 同一组锚点），
+      // 区别只在**执行端多两道闸**（人工确认 + 内容快照）与**请求级超时更宽**。
+      //   deleteFile(file, { expectedVersion, expectedIncarnation, expectedDisk, grant?, timeoutMs? })
+      //   deleteFile({ file, expectedVersion, expectedIncarnation, expectedDisk, grant? }, opts?)
+      // 不可逆：不保证进回收站、不提供撤销、不支持目录/递归。
+      deleteFile: (...args) => this.deleteFileAs(HOST_CONSUMER, args),
+    }
+
+    /**
+     * `vscode.applyEdit` 的**唯一实现**（三个入口共用）。
+     *
+     * 三个入口只是"身份不同"：
+     *  - 类实例的糖衣 → `HOST_CONSUMER`（owner 通道，E2E 与类直构单测走这条）；
+     *  - `forPlugin()` 绑定的 facade → 该插件的身份；
+     *  - `ctx.provide` 出去的 facade → `UNBOUND_CONSUMER`（天花板 `read`，写必拒）。
+     *
+     * 本地闸门一字不差地留在这里（而不是抄到每个入口）：
+     * 版本锚点 → 绑定写目标 → 化身锚点 → 锚点来源，判在发送之前 ⇒ 抛在这里 = 一个字节都没发出去。
+     * ★ T35：化身必填**不再看对端公告**（原 `required: this._peerRequiresIncarnation(...)`）
+     *   —— 公告不是强制条件，"对端一沉默本端就少判一半"正是 H1 的形态；真正的兜底在
+     *   `request()` 的写分支里（raw request 走那条路），这里是同一判据的**更早一道**。
+     *
+     * @param {{name: string|null, declared: string, source: string}} consumer 由入口决定，调用方改不了
+     * @param {any[]} args `applyEdit(...)` 的原始实参（位置形态 / 对象形态都支持）
+     */
+    // 写成实例属性（不是 class 方法）是**故意的**：它紧挨着 `this.vscode` 定义，
+    // 而糖衣 `applyEdit` 就是它的一行转发 —— 放在一起才不会漂移。
+    this.applyEditAs = async (consumer, args) => {
+      const { params, opts } = normalizeApplyEditArgs(args)
+      assertLocalExpectedVersion('vscode.applyEdit', params)
+      // 三个本地闸门，顺序有意：形状 → 必填 → 来源（最贵的放最后）。
+      const sessionId = readSessionId(opts)
+      const bound = this._bindWriteTarget(params, sessionId)
+      assertLocalExpectedIncarnation('vscode.applyEdit', params)
+      this._assertAnchorSource('vscode.applyEdit', params, {
+        link: bound.link,
+        sessionId,
+      })
+      return this.request('vscode.applyEdit', params, opts, consumer)
+    }
+
+    /**
+     * `vscode.save` 的**唯一实现**（三个入口共用，T39 / 契约 §6.2.1 Tier 3）。
+     *
+     * 本地闸门（发送之前，抛在这里 = 宿主零调用、线上一字节没有）：
+     *  ① `expectedVersion` 形状 → ② 绑定写目标（会话 → grant 记录 → 连接）→
+     *  ③ `expectedIncarnation` 形状 → ④ `expectedDisk` 形状 → ⑤ 锚点来源。
+     *
+     * ★ **意图位不在这里读**：`allowDirtySave` 只长在 grant 记录上（`editing.grant` 发放时
+     *   定型、`bridge.grant` 投递给执行端），**不接受** `params.allowDirtySave`。放进来
+     *   就等于调用方自己给自己授权（契约 §6.2.2 的结论）—— 而且我们连读都不读它，
+     *   免得"没生效但看起来被接受了"。
+     *
+     * 本地闸门之外还有：白名单（`request()` 第一步，`vscode.save` = `disk-write`）、
+     * 双锚点（`request()` 写分支再判一次）、绑定门（DSH 侧 `_writeGate` + 执行端复核）。
+     * 这道门是"更早、更清楚"的那一道，不是唯一一道。
+     *
+     * @param {{name: string|null, declared: string, source: string}} consumer 由入口决定
+     * @param {any[]} args `save(...)` 的原始实参（位置形态 / 对象形态都支持）
+     */
+    this.saveAs = async (consumer, args) => {
+      const { params, opts } = normalizeSaveArgs(args)
+      assertLocalExpectedVersion('vscode.save', params)
+      const sessionId = readSessionId(opts)
+      const bound = this._bindWriteTarget(params, sessionId)
+      assertLocalExpectedIncarnation('vscode.save', params)
+      assertLocalExpectedDisk('vscode.save', params)
+      this._assertAnchorSource('vscode.save', params, {
+        link: bound.link,
+        sessionId,
+      })
+      return this.request('vscode.save', params, opts, consumer)
+    }
+
+    /**
+     * `vscode.deleteFile` 的**唯一实现**（三个入口共用，T40 / 契约 §6.2.1 Tier 4）。
+     *
+     * 名字是历史包袱，语义是 T44 裁决的"**移入隔离区，永不删**"：它把目标 rename 进
+     * 工作区根下的 `.dsh-quarantine/` 并把归档后的实测 sha256 交回来。
+     *
+     * 本地闸门与 `saveAs` **同一套、同顺序**（① 版本 → ② 绑定写目标 → ③ 化身 →
+     * ④ 磁盘锚点 → ⑤ 锚点来源）：移动是比落盘更狠的动作，没有理由在发送前比它更松。
+     * 抛在这里 = 宿主零调用、线上一字节没有，**也没人会被弹确认框**。
+     *
+     * ★ 本端**不做**的三件事（它们执行端才做得了，这里假装做等于给假保险）：
+     *   - 弹确认框（没有 UI；`showWarningMessage` 只在扩展宿主里存在）；
+     *   - 读文件内容做快照（本端能读，但"谁读了算数"必须与"谁移动"同一个人，否则
+     *     快照可以来自另一份文件）；
+     *   - 判断目录/链接（路径守卫在扩展侧，本端看不到 lstat）。
+     *
+     * 白名单档位是**最高档** `delete`（`whitelist.js` 的 `METHOD_TIERS`），绑定门由
+     * `WRITE_METHODS` 自动继承 —— 与 `applyEdit` / `save` 共用同一份判定。
+     *
+     * @param {{name: string|null, declared: string, source: string}} consumer 由入口决定
+     * @param {any[]} args `deleteFile(...)` 的原始实参（位置形态 / 对象形态都支持）
+     */
+    this.deleteFileAs = async (consumer, args) => {
+      const { params, opts } = normalizeSaveArgs(args)
+      assertLocalExpectedVersion('vscode.deleteFile', params)
+      const sessionId = readSessionId(opts)
+      const bound = this._bindWriteTarget(params, sessionId)
+      assertLocalExpectedIncarnation('vscode.deleteFile', params)
+      assertLocalExpectedDisk('vscode.deleteFile', params)
+      this._assertAnchorSource('vscode.deleteFile', params, {
+        link: bound.link,
+        sessionId,
+      })
+      // 线路超时要盖住"人看确认框"的那段（§7 #5(b) 的独立长超时）。显式给了就听调用方的。
+      const wireOpts = { ...opts, timeoutMs: opts.timeoutMs ?? DELETE_REQUEST_TIMEOUT_MS }
+      return this.request('vscode.deleteFile', params, wireOpts, consumer)
+    }
+
+    /**
+     * per-plugin 能力白名单的唯一判定点（契约 §6.2.5）—— 发线路**之前**，失败零字节。
+     *
+     * `bridge.*` 豁免：那是协议协商面，不是编辑器能力（白名单收口的是"能调任何 `vscode.*`"）。
+     * 位置在 `request()` / `notify()` 的最前面：只要身份/档位不够，连"等编辑器 3 秒"
+     * 都不该开始等 —— 那种"先等一会儿再告诉你没权限"的失败形态在真机上会被当成网络问题重试。
+     *
+     * @param {{name: string|null, declared: string, source: string}} consumer
+     * @param {string} method
+     * @throws {BridgeError} `-32602`（`data.stage === 'local'`，`data.reason` 说明是哪种不够格）
+     */
+    this._assertConsumer = (consumer, method) => {
+      if (isBridgeMethod(method)) return
+      this.whitelist.judge(consumer ?? HOST_CONSUMER, method)
     }
 
     /**
@@ -788,13 +1087,18 @@ class VscodeKit {
    *
    * 异步（返回 Promise）：v1 起投递语义从"写进 socket 就算送达"改成了"等到回执"。
    *
-   * @param {{sessionId?: string|null, windowId?: string|null, timeoutMs?: number}} [opts]
+   * @param {{sessionId?: string|null, windowId?: string|null, timeoutMs?: number,
+   *          allowDirtySave?: boolean}} [opts] `allowDirtySave`（T39 / 契约 §6.2.2 结论）：
+   *   允许 `vscode.save` 把**脏缓冲区**写进磁盘。★ **只属于授权方**——它在这里发放、
+   *   落到 grant 记录上、随 `bridge.grant` 投递给执行端，**不许**由调用方在
+   *   `params` 里自填（那等于自己给自己授权）。缺省 = 不允许（脏 = 拒）。
    * @returns {Promise<{id: string, epoch: string, windowId: string|null,
    *                    delivered: true, ack: {ok: true, id: string}}>}
    * @throws {BridgeError} -32007 没有目标连接 / -32008 目标协议不兼容
    *   / -32004 等不到回执 / -32010 `sessionId` 缺失或形状不对（凭证无法参与会话绑定）
+   *   / -32602 `allowDirtySave` 不是布尔（放宽安全门的位不收"看起来像 true"的值）
    */
-  async grantEditing({ sessionId = null, windowId = null, timeoutMs } = {}) {
+  async grantEditing({ sessionId = null, windowId = null, timeoutMs, allowDirtySave } = {}) {
     const link = this._activeLink()
     if (!link) {
       throw new BridgeError(
@@ -823,8 +1127,27 @@ class VscodeKit {
     //   同 session 的并发写照样到达写宿主。而"对端还不知道这条凭证"这件事，恰恰是
     //   最不能放行的时刻（对端没有记录可复核，写请求等于裸奔）。
     //   pending 存在两张表之外，因此没有任何放行路径能看到它。
-    const { id, epoch } = this.grants.stage({ link, sessionId, windowId })
-    const grant = { id, epoch, sessionId, windowId }
+    // ★ T39：意图位**在发放时**就定型（契约 §6.2.2 的结论 / §6.2.8 待决 1 取 (b)）。
+    //   只认严格布尔：`'true'`、`1`、`{}` 一律 -32602 —— 这个位放宽的是一道安全门，
+    //   形状宽松就等于"半个默认开启"。缺省 = false（不传就是不允许）。
+    if (allowDirtySave !== undefined && typeof allowDirtySave !== 'boolean') {
+      throw new BridgeError(ERR.INVALID_PARAMS,
+        'editing.grant allowDirtySave must be a boolean when provided; '
+        + 'a permission bit does not accept truthy look-alikes',
+        {
+          method: 'bridge.grant',
+          reason: 'allow-dirty-save-not-a-boolean',
+          field: 'allowDirtySave',
+          granted: false,
+          got: { type: typeof allowDirtySave },
+        })
+    }
+    const dirtySaveAllowed = allowDirtySave === true
+
+    const { id, epoch } = this.grants.stage({ link, sessionId, windowId, allowDirtySave: dirtySaveAllowed })
+    const grant = {
+      id, epoch, sessionId, windowId, ...(dirtySaveAllowed ? { allowDirtySave: true } : {}),
+    }
     const waitMs = Number.isInteger(timeoutMs) && timeoutMs > 0 ? timeoutMs : this.grantAckTimeoutMs
     let ack
     try {
@@ -999,10 +1322,18 @@ class VscodeKit {
    *   / -32009 对端响应形状不合格（契约 §5.1，facade 出口校验）
    *   / -32010 写入类方法没有有效授权绑定（契约 §6.1，**发包前就拒，一个字节都不发**）
    */
-  async request(method, params = {}, opts = {}) {
+  async request(method, params = {}, opts = {}, consumer) {
     if (typeof method !== 'string' || method === '') {
       throw new BridgeError(ERR.INVALID_PARAMS, 'method must be a non-empty string')
     }
+
+    // ── per-plugin 能力白名单（契约 §6.2.5）：**第一道门** ──
+    // 位置有意在最前面（连"等编辑器"都不开始等）：身份/档位不够时，一个字节都不发，
+    // 也不消耗 3 秒等待 —— 否则真机上表现为"卡一下然后说没权限"，容易被当网络问题重试。
+    // 身份是**第 4 个实参**，不是 opts 里的字段：opts 是"这趟怎么发"（timeoutMs 等），
+    // 身份是"谁在发"。分开才不会让插件以为 `opts.consumer` 是它能填的东西，
+    // 也保证糖衣不会因为注入身份而改变 opts 的形状（T30 有断言逐字守着这一点）。
+    this._assertConsumer(consumer, method)
 
     const write = isWriteMethod(method)
     // ★ 评审 F2：`params.sessionId` 直接拒 —— 会话身份不许由业务参数自证。
@@ -1120,10 +1451,13 @@ class VscodeKit {
    *   不改成 request：那会把「发了就算」变成「等回执」，改变语义与阻塞行为；
    *   判定失败时抛错，错误契约与 request 一致。
    */
-  notify(method, params = {}) {
+  notify(method, params = {}, consumer) {
     if (typeof method !== 'string' || method === '') {
       throw new BridgeError(ERR.INVALID_PARAMS, 'method must be a non-empty string')
     }
+    // ★ 白名单对通知同样生效（单向不等于可以不判）：身份由入口给（第三个实参），
+    //   未传时按宿主通道处理（类实例的既有调用方）。消费者拿到的 facade 已经替他们盖好了。
+    this._assertConsumer(consumer, method)
     // ★ 评审 F5：写入类方法**不许**走通知。通知没有回执，发送前门判完也证明不了
     //   对端存下了；而"默认给通知带 token 让它变成可执行写"是把漏洞换个位置。
     //   入口就拒，要求改用 request()（那道门与会话绑定才跑得起来）。
@@ -1157,6 +1491,15 @@ class VscodeKit {
       connections: this.server.links.size,
       lastEditor: editor,
       discoveryPath: this.server.discoveryPath,
+      /**
+       * per-plugin 白名单的**可观测面**（契约 §6.2.5 要求"默认拒必须看得见"）。
+       *
+       * 三份记录回答三个真机问题：①这个消费者被判成哪一档（`consumers`/`bindings`）；
+       * ②它为什么被拒（`denials` 里每条的 `{method, tier, consumer, declared, allowed, reason}`）；
+       * ③配置里哪几行没生效（`invalid`）。没有这三份，"能力不存在"这种误导性失败
+       * 在真机上就只剩重试。
+       */
+      consumerPolicy: this.whitelist.snapshot(),
     }
   }
 }
@@ -1171,6 +1514,10 @@ class VscodeKit {
  * @param {number}   [config.connectWaitMs] 请求前等编辑器连接的时长，默认 3000
  * @param {number}   [config.helloWaitMs]   请求前等对端 hello（协议版本）的时长，默认 1000
  * @param {boolean}  [config.enabled]    置 false 则只注册服务不监听（便于排障）
+ * @param {object}   [config.consumers]  per-plugin 能力白名单：`{ 插件名: 档位 }`，
+ *   档位取 `read` / `buffer-edit` / `disk-write` / `delete`（契约 §6.2.5）。
+ *   未列出的插件默认 `read`（只读四能力放行，`buffer-edit` 及以上一律拒）。
+ *   配置从 cordis 传进来，本库**不读配置文件**（零依赖 + 配置归宿主）。
  * @param {(level: string, msg: string, extra?: any) => void} [config.onLog]
  */
 export function apply(ctx, config = {}) {
@@ -1181,6 +1528,7 @@ export function apply(ctx, config = {}) {
     helloWaitMs = DEFAULT_HELLO_WAIT_MS,
     grantAckTimeoutMs = DEFAULT_GRANT_ACK_TIMEOUT_MS,
     enabled = true,
+    consumers,
     onLog,
   } = config ?? {}
 
@@ -1198,6 +1546,21 @@ export function apply(ctx, config = {}) {
 
   /** 服务实例在监听成功后才有；消费者可能早于监听就 inject，故用惰性代理。 */
   let kit = null
+
+  /**
+   * per-plugin 能力白名单（契约 §6.2.5 / §6.2.8 第 3 条）。
+   *
+   * 粒度是 **插件名 × 最高档位**（契约 §6.2.8 第 3 条的待决项落在这里）：
+   * 「能读」和「能删」不是同一根轴上的刻度，所以配置里给每个插件只写一个档位词。
+   * 配置落 **DSH 宿主侧**（cordis 的 `consumers`），不落扩展侧 —— 扩展根本不知道
+   * DSH 里的插件叫什么名字。
+   *
+   * 在 `apply()` 里就建好（不是 boot 里）：消费者可能在 boot 之前就 `forPlugin()` 领身份，
+   * 领身份不依赖监听，只依赖配置。
+   */
+  const whitelist = new Whitelist(consumers, { onLog: log })
+  // 加载期一句话把策略说清楚（配错了要在这里看得见，而不是等到某次调用被拒）。
+  log('info', whitelist.summary())
   /**
    * 监听已起、但 kit 还没装配完的空窗期里通过准入的连接。
    * 单纯丢掉它们会让「扩展恰好比 kit 快一步」变成一次静默失败，
@@ -1224,31 +1587,52 @@ export function apply(ctx, config = {}) {
   const notReady = (method) => Promise.reject(new BridgeError(ERR.DISCONNECTED,
     'dsh-vscode-kit is not listening yet', { method, reason: 'server-not-ready' }))
 
+  /**
+   * 共享 facade 的请求入口 —— **未绑定身份通道**（`UNBOUND_CONSUMER`）。
+   *
+   * 这是本次收口的关键一行：以前这里原样透传 `opts`，于是 `ctx.provide` 出去的
+   * 那个共享实例在能力判定上没有身份可言（谁能拿到服务就能调任何 `vscode.*`，
+   * 契约 §6 开头点名的那笔债）。现在每一个调用都盖上"未绑定"的戳：
+   * 天花板 `read`，写入类一律 `-32602` 拒，且**零字节出门**。
+   *
+   * 想写 ⇒ 必须先 `kit.forPlugin('你的插件名', { declared })` 领一个身份
+   * （并且那个名字要在宿主配置的 `consumers` 里被放行）。
+   */
+  const requestUnbound = (method, params, opts) => (kit
+    ? kit.request(method, params, opts, UNBOUND_CONSUMER)
+    : notReady(method))
+
   const vscode = {
-    openFile: (params, opts) => (kit
-      ? kit.vscode.openFile(params, opts)
-      : notReady('vscode.openFile')),
-    getSelection: (params, opts) => (kit
-      ? kit.vscode.getSelection(params, opts)
-      : notReady('vscode.getSelection')),
-    getDiagnostics: (params, opts) => (kit
-      ? kit.vscode.getDiagnostics(params, opts)
-      : notReady('vscode.getDiagnostics')),
-    listOpenEditors: (params, opts) => (kit
-      ? kit.vscode.listOpenEditors(params, opts)
-      : notReady('vscode.listOpenEditors')),
+    // 只读四能力（契约 §6.2.1 Tier 1）：未声明身份也**必须**继续可用 —— 这是
+    // 白名单落地的兼容底线，不因为"没报名字"就把读也一起关了。
+    openFile: (params, opts) => requestUnbound('vscode.openFile', params, opts),
+    getSelection: (params, opts) => requestUnbound('vscode.getSelection', params, opts),
+    getDiagnostics: (params, opts) => requestUnbound('vscode.getDiagnostics', params, opts),
+    listOpenEditors: (params, opts) => requestUnbound('vscode.listOpenEditors', params, opts),
     // 写入类糖衣：与 VscodeKit.vscode.applyEdit 成对出现（契约 §2.2 第②步：
     // 要加就两处都加；只加一处会让 facade 消费者拿到裸 TypeError）。
-    // 注意这里用 `(...args)` 原样转发：`VscodeKit.vscode.applyEdit` 支持
-    // 位置形态与对象形态两种调用，facade 若只转发 `(params, opts)` 就会把位置形态
-    // 的第二个参数（range）当成 opts 丢掉。
+    // 注意这里用 `(...args)` 原样转发：`applyEdit` 支持位置形态与对象形态两种调用，
+    // facade 若只转发 `(params, opts)` 就会把位置形态的第二个参数（range）当成 opts 丢掉。
+    // ★ 走未绑定通道 ⇒ 未 `forPlugin()` 的消费者在这里拿 `-32602`（reason `consumer-unbound`）。
     applyEdit: (...args) => (kit
-      ? kit.vscode.applyEdit(...args)
+      ? kit.applyEditAs(UNBOUND_CONSUMER, args)
       : notReady('vscode.applyEdit')),
     // 写入锚点的读侧（T30），同样两处都加。
-    getDocumentState: (file, opts) => (kit
-      ? kit.vscode.getDocumentState(file, opts)
-      : notReady('vscode.getDocumentState')),
+    getDocumentState: (...args) => {
+      const { params, opts } = normalizeDocStateArgs(args)
+      return requestUnbound('vscode.getDocumentState', params, opts)
+    },
+    // 落盘（T39）：两处都加（契约 §2.2 第②步）。未绑定身份 ⇒ 白名单 `read` 天花板
+    // 在这条路上先拒（`consumer-unbound` / 档位不足），轮不到绑定门说话。
+    save: (...args) => (kit
+      ? kit.saveAs(UNBOUND_CONSUMER, args)
+      : notReady('vscode.save')),
+    // 删除（T40 / Tier 4）：两处都加。未绑定身份 ⇒ 白名单最高档 `delete` 先拒
+    // （`consumer-unbound`），**连确认框都不会弹** —— 这是有意的：不可逆动作不接受
+    // "先试一下看看"。
+    deleteFile: (...args) => (kit
+      ? kit.deleteFileAs(UNBOUND_CONSUMER, args)
+      : notReady('vscode.deleteFile')),
   }
 
   /**
@@ -1289,14 +1673,36 @@ export function apply(ctx, config = {}) {
 
   const facade = {
     get ready() { return kit !== null },
+    /** 未绑定身份（诊断用；不是判据）。 */
+    consumer: { ...UNBOUND_CONSUMER },
     get vscode() { return vscode },
     get editing() { return editing },
-    request: (method, params, opts) => (kit ? kit.request(method, params, opts) : notReady(method)),
+    request: requestUnbound,
     notify: (method, params) => {
       if (!kit) throw new BridgeError(ERR.DISCONNECTED, 'dsh-vscode-kit is not listening yet',
         { method, reason: 'server-not-ready' })
-      return kit.notify(method, params)
+      return kit.notify(method, params, UNBOUND_CONSUMER)
     },
+    /**
+     * 领一个**绑定身份**的 facade（本次新增的显式入口）。
+     *
+     * 名字：`forPlugin`。理由有三，都是"少一层歧义"：
+     *  - 它回答的问题是「**哪个插件**在调」，而不是「以什么路径调」——`forPlugin('dsh-kit-demo')`
+     *    读起来就是"给 dsh-kit-demo 绑一个身份"，与 `inject: ['dshVscodeKit']` 里的插件名
+     *    同一个语境（所以要求传**自己的 cordis 插件名**，而不是随手起的别名）；
+     *  - 比 `as()` / `bind()` / `with()` 具体：那几个名字在别的库里都是"改 this"的意思，
+     *    而这里改的是**能力天花板**，含糊的名字会让调用方以为它只是语法糖；
+     *  - 与配置项 `consumers: { <同一个名字>: <档位> }` 逐字对齐 —— 报的名字要和配的键一致，
+     *    这是本层唯一能做的"身份校验"（advisory，见 `whitelist.js` 顶部）。
+     *
+     * `declared` 是你**自己声明**的最高档位：`read` / `buffer-edit` / `disk-write` / `delete`。
+     * 省略或拼错一律按 `read`（想写就必须显式写出来）。最终天花板 = min(declared, 配置给的值)。
+     *
+     * @param {string} name 你的 cordis 插件名
+     * @param {{declared?: string}} [opts]
+     * @returns {object} 形状与 facade 相同、但每个调用都带这个身份的 facade
+     */
+    forPlugin: (name, opts) => boundFacade(() => kit, whitelist.bind(name, opts), facade),
     snapshot: () => (kit ? kit.snapshot() : { ready: false }),
     /**
      * 等监听就绪。消费者在 apply 里立刻调用能力时（真机 demo 就这么干的），
@@ -1386,6 +1792,9 @@ export function apply(ctx, config = {}) {
         helloWaitMs,
         grantAckTimeoutMs,
         onLog: log,
+        // 白名单实例在 apply() 里就建好（`forPlugin` 可能早于 boot 调用），
+        // 这里只是把它交给实例 —— 判定表与拒绝记录因此只有一份。
+        whitelist,
       })
 
       // 服务端反向收到的编辑器身份存在 lastEditor（能力降级的判据）。
@@ -1532,6 +1941,12 @@ function readDshVersion() {
 // 对端身份由 hello 写到 `link.editor`。删掉不影响任何消费者（无导入点、无文档引用）。
 
 export { VscodeKit }
+// 白名单的档位模型对外暴露（消费者/测试要能查"某方法落在哪一档"，
+// 也不必自己抄一份 `TIERS`；抄一份就会漂移）。
+export {
+  TIERS, METHOD_TIERS, tierOf, tierRank, isTier, minTier, Whitelist,
+  UNBOUND_CONSUMER, HOST_CONSUMER,
+} from './whitelist.js'
 export {
   BridgeError, ERR, PROTOCOL_VERSION, SUPPORTED_PROTOCOL, hasCapability,
 } from './protocol.js'

@@ -90,10 +90,24 @@ export function assertRetireCause(cause, where = 'grant') {
 /**
  * 写入类能力清单（§6.1.1 ②「按该能力是否登记为写入类判，不按是否糖衣」）。
  *
- * 本卡（T3）只登记 `vscode.applyEdit`。保存/新建/删除/改名（T4、T5）往这里追加，
- * 门就是自动生效的 —— 判据是一张表，不是一个开关。
+ * 判据是一张表，不是一个开关：保存/新建/删除/改名往这里追加，门就是自动生效的
+ * （契约 §6.2.6 已写明这是"设计时留好的口子"—— 不要为 `vscode.save` 再设计一道绑定门）。
+ *
+ *  - `vscode.applyEdit`（T3）：只改缓冲区；
+ *  - `vscode.save`（T39 / Tier 3）：会改磁盘 —— 绑定门照旧先行，磁盘锚点（`-32013`）
+ *    与意图门（`-32012 reason:'buffer-dirty'`，见 `grantAllowsDirtySave`）是**额外的**两道；
+ *  - `vscode.deleteFile`（T40 / Tier 4）：**不可逆**。绑定门在这里的作用比前两条更像
+ *    安全边界（前两条判错了还能再改一次，这条判错了没有第二次）。追加进来就自动继承
+ *    `request()` 里"写入类必带 `expectedIncarnation`"那条（T35），所以删除的双锚点是
+ *    白名单/绑定门这一层顺带守住的，不是删除自己另加的规矩。
+ *    ★ 但绑定门**不等于** tiers 白名单（`whitelist.js` 的 `delete` 档）：前者管"发给谁"，
+ *    后者管"消费者被允许做多重的事"，两道都要有（契约 §6.2.5）。
  */
-export const WRITE_METHODS = Object.freeze(['vscode.applyEdit'])
+export const WRITE_METHODS = Object.freeze([
+  'vscode.applyEdit',
+  'vscode.save',
+  'vscode.deleteFile',
+])
 
 /** @param {string} method @returns {boolean} 该方法是否属于写入类（需要绑定门） */
 export function isWriteMethod(method) {
@@ -200,10 +214,15 @@ export class GrantStore {
    * 1 个有效 grant，新到即覆盖」）；同连接上残留的 pending 也一并作废
    * （新的一次发放就是"我不再等上一条了"）。
    *
-   * @param {{link: object, sessionId?: string|null, windowId?: string|null}} p
+   * `allowDirtySave`（T39 / 契约 §6.2.2 结论）：**这个位必须长在 grant 上**，不能是
+   * `params` 里的开关 —— 放在参数上等于调用方自己给自己授权。它只对 `vscode.save` 的
+   * 意图门有效（`grantAllowsDirtySave`），且**只认布尔 `true`**（`'true'`、`1`、
+   * 缺失一律视为 false）：这个位放宽的是一道安全门，形状宽松就等于半个默认开启。
+   *
+   * @param {{link: object, sessionId?: string|null, windowId?: string|null, allowDirtySave?: boolean}} p
    * @returns {{id: string, epoch: string}}
    */
-  stage({ link, sessionId = null, windowId = null } = {}) {
+  stage({ link, sessionId = null, windowId = null, allowDirtySave = false } = {}) {
     if (!link || typeof link !== 'object') {
       throw new BridgeError(ERR.INTERNAL, 'GrantStore.stage requires the carrier link object')
     }
@@ -214,6 +233,7 @@ export class GrantStore {
       link,
       sessionId,
       windowId,
+      allowDirtySave: allowDirtySave === true,
       cause: null,
       at: Date.now(),
     }
@@ -288,11 +308,12 @@ export class GrantStore {
    * 同一连接上已有的 grant 会被置为 `superseded`（§6.1.1 ①-b(2)「每窗口最多 1 个有效
    * grant，新到即覆盖」）。旧 grant 不是"还能用一会儿"，是立刻失效。
    *
-   * @param {{link: object, sessionId?: string|null, windowId?: string|null, cause?: null}} p
+   * @param {{link: object, sessionId?: string|null, windowId?: string|null,
+   *          allowDirtySave?: boolean, cause?: null}} p
    * @returns {{id: string, epoch: string}}
    */
-  issue({ link, sessionId = null, windowId = null } = {}) {
-    const { id } = this.stage({ link, sessionId, windowId })
+  issue({ link, sessionId = null, windowId = null, allowDirtySave = false } = {}) {
+    const { id } = this.stage({ link, sessionId, windowId, allowDirtySave })
     if (!this.activate(id)) {
       // 同步路径上不可能发生（stage 刚写完，没有 await 让出）；真发生了就是本端 bug。
       throw new BridgeError(ERR.INTERNAL, 'GrantStore.issue: staged grant vanished before activation')
@@ -303,11 +324,15 @@ export class GrantStore {
   /**
    * 扩展侧登记（只存不生成，§6.1.1 ①：生成方只有 DSH）。
    *
-   * @param {{id: string, epoch: string, link: object, sessionId?: string|null, windowId?: string|null}} p
+   * `allowDirtySave` 跟着 grant 一起过来并**只存**（与 id/epoch 同一条原则：本端不补默认值、
+   * 不自己推断）。DSH 没给 = 没有这个位 = 意图门默认拒脏缓冲区（fail closed）。
+   *
+   * @param {{id: string, epoch: string, link: object, sessionId?: string|null,
+   *          windowId?: string|null, allowDirtySave?: boolean}} p
    * @returns {{id: string, epoch: string}}
    * @throws {BridgeError} -32602 形状不合格
    */
-  adopt({ id, epoch, link, sessionId = null, windowId = null } = {}) {
+  adopt({ id, epoch, link, sessionId = null, windowId = null, allowDirtySave = false } = {}) {
     const shape = checkGrantShape({ id, epoch })
     if (!shape.ok) {
       throw new BridgeError(ERR.INVALID_PARAMS, `invalid grant: ${shape.problem}`, {
@@ -318,7 +343,9 @@ export class GrantStore {
       throw new BridgeError(ERR.INTERNAL, 'GrantStore.adopt requires the carrier link object')
     }
     this._supersedeLink(link)
-    this._active.set(id, { id, epoch, link, sessionId, windowId, cause: null, at: Date.now() })
+    this._active.set(id, {
+      id, epoch, link, sessionId, windowId, allowDirtySave: allowDirtySave === true, cause: null, at: Date.now(),
+    })
     return { id, epoch }
   }
 
@@ -755,4 +782,32 @@ export function extensionWriteGate(store, { isTrusted = null } = {}) {
     //    字段回读一遍 —— 那不是比对，是复述。会话权威在 DSH 侧（`dshWriteGate` 用
     //    消费者自己的上下文判），扩展侧继续守它真正能验的那部分：连接身份 + 世代。
   }
+}
+
+/**
+ * 「这条 grant 是否允许保存脏缓冲区」—— 契约 §6.2.2 结论 / §6.2.8 待决 1 的落点。
+ *
+ * ★ **这个位为什么在 grant 上，不在 `params` 上**：`vscode.save` 的意图门要回答的是
+ *   "**谁**授权了把人工改动一起写进磁盘"。`params` 是调用方自己填的字段 —— 让它在
+ *   请求里带 `allowDirtySave: true`，等于让它自己给自己授权，这道门就等于没有。
+ *   只有跟 `grant` 一起、由 `kit.editing.grant({allowDirtySave:true})` 发放、
+ *   经 `bridge.grant` 回执确认的位，才代表**授权方**（持有 kit 实例的那一方）的表态。
+ *
+ * 判定口径（fail closed）：
+ *  - 记录不存在 / 不是 active（墓碑、pending）→ `false`；
+ *  - 记录上不是严格的布尔 `true` → `false`（`'true'`、`1` 都不算）。
+ *
+ * 它**不参与** `judgeGrant`：那是七行判定（凭证/世代/连接），这是能力层的意图门；
+ * 混进七行表会让 `-32010` 的 reason 多出一个"意图"分支，而这两件事的处置不同
+ * （授权缺失 → 重新申请；意图未授权 → 换 `save` 语义或人工确认）。所以它是一条
+ * 独立的、只读的查询，放在本文件是为了让"grant 的形状"仍然只有一处定义。
+ *
+ * @param {GrantStore} store
+ * @param {{id?: string}|null|undefined} grant 请求里那份 `{id, epoch}`
+ * @returns {boolean}
+ */
+export function grantAllowsDirtySave(store, grant) {
+  if (!store || !grant || typeof grant !== 'object') return false
+  const found = store.lookup(grant.id)
+  return found?.kind === 'active' && found.record.allowDirtySave === true
 }

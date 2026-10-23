@@ -23,11 +23,28 @@ export const inject = ['dshVscodeKit']
  */
 export function apply(ctx, config = {}) {
   const log = config.onLog ?? (() => {})
-  const kit = ctx.get('dshVscodeKit')
-  if (!kit) {
+  const service = ctx.get('dshVscodeKit')
+  if (!service) {
     log('dshVscodeKit service unavailable; demo plugin stays idle')
     return
   }
+
+  /**
+   * **显式声明身份与档位**（契约 §6.2.8 第 3 条：白名单粒度是「插件名 × 最高档位」）。
+   *
+   * 两条容易搞反的语义，写在这里当示范：
+   *  - `declared` 是**上限声明**，不是许可：本插件只用到只读两能力
+   *    （`vscode.getSelection` / `vscode.openFile`），所以声明 `read` 就够；
+   *    就算这里写成 `delete`，宿主配置没给也照样拒 —— 生效档位 = min(声明, 配置)。
+   *  - 身份由**入口**决定，不是调用时填的：`forPlugin(name)` 就是"我是谁"这一步，
+   *    共享的 `kit.vscode.*` 天花板硬编码 `read`（写入必须走已绑定的入口）。
+   *
+   * 声明得低只影响自己（写类会被拒），声明得高也不提权，所以这里如实写 `read`。
+   */
+  const kit = typeof service.forPlugin === 'function'
+    ? service.forPlugin('dsh-kit-demo', { declared: 'read' })
+    // 旧版 kit 没有 forPlugin：退回共享 facade（它同样只能到 read，不静默提权）。
+    : service
 
   /**
    * 读编辑器选区。相对路径/无选区等失败一律转成可读文本，
