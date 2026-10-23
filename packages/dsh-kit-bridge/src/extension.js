@@ -508,6 +508,27 @@ export function activate(context) {
     // 评审 F7：连接层的绑定门也要先问信任 —— 否则「未信任工作区」这个事实
     // 会随「带不带 grant」变成两种回答（-32010 / -32006），调用方分不清该做什么。
     isTrusted: () => vscode.workspace.isTrusted,
+    // ★ W3（多窗口寻址 §6）：**身份候选**，只随 hello 上报，DSH 侧拿它签发 / 匹配 windowId。
+    //   本端一个字都不判它（不参与准入、不参与授权、不参与版本门）；
+    //   整个字段删掉，两端照常工作，只是窗口号退化成 `tmp-<connSeq>`。
+    //   采集必须是纯读 + 无副作用：connector 会把它包在 try/catch 里，抛了只是这块不出现。
+    describeWindow: () => {
+      const ws = vscode.workspace
+      const folders = Array.isArray(ws?.workspaceFolders)
+        ? ws.workspaceFolders
+          .map((f) => f?.uri?.fsPath)
+          .filter((p) => typeof p === 'string' && p !== '')
+        : []
+      const name = typeof ws?.name === 'string' && ws.name !== '' ? ws.name : null
+      return {
+        // `env.sessionId` 是 VS Code 给的**窗口**会话标识（一个窗口一个）——
+        // 它不是安全凭据，只用来"同一个窗口重连后还认得出自己"。
+        sessionId: vscode.env?.sessionId ?? null,
+        workspace: (name || folders.length > 0) ? { name, folders } : null,
+        uiKind: vscode.env?.uiKind ?? null,
+        remoteName: vscode.env?.remoteName ?? null,
+      }
+    },
     log,
     dshHome: cfg.dshHome,
     pollIntervalMs: cfg.pollIntervalMs,

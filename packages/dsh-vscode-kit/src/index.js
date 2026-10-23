@@ -11,10 +11,16 @@
  * 插件形状：函数式 cordis 插件（export { name, inject, apply }），与 dsh-agy-link 同款。
  */
 
-import { startBridgeServer, listLiveBridges, discoveryDir, resolveDshHome } from './server.js'
+import {
+  startBridgeServer, listLiveBridges, discoveryDir, resolveDshHome, liveTrustedLinks,
+} from './server.js'
 import {
   BridgeError, ERR, PROTOCOL_VERSION, SUPPORTED_PROTOCOL, hasCapability, judgeProtocolVersion,
 } from './protocol.js'
+import {
+  WINDOW_ID_PATTERN, WindowRegistry, normalizeWindowBlock, windowFingerprint, windowLabel,
+  windowsFilePath,
+} from './windows.js'
 import { validateResponse } from './response-contract.js'
 import {
   GrantStore, GRANT_REASONS, GRANT_TOMBSTONE_LIMIT, WRITE_METHODS, isWriteMethod,
@@ -241,6 +247,58 @@ function isPlainObject(v) {
 }
 
 /**
+ * 从 `opts.target` 里取窗口寻址目标（多窗口寻址 §1.2：只认 `windowId` 或 `#connSeq`）。
+ *
+ * 返回 `{raw, text}` 而不是直接返回字符串：报错时 `raw` 要能原样回显
+ * （"你说的是 `{target: 1}` 还是 `{target: '1'}`" 对排障是两件事），
+ * 而解析只用 `text`。`null` = **没给** —— 与"给了但解析不出来"必须区分：
+ * 前者走老的活跃连接路径，后者是错误。
+ *
+ * 数字/对象形态**不做善意解释**（不把 `1` 当 connSeq、也不当 windowId 序号）：
+ * 两种意图都能写清楚（`'#1'` / `'win-01'`），含糊的 target 一律按解析失败处理。
+ *
+ * @param {{target?: unknown}} [opts]
+ * @returns {{raw: unknown, text: string}|null}
+ */
+function readWindowTarget(opts) {
+  const raw = opts?.target
+  if (raw === undefined || raw === null) return null
+  if (typeof raw === 'string') return { raw, text: raw.trim() }
+  if (typeof raw === 'number') return { raw, text: String(raw) }
+  return { raw, text: '' }
+}
+
+/**
+ * 造一个 `-32014 window-target-failed`（多窗口寻址设计 §5：一个码 + `data.reason`）。
+ *
+ * `data` 里 `reason` 是**唯一**的处置依据（码本身只说"寻址没成"）；其余字段都是排障用的，
+ * 故意带上 `side: 'dsh'` —— 这个码只在 DSH 侧产生，对端不会发它。
+ *
+ * @param {string} method
+ * @param {{raw: unknown, text: string}|null} target
+ * @param {'window-not-found'|'window-closed'|'window-ambiguous'|'target-unauthorized'|'target-not-routable'} reason
+ * @param {object} [extra]
+ * @returns {BridgeError}
+ */
+function windowTargetError(method, target, reason, extra) {
+  const shown = typeof target?.text === 'string' && target.text !== ''
+    ? `"${target.text}"`
+    : `(${target ? JSON.stringify(target.raw) ?? 'empty' : 'missing'})`
+  return new BridgeError(
+    ERR.WINDOW_TARGET_FAILED,
+    `window target ${shown} cannot be used for "${method}": ${reason}`,
+    {
+      method,
+      target: typeof target?.text === 'string' && target.text !== '' ? target.text : null,
+      rawTarget: target?.raw ?? null,
+      reason,
+      side: 'dsh',
+      ...extra,
+    },
+  )
+}
+
+/**
  * 从 opts 里挑出**属于请求参数**的锚点字段（位置形态没有别的地方放它们）。
  *
  * `expectedIncarnation`（T34）与 `expectedVersion` 同族：两者一起构成写锚点
@@ -377,6 +435,14 @@ function boundFacade(getKit, consumer, host) {
         getSelection: read('vscode.getSelection'),
         getDiagnostics: read('vscode.getDiagnostics'),
         listOpenEditors: read('vscode.listOpenEditors'),
+        // 多窗口视图（W1）：**本地**视图，因此未就绪时返回空表而不是 rejected Promise
+        // （与 `editing.list()` 一致：诊断视图不该把调用方拖进 catch）。
+        windows: {
+          list: () => {
+            const kit = getKit()
+            return kit ? kit.listWindows(consumer) : []
+          },
+        },
         // 写入类：**唯一**入口是实例上的 `applyEditAs` —— 本地锚点门（版本 / 化身 / 来源）
         // 与普通调用共用同一份实现，绑身份只多做一件事：把 consumer 盖进 opts。
         applyEdit: (...args) => {
@@ -423,7 +489,9 @@ function boundFacade(getKit, consumer, host) {
  * 消费者插件不该碰，但排障时可读。
  */
 class VscodeKit {
-  constructor({ server, dshVersion, connectWaitMs, helloWaitMs, grantAckTimeoutMs, onLog, whitelist }) {
+  constructor({
+    server, dshVersion, connectWaitMs, helloWaitMs, grantAckTimeoutMs, onLog, whitelist, dshHome,
+  }) {
     this.server = server
     this.dshVersion = dshVersion
     this.connectWaitMs = connectWaitMs
@@ -476,6 +544,29 @@ class VscodeKit {
      */
     this._anchorSources = new Map()
 
+    /**
+     * 窗口注册表（W1）：`windowId` 的签发与持久化，落在
+     * `~/.dsh/dsh-vscode-kit/windows.json`（`dshHome` 由 `apply()` 传进来；类直构时用默认值）。
+     *
+     * 懒加载 + 写失败只 log：注册表是**诊断字段的家**，不是连接的前提。
+     * @type {WindowRegistry}
+     */
+    this.windowRegistry = new WindowRegistry({
+      file: windowsFilePath(dshHome),
+      onLog,
+    })
+
+    /**
+     * 已关闭的窗口（W2 的 `window-closed` 判据）。
+     *
+     * 为什么要墓碑：连接断了以后 `trusted` 里就查不到了，而"你问的那个窗口曾经存在、
+     * 现在关了"与"你问的号根本没有过"是两种完全不同的排障方向（前者该重连，
+     * 后者该检查调用方的 target 拼写）。墓碑只活在这个进程里，上限 256 条（FIFO），
+     * 淘汰之后最坏退化成 `window-not-found` —— 仍然是个错误，不会误投。
+     * @type {{seqs: Set<number>, ids: Set<string>}}
+     */
+    this._closedWindows = { seqs: new Set(), ids: new Set() }
+
     // 糖衣方法族。新增能力只在这里加一行，协议层不改。
     // 注意两个参数都要往下传：早期写成 `openFile: (params) => this.request(m, params)`
     // 会把消费者传的 opts（timeoutMs / waitForEditor）静默丢掉。
@@ -484,6 +575,11 @@ class VscodeKit {
       getSelection: (params, opts) => this.request('vscode.getSelection', params, opts),
       getDiagnostics: (params, opts) => this.request('vscode.getDiagnostics', params, opts),
       listOpenEditors: (params, opts) => this.request('vscode.listOpenEditors', params, opts),
+      // 多窗口视图（W1）：**本地**视图 —— 列的是本端握着的几条连接，一个字节都不发给对端
+      // （没有"哪个窗口"可问：要问的就是"有几个窗口"）。同步返回数组，与 `editing.list()` 一致。
+      windows: {
+        list: () => this.listWindows(HOST_CONSUMER),
+      },
       // 写入类：额外过会话授权绑定门（契约 §6.1，发送前）。糖衣只做转发，
       // 门在 request() 里统一判 —— 绕过糖衣走 raw request 也照样过门。
       //
@@ -540,6 +636,8 @@ class VscodeKit {
     // 而糖衣 `applyEdit` 就是它的一行转发 —— 放在一起才不会漂移。
     this.applyEditAs = async (consumer, args) => {
       const { params, opts } = normalizeApplyEditArgs(args)
+      // W2 / §3.2：写路径不接受窗口寻址 —— 在绑定目标**之前**拒，对端零帧。
+      this._rejectWriteWindowTarget('vscode.applyEdit', opts)
       assertLocalExpectedVersion('vscode.applyEdit', params)
       // 三个本地闸门，顺序有意：形状 → 必填 → 来源（最贵的放最后）。
       const sessionId = readSessionId(opts)
@@ -573,6 +671,8 @@ class VscodeKit {
      */
     this.saveAs = async (consumer, args) => {
       const { params, opts } = normalizeSaveArgs(args)
+      // W2 / §3.2：写路径不接受窗口寻址 —— 在绑定目标**之前**拒，对端零帧。
+      this._rejectWriteWindowTarget('vscode.save', opts)
       assertLocalExpectedVersion('vscode.save', params)
       const sessionId = readSessionId(opts)
       const bound = this._bindWriteTarget(params, sessionId)
@@ -609,6 +709,8 @@ class VscodeKit {
      */
     this.deleteFileAs = async (consumer, args) => {
       const { params, opts } = normalizeSaveArgs(args)
+      // W2 / §3.2：写路径不接受窗口寻址 —— 在绑定目标**之前**拒，对端零帧。
+      this._rejectWriteWindowTarget('vscode.deleteFile', opts)
       assertLocalExpectedVersion('vscode.deleteFile', params)
       const sessionId = readSessionId(opts)
       const bound = this._bindWriteTarget(params, sessionId)
@@ -665,6 +767,28 @@ class VscodeKit {
       // 在它上面derive 出的锚点可能来自另一个窗口 —— 这个方法是唯一正确的读法。
       stateFor: (sessionId, file, opts) => this.readStateFor(sessionId, file, opts),
     }
+  }
+
+  /**
+   * 内部：**写路径**上的窗口寻址拒绝（W2 / 多窗口寻址 §3.2）。
+   *
+   * 写目标只能由 grant 记录决定（见下一个方法），所以"写给哪个窗口"这件事
+   * **不接受调用方指定**。这里拒绝，不是忽略：悄悄忽略会让人以为写到了自己点的
+   * 那个窗口，实际写到了别处 —— 那是最坏的一种"成功"。
+   *
+   * 位置要求：必须在 `_bindWriteTarget` **之前**，且抛在这里对端**零帧**
+   * （连 grant 都不会被查，更不会有人被弹确认框）。
+   *
+   * @param {string} method 业务方法名（进错误 `data.method`）
+   * @param {any} opts     调用方 opts（`target` 只会出现在这里，不在 params 里）
+   */
+  _rejectWriteWindowTarget(method, opts) {
+    const target = readWindowTarget(opts)
+    if (!target) return
+    throw windowTargetError(method, target, 'target-not-routable', {
+      write: true,
+      boundBy: 'grant',
+    })
   }
 
   /**
@@ -732,6 +856,195 @@ class VscodeKit {
   }
 
   /**
+   * 内部：**已准入且仍活着**的连接（W1 起成为唯一口径）。
+   *
+   * 三处共用它：`_activeLink()` 的挑选面、`windows.list()` 的可见面、target 解析的候选面。
+   * 集合的定义在 `server.js` 的 `liveTrustedLinks()`（与 `broadcast` 的投递面同一个函数）——
+   * 三处各写一遍判断，就会有一处忘了跳过死连接，那类 bug 表现为"表里有、一发就断"。
+   * @returns {any[]}
+   */
+  _liveLinks() {
+    return liveTrustedLinks(this.server?.trusted)
+  }
+
+  /**
+   * 内部：一条连接的 `windowId`。
+   *
+   * 报过 hello 且有 `window` 块 → 注册表签发的号；否则按 §6 降级成 `tmp-<connSeq>`
+   * （老扩展没有这个块，也不许因此少一行视图）。`windowId` **永远存在**（§1.3 末段），
+   * 不稳定只体现在 `stable:false` 上。
+   * @param {object|null} link
+   * @returns {string}
+   */
+  _windowIdOf(link) {
+    const noted = link?.window?.windowId
+    if (typeof noted === 'string' && noted !== '') return noted
+    const seq = typeof link?.connSeq === 'number' ? String(link.connSeq) : 'unknown'
+    return `tmp-${seq}`
+  }
+
+  /**
+   * 内部：一条连接在 `windows.list()` 里的那一行（§2.2 字段表）。
+   *
+   * `windowId` 与 `connSeq` 是**两个字段**（§1.2：禁止 `windowId = String(connSeq)`）：
+   * 前者是身份、跨重连稳定；后者是进程内序号、只用于排序与诊断。
+   * `active` 只是"此刻 `_activeLink()` 是谁"的视图，不是身份、也不是权限。
+   * @param {object} link
+   * @returns {object}
+   */
+  _windowRow(link) {
+    const win = link?.window ?? null
+    const editor = link?.editor ?? null
+    const windowId = this._windowIdOf(link)
+    const workspace = win?.workspace
+      ? {
+        name: typeof win.workspace.name === 'string' ? win.workspace.name : null,
+        folders: Array.isArray(win.workspace.folders) ? [...win.workspace.folders] : [],
+      }
+      : null
+    const pv = editor?.protocolVersion
+    return {
+      windowId,
+      stable: win ? win.stable === true : false,
+      connSeq: typeof link?.connSeq === 'number' ? link.connSeq : null,
+      label: windowLabel(workspace, windowId),
+      workspace,
+      uiKind: typeof win?.uiKind === 'string' ? win.uiKind : null,
+      remoteName: typeof win?.remoteName === 'string' ? win.remoteName : null,
+      focused: typeof win?.focused === 'boolean' ? win.focused : null,
+      extensionVersion: typeof editor?.extensionVersion === 'string' ? editor.extensionVersion : null,
+      protocolVersion: typeof pv === 'string' || typeof pv === 'number' ? String(pv) : null,
+      active: link === this._activeLink(),
+    }
+  }
+
+  /**
+   * `vscode.windows.list()` —— 本端握着的窗口（W1）。
+   *
+   * 只会看见**已准入且活着**的连接（`_liveLinks()`）：一个裸 socket、握手都没做完的
+   * 连接既不在表里，也不能被 target 命中（未准入与"不存在"同码，§4：target 不许变成
+   * 准入探针）。排序口径只有一个：`connSeq` 升序（§2.2），跨重连的稳定顺序不在本方法里。
+   *
+   * 不看对端能力位、也不对任何单条连接做版本预检：这是**本端视图**，
+   * 没有"单一对端"可问；老扩展（没有这个能力位）照样应该出现在表里（§7 A9）。
+   *
+   * @param {{name: string|null, declared: string, source: string}} [consumer]
+   * @returns {Array<object>}
+   */
+  listWindows(consumer) {
+    this._assertConsumer(consumer, 'vscode.windows.list')
+    return this._liveLinks()
+      .slice()
+      .sort((a, b) => {
+        const sa = typeof a?.connSeq === 'number' ? a.connSeq : Number.POSITIVE_INFINITY
+        const sb = typeof b?.connSeq === 'number' ? b.connSeq : Number.POSITIVE_INFINITY
+        return sa - sb
+      })
+      .map((link) => this._windowRow(link))
+  }
+
+  /**
+   * 内部：hello 到达时给连接记下窗口身份（W1）。
+   *
+   * 只写 `link.window`（与 `link.editor` 同生共死），**不参与任何判定** ——
+   * 准入看 token、授权看 grant、写入看锚点，都不读这个字段（§4「target 不提升权限」）。
+   * 因此把 hello 里的 `window` 块整个删掉，所有判定测试必须依然全绿（§7 A9 的守门）。
+   *
+   * @param {object} link
+   * @param {unknown} rawWindow hello 里的 `window` 块（可能是 undefined / 坏形状 / null）
+   * @returns {object|null}
+   */
+  _noteWindowIdentity(link, rawWindow) {
+    if (!link) return null
+    const block = normalizeWindowBlock(rawWindow)
+    const issued = this.windowRegistry.assign({
+      fingerprint: windowFingerprint(block),
+      connSeq: link.connSeq,
+    })
+    link.window = {
+      windowId: issued.windowId,
+      stable: issued.stable === true,
+      workspace: block?.workspace ?? null,
+      uiKind: block?.uiKind ?? null,
+      remoteName: block?.remoteName ?? null,
+      focused: block?.focused ?? null,
+    }
+    return link.window
+  }
+
+  /**
+   * 内部：连接关掉时留一块墓碑（`window-closed` 的判据，`_resolveWindowTarget` 用）。
+   *
+   * 为什么需要："那个窗口曾经存在、现在关了"（该重连）与"你写的号根本没有过"
+   * （该检查拼写）是两种完全不同的排障方向，合并成一句 not-found 就把线索丢了。
+   * 上限 256 条 FIFO：淘汰后最坏退化成 `window-not-found`，仍然是个错误、不会误投。
+   *
+   * @param {object|null} link
+   */
+  _noteWindowClosed(link) {
+    if (!link) return
+    if (typeof link.connSeq === 'number') this._closedWindows.seqs.add(link.connSeq)
+    const windowId = link.window?.windowId
+    if (typeof windowId === 'string' && windowId !== '') this._closedWindows.ids.add(windowId)
+    for (const set of [this._closedWindows.seqs, this._closedWindows.ids]) {
+      while (set.size > 256) {
+        const oldest = set.values().next().value
+        if (oldest === undefined) break
+        set.delete(oldest)
+      }
+    }
+  }
+
+  /**
+   * 内部：把 `{target}` 解析成**一条**活连接（W2 / §5 的 reason 判定序）。
+   *
+   * 判定顺序（先命中先返回，与 §5 一致）：
+   *  1. 目标写错（`#abc`、`{}`、空串、label 撞多行）→ `window-not-found` / `window-ambiguous`；
+   *  2. 解析到 0 条活连接 → 有墓碑/有签发记录 ⇒ `window-closed`，否则 `window-not-found`；
+   *  3. 解析到 >1 条活连接 → `window-ambiguous`（同一 windowId 挂在两条连接上就是这个 case）。
+   *
+   * 候选集合只有 `_liveLinks()`：未准入的连接**不在候选里**，所以 target 永远探不到准入状态。
+   *
+   * @param {{raw: unknown, text: string}} target
+   * @param {string} method
+   * @returns {object} 命中的连接
+   * @throws {BridgeError} -32014 + `data.reason`
+   */
+  _resolveWindowTarget(target, method) {
+    const text = typeof target?.text === 'string' ? target.text : ''
+    const fail = (reason, extra) => windowTargetError(method, target, reason, extra)
+    const live = this._liveLinks()
+    const candidatesOf = (hits) => hits.map((l) => this._windowIdOf(l))
+
+    // ── `#<connSeq>`：进程内序号，最容易拿到、也最容易过期（DSH 重启即重排）──
+    if (text.startsWith('#')) {
+      const n = Number.parseInt(text.slice(1), 10)
+      if (!Number.isInteger(n) || String(n) !== text.slice(1)) throw fail('window-not-found')
+      const hits = live.filter((link) => link.connSeq === n)
+      if (hits.length === 1) return hits[0]
+      if (hits.length > 1) throw fail('window-ambiguous', { candidates: candidatesOf(hits) })
+      throw fail(this._closedWindows.seqs.has(n) ? 'window-closed' : 'window-not-found', { connSeq: n })
+    }
+
+    // ── `windowId`：`windows.list()` 真报出来的号（`win-NN` 本端签发 / `tmp-N` 降级号）──
+    if (WINDOW_ID_PATTERN.test(text)) {
+      const hits = live.filter((link) => this._windowIdOf(link) === text)
+      if (hits.length === 1) return hits[0]
+      if (hits.length > 1) throw fail('window-ambiguous', { candidates: candidatesOf(hits) })
+      // 签发过（windows.json 里有）或刚刚关掉（墓碑）⇒ 曾经存在；否则这个号从没出现过。
+      const known = this.windowRegistry.has(text) || this._closedWindows.ids.has(text)
+      throw fail(known ? 'window-closed' : 'window-not-found', { windowId: text })
+    }
+
+    // ── 其余写法（label / 裸数字 / 对象 / 空串）一律不路由 ──
+    // 只有一种情况值得区分：给的是一行 label 且撞了多行（那是真实存在的歧义）。
+    const labeled = live.filter((link) => this._windowRow(link).label === text)
+    throw fail(labeled.length > 1 ? 'window-ambiguous' : 'window-not-found', {
+      candidates: labeled.length > 1 ? candidatesOf(labeled) : undefined,
+    })
+  }
+
+  /**
    * 内部：取当前活跃连接 —— **只在已准入的连接里挑，且按连接序号挑**。
    *
    * ★ 安全（洞 2）：不能简单取「最后连上的」。裸连一个 socket、什么都不发，
@@ -749,17 +1062,13 @@ class VscodeKit {
   _activeLink() {
     let best = null
     let bestSeq = -Infinity
-    for (const link of this.server.trusted) {
+    // W1：候选面统一走 `_liveLinks()`（= `server.liveTrustedLinks(trusted)`），
+    // 挑选规则一字未改：connSeq 最大者，同序号保留先遇到的，死连接不参与。
+    for (const link of this._liveLinks()) {
       // 未带序号的连接（白盒/旧对象）排在所有带序号的连接之后；
       // 同序号时保留先遇到的那条，结果稳定可测。
       const seq = typeof link.connSeq === 'number' ? link.connSeq : -Infinity
       if (best !== null && seq <= bestSeq) continue
-      // 活连接才可当目标：socket 已销毁但 'close' 事件还没派发的那一下不选它，
-      // 否则请求会写进一条死 socket。
-      if (link.socket?.destroyed) continue
-      // 协议层已关掉的连接同理（评审 F1 回归 ②：目标窗口关掉后必须回退到**另一条**，
-      // 而不是继续选它；connSeq 更大的死连接会被跳过）。
-      if (link.closed === true) continue
       best = link
       bestSeq = seq
     }
@@ -1347,8 +1656,20 @@ class VscodeKit {
       ? opts.sessionId
       : null
 
+    // ── 窗口寻址（W2 / 多窗口寻址设计 §3）──
+    // `opts.target` 只对**读**有意义：写目标由 grant 决定（§3.2），带 target 一律拒。
+    // ★ 位置就是判定本身：`_bindWriteTarget` 之前、任何线路动作之前 ⇒ 对端零帧。
+    //   写路径的 target **不退化成"最近的那个窗口"**：写错窗口比写失败贵得多。
+    const target = readWindowTarget(opts)
+    if (target && write) {
+      throw windowTargetError(method, target, 'target-not-routable', {
+        write: true,
+        boundBy: 'grant',
+      })
+    }
+
     // ── 选目标（评审 F3）──
-    // 读路径：当前活跃连接；写路径：**grant 记录里的承载连接**，不经过 `_activeLink()`。
+    // 读路径：显式 target > 绑定读的 grant 记录 > 当前活跃连接；写路径：只认 grant 记录。
     let link
     let wireParams = params
     if (write) {
@@ -1360,6 +1681,10 @@ class VscodeKit {
       // 与写路径**同一套**会话标识、同一条记录、同一个对象身份。
       // 没有有效记录时**绝不**回退 `_activeLink()` —— 那正是 T5 的 Q1：
       // 回退 = 锚点从"谁最后连上"的窗口读出来，再拿去写另一个窗口。
+      //
+      // ★ W2：target 解析排在记录检查**之前**（§3.1 ② 早于 ③）—— 给了 target 却指不到
+      //   任何窗口时，报的是"你指错了窗口"（-32014），不是"你没有授权"（-32010）。
+      const targetLink = target ? this._resolveWindowTarget(target, method) : null
       const found = this._grantForSession(sessionId)
       const record = found?.record ?? null
       link = record ? this._liveTargetOrNull(record) : null
@@ -1367,6 +1692,20 @@ class VscodeKit {
         // 行 1（没有该会话的记录）/ 行 3（记录里的连接已死）—— 与判定表同一套 reason。
         throw editNotBoundError(method, record ? 'target-gone' : 'no-grant', record ? 3 : 1)
       }
+      if (targetLink && targetLink !== link) {
+        // 同一趟里"绑定的窗口"和"你指名的窗口"不是同一条连接 ⇒ 视角冲突，拒。
+        // ★ 这里**不许**挑一边：挑 target = 读的不是你获准写的那份文档（T5 的 Q1 原形）；
+        //   挑 record = 静默忽略调用方明确说了的 target。两种猜测都会让人以为成功了。
+        throw windowTargetError(method, target, 'target-unauthorized', {
+          sessionId,
+          boundWindow: this._windowIdOf(link),
+          targetWindow: this._windowIdOf(targetLink),
+        })
+      }
+    } else if (target) {
+      // 纯读显式寻址：**只**用 target 指的那条连接。解析不出来就在这里抛 -32014，
+      // 绝不回退 `_activeLink()` —— 回了退，target 就成了"建议"而不是"路由"（§3.1 ④⑤）。
+      link = this._resolveWindowTarget(target, method)
     } else {
       link = await this._waitForEditor(waitMs)
       if (!link) {
@@ -1633,6 +1972,12 @@ export function apply(ctx, config = {}) {
     deleteFile: (...args) => (kit
       ? kit.deleteFileAs(UNBOUND_CONSUMER, args)
       : notReady('vscode.deleteFile')),
+    // 多窗口视图（W1 / 契约 §2.2 第②步：三处都加 —— 类实例、绑身份、未绑定）。
+    // 只读诊断：未就绪时返回空表（同 `editing.list`），不 reject；档位 `read` ⇒
+    // 未声明身份也放行（白名单里 `vscode.windows.list` 就是 read）。
+    windows: {
+      list: () => (kit ? kit.listWindows(UNBOUND_CONSUMER) : []),
+    },
   }
 
   /**
@@ -1782,6 +2127,9 @@ export function apply(ctx, config = {}) {
         onLinkClosed: (link) => {
           const n = kit?.grants.closeLink(link) ?? 0
           if (n > 0) log('info', `edit grant invalidated by disconnect (${n})`)
+          // W2：留一块墓碑，好把"窗口关了"与"号写错了"分开报（`window-closed` / `window-not-found`）。
+          // 只在**判定**里用，不参与放行 —— 墓碑只会让错误更准，不会让门更松。
+          kit?._noteWindowClosed(link)
         },
       })
 
@@ -1795,6 +2143,9 @@ export function apply(ctx, config = {}) {
         // 白名单实例在 apply() 里就建好（`forPlugin` 可能早于 boot 调用），
         // 这里只是把它交给实例 —— 判定表与拒绝记录因此只有一份。
         whitelist,
+        // W1：窗口注册表落在这里（`~/.dsh/dsh-vscode-kit/windows.json`）。
+        // 传下去而不是让 VscodeKit 自己读环境变量：配置只有一个来源（`apply()` 的 config）。
+        dshHome,
       })
 
       // 服务端反向收到的编辑器身份存在 lastEditor（能力降级的判据）。
@@ -1851,6 +2202,9 @@ export function apply(ctx, config = {}) {
             msgCtx.link.editor = editor
             // ★ T34：语义能力公告（`features`）按连接记 —— 它决定糖衣要不要强制化身锚点。
             kit._notePeerFeatures(msgCtx.link, params.features)
+            // ★ W1：窗口身份候选（W3 上报）。**只用来签发 / 匹配 windowId**，
+            //   不参与任何判定：删掉 hello 里的 `window` 块，全部判定测试必须依然全绿。
+            kit._noteWindowIdentity(msgCtx.link, params.window)
             kit._notifyHello(msgCtx.link)
           } else {
             // 理论上到不了：协议层给每次分派都带 ctx.link。真到了就 fail-closed ——

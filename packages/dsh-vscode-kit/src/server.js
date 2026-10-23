@@ -88,6 +88,31 @@ async function listenOnFreePort(host, range, createBridgeFor, onConnection) {
 }
 
 /**
+ * 从 `trusted` 里取出「还活着」的连接（多窗口寻址 W1 起提为公开定义，= §8 的「只读访问器」）。
+ *
+ * 为什么提出来而不是各写一遍：`broadcast` 的投递面、`windows.list()` 的可见面、
+ * target 解析的候选面**必须是同一个集合**。三处各写一份判断，迟早有一处忘了跳过已关闭
+ * 的连接 —— 那种 bug 的表现是"表里有、一发就断"，最难查。
+ *
+ * 「活」只有两条：连接没标记关闭、socket 没销毁。**不看 `authorized`**：
+ * 传进来的集合本来就是 `trusted`（准入过的那批），准入判定不在这里，也不许在这里补。
+ *
+ * @param {Iterable<any>} trusted
+ * @returns {any[]} 保持 `trusted` 的插入顺序（即首连顺序；排序由调用方自己定）
+ */
+export function liveTrustedLinks(trusted) {
+  const out = []
+  if (!trusted || typeof trusted[Symbol.iterator] !== 'function') return out
+  for (const link of trusted) {
+    if (!link) continue
+    if (link.closed === true) continue
+    if (link.socket?.destroyed) continue
+    out.push(link)
+  }
+  return out
+}
+
+/**
  * 启动桥接服务端。
  *
  * @param {object} opts
@@ -100,7 +125,7 @@ async function listenOnFreePort(host, range, createBridgeFor, onConnection) {
  * @param {(err) => void} [opts.onError]
  * @param {number}  [opts.timeoutMs]
  * @param {boolean} [opts.sweep]       启动时清扫死 pid，默认 true
- * @returns {Promise<{port, token, pid, links: Set, trusted: Set, close, server, discoveryPath, broadcast}>}
+ * @returns {Promise<{port, token, pid, links: Set, trusted: Set, liveTrusted, close, server, discoveryPath, broadcast}>}
  */
 export async function startBridgeServer(opts = {}) {
   const {
@@ -303,15 +328,7 @@ export async function startBridgeServer(opts = {}) {
     assertWritableNotNotified(method, 'broadcast')
 
     /** 只对「还活着」的连接投递：socket 已销毁 / 终端已关的连接收不到。 */
-    const live = () => {
-      const out = []
-      for (const link of trusted) {
-        if (link.closed === true) continue
-        if (link.socket?.destroyed) continue
-        out.push(link)
-      }
-      return out
-    }
+    const live = () => liveTrustedLinks(trusted)
 
     // 协议层方法豁免版本门：否则版本不兼容时连「问一句对方是几版」都做不到。
     // 豁免口径必须与 index.js `_assertProtocolCompatible` 一致（同一条规则两处用）。
@@ -374,6 +391,12 @@ export async function startBridgeServer(opts = {}) {
     capabilities,
     onConnected,
     broadcast,
+    /**
+     * 只读访问器：已准入且仍活着的连接（`windows.list()` / target 解析共用）。
+     *
+     * **只读**：返回新数组，调用方拿到的不是 `trusted` 本身，改它不影响投递面。
+     */
+    liveTrusted: () => liveTrustedLinks(trusted),
     close,
     get closed() { return closed },
   }

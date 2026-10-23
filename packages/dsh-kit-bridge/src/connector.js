@@ -59,6 +59,11 @@ export const PEER_FEATURES = Object.freeze(['document-incarnation'])
  * @param {() => boolean} [deps.isTrusted]
  *        工作区信任（判序在 grant 之前，评审 F7）。不给则信任门不参与判定 ——
  *        能力层的 `assertTrusted` 仍会在 handler 里守住 -32006。
+ * @param {() => ({sessionId?: string|null, workspace?: {name?: string|null, folders?: string[]}|null,
+ *   uiKind?: number|string|null, remoteName?: string|null})|null} [deps.describeWindow]
+ *        **窗口身份候选**采集器（W3，多窗口寻址 §6）。只在出站 `bridge.hello` 里带出去，
+ *        本层不做任何判断；抛错会被吞掉（只是这块不出现）。由 `extension.js` 注入 ——
+ *        本文件是纯传输层，不认识 `vscode`。
  */
 export function createConnector(deps) {
   const {
@@ -88,6 +93,30 @@ export function createConnector(deps) {
   // `assertTrusted` 给出 -32006 —— 用户该看到"工作区没被信任"，不是"没授权"。
   const isTrusted = typeof deps.isTrusted === 'function' ? deps.isTrusted : null
   const grantGate = extensionWriteGate(grants, { isTrusted })
+
+  /**
+   * 窗口身份候选采集器（W3）。由 `extension.js` 注入 —— 本文件是纯传输层，不 import `vscode`。
+   * 没注入（单测 / 老宿主）⇒ hello 里没有 `window` 块，DSH 侧按 `tmp-<connSeq>` + `stable:false` 降级。
+   */
+  const describeWindow = typeof deps.describeWindow === 'function' ? deps.describeWindow : null
+
+  /**
+   * 采一次窗口身份候选（`{sessionId, workspace:{name,folders}, uiKind, remoteName}`）。
+   *
+   * ★ 任何失败都**只降级**，绝不外抛：这是 hello 的一个附加字段，不是建连的前提。
+   *   一个拿不到的 `vscode.env` 不该把整次握手带崩（老宿主、非编辑器宿主都会走到这里）。
+   *   返回 `null` = 整块不出现，语义与"老扩展没上报"完全相同。
+   */
+  function readWindowBlock() {
+    if (!describeWindow) return null
+    try {
+      const info = describeWindow()
+      return info && typeof info === 'object' && !Array.isArray(info) ? info : null
+    } catch (err) {
+      log(`window description failed: ${err?.message ?? err}`, 'warn')
+      return null
+    }
+  }
 
   /**
    * 连接消失的唯一收口：清共享槽 + 让挂在这条连接上的 grant 全部失效。
@@ -362,12 +391,18 @@ export function createConnector(deps) {
 
     // 主动回报身份：DSH 侧据 capabilities 做能力降级判定。
     // 这是请求（要拿到对端确认），失败只记日志不推翻连接。
+    const windowBlock = readWindowBlock()
     link.request('bridge.hello', {
       client: CLIENT_ID,
       extensionVersion: EXTENSION_VERSION,
       protocolVersion: PROTOCOL_VERSION,
       capabilities: CAPABILITIES,
       features: PEER_FEATURES,
+      // ★ W3（多窗口寻址 §6）：**身份候选**，只供 DSH 签发 / 匹配 `windowId`。
+      //   本端不判它、DSH 也不拿它做任何放行判定 —— 从这里删掉这一段，
+      //   全部判定用例必须依然全绿（桥接侧 test/hello-window.test.js 守着这一点）。
+      //   拿不到就整块不出现（老 DSH 只会当作"没上报"，与老扩展同一条降级路径）。
+      ...(windowBlock ? { window: windowBlock } : {}),
     }).catch((err) => log(`hello failed: ${err?.message ?? err}`, 'warn'))
   }
 

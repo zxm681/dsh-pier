@@ -77,6 +77,24 @@ export const ERR = Object.freeze({
    * 那三个说的是"没读到 / 没谈成"，本码说的是"读到了，但磁盘已经不是你以为的那一份"。
    */
   DISK_STATE_CONFLICT: -32013,
+  /**
+   * 窗口寻址失败（多窗口寻址设计 §5）。**新增**码位，不动既有码语义。
+   *
+   * 一个码 + `data.reason` 五选一（`reason` 才是处置依据，码本身只说"寻址没成"）：
+   *  - `window-not-found`：target 解析不到任何已准入的活连接
+   *    （**未准入的连接与"不存在"同码** —— 不许让 target 变成准入探针）；
+   *  - `window-closed`：这个 windowId / connSeq 曾经有过，但记录或连接已经关了；
+   *  - `window-ambiguous`：target 命中不止一条活连接（同一个 windowId 挂在两条连接上、
+   *    或者给的是 label）；
+   *  - `target-unauthorized`：读路径同时给了 `sessionId` 与 `target`，且两者不是同一条
+   *    连接（绑定读的视角冲突 —— 见 §3.1 ③）；
+   *  - `target-not-routable`：**写路径**带 target。写目标只由 grant 决定（§3.2），
+   *    带 target 一律拒，不做"就近解释"。
+   *
+   * 不许拿 -32003（不存在）/ -32007（未连接）/ -32010（没有授权绑定）代替：
+   * 那三个回答的是"这次通话成不成"，本码回答的是"你指的是哪一个窗口，我没法确认"。
+   */
+  WINDOW_TARGET_FAILED: -32014,
 })
 
 /** 错误码 → 稳定诊断串（日志与测试断言都用它，改动即破坏契约）。 */
@@ -98,6 +116,7 @@ export const ERR_NAME = Object.freeze({
   [ERR.EDIT_NOT_BOUND]: 'edit-not-bound',
   [ERR.DOCUMENT_VERSION_CONFLICT]: 'document-version-conflict',
   [ERR.DISK_STATE_CONFLICT]: 'disk-state-conflict',
+  [ERR.WINDOW_TARGET_FAILED]: 'window-target-failed',
 })
 
 /**

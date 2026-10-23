@@ -80,6 +80,9 @@ export const METHOD_TIERS = Object.freeze({
   'vscode.listOpenEditors': TIER_READ,
   // 绑定读（T34）：读的是"我获准写的那份文档"的锚点，本质仍是读。
   'vscode.getDocumentState': TIER_READ,
+  // 多窗口视图（W1）：列的是**本端**握着的那几条连接，一个字节都不发给对端，
+  // 所以它是最纯的读 —— 未声明的消费者（unbound）也按 read 档放行。
+  'vscode.windows.list': TIER_READ,
 
   // ── Tier 2：缓冲区编辑（已实现；**本层收口的正是这笔债**，契约 §6.2.5）──
   'vscode.applyEdit': 'buffer-edit',
