@@ -30,6 +30,13 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
     DSH 发送前与扩展执行前共用），各抄一份必然漂移。另外 **`notify` / `broadcast` 对写入类方法一律
     拒绝**（`assertWritableNotNotified`）：单向消息没有回执，发送前门判完也证明不了对端存下了，
     写入只能走 `request`。
+11. **不可逆动作宁可不做**。`vscode.deleteFile` **只搬不删**：目标 `rename` 进 `<工作区根>/.dsh-quarantine/`，
+    不 `unlink`、不走回收站、一个字节都不销毁（宿主原语 `fs.promises.rename`，跨卷抛 EXDEV 就整个拒，
+    **绝不退化成 copy+delete** —— provider 那条路径实测会先 copy 再 rimraf 源）。所以：
+    **不许**把返回体写成 `deleted`/`trashed`（只有 `quarantined:true`）；**不许**在 `packages/**` 里加任何删除方法或
+    `unlink`/`rm`/`copyFile` 调用（`test/t40-host-surface.test.js` 有静态守门）。
+    要改删除语义（真删、走回收站、加 `restore`）**必须在 commit message 里写明改了什么、为什么**，
+    否则下一轮评审会把它当成偷偷加回来的 `unlink`。
 
 ## 动手之前先查先例（用户 2026-10-21 明确要求）
 
@@ -54,16 +61,23 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
 ## 验证门槛（声称完成前必须全绿）
 
 ```bash
-cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 139
-cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 63
-cd packages/dsh-kit-demo   && node --test "test/*.test.js"   # 7
-cd packages/dsh-kit-bridge && node scripts/e2e.mjs           # 13
+cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 193
+cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 153
+cd packages/dsh-kit-demo   && node --test "test/*.test.js"   # 9
+cd packages/dsh-kit-bridge && node scripts/e2e.mjs           # 22
 ```
 
-条数是**实跑的 `pass` 计数**（2026-10-22 复跑；四条全绿），不是历史快照 —— 加测试就得回来改这几行。
-kit 的 139 里含两道新门禁的条目：`-32009` 响应校验 20 条（`test/response-contract.test.js`）、
-写入绑定门与 `vscode.applyEdit` 39 条（`test/editing-grant.test.js`）；bridge 的 63 里含
-`test/apply-edit.test.js` 31 条。扣掉这三组，历史基线是 kit 80 / bridge 32。
+条数是**实跑的 `pass` 计数**（T48 复跑：kit 193 / bridge 153 / demo 9 / E2E 22；四条全绿），不是历史快照 —— 加测试就得回来改这几行。
+kit 里含两道门禁的条目：`-32009` 响应校验（`test/response-contract.test.js`）、
+写入绑定门与 `vscode.applyEdit`（`test/editing-grant.test.js`）；bridge 里含
+`test/apply-edit.test.js`。T38 白名单（`test/t38-whitelist.test.js`）与 T39 落盘
+（两侧各一个 `test/t39-save.test.js`）各有独立文件。T40 删除（Tier 4）在 `test/t40-delete.test.js`（两侧），另有宿主面守门
+`packages/dsh-kit-bridge/test/t40-host-surface.test.js`（`capabilities.js` 里用到的每个 `host.<field>`
+都必须在 `vscode-host.js` 的返回面登记；真机曾因漏掉 `fileExists` 而整片全红）。
+T42 在 bridge 的 `test/t40-delete.test.js` 里加了三条交错回归（B1：隔离后替换 / 隔离前顶名 /
+原名被占时保留隔离文件）并把 I1 的三条旧断言改写成"交不出整份字节就不许删"（拒删 + 大文本
+整份交付 + base64 无损）；白名单的原型成员回归与"删除返回必须带整份备份"的合同断言在 kit 的
+`test/t38-whitelist.test.js` / `test/t40-delete.test.js`。变异证据在 `work/t42-mutation/*.log`。
 
 涉及真实宿主语义的改动（服务注册、配置监听、VSCode API 调用）**必须真机验证**，
 单测和 E2E 都用假宿主，证明不了那半边。步骤见 `docs/phase6-验收报告.md` §6。

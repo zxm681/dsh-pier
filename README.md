@@ -48,11 +48,11 @@ VS Code
 
 | 包 | 作用 | 版本 | 测试 |
 |---|---|---|---|
-| `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 139 ✅ |
-| `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.2.0 | 63 ✅ |
-| `packages/dsh-kit-demo` | 示例消费者，证明零耦合接入 | 0.1.0 | 7 ✅ |
+| `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 193 ✅ |
+| `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.2.0 | 153 ✅ |
+| `packages/dsh-kit-demo` | 示例消费者，证明零耦合接入 | 0.1.0 | 9 ✅ |
 
-合计 **209 条单测 + 13 项跨进程 E2E**，全绿。
+合计 **355 条单测 + 22 项跨进程 E2E**，全绿。
 
 ## 快速开始
 
@@ -86,10 +86,10 @@ export function apply(ctx) {
 ## 跑测试
 
 ```bash
-cd packages/dsh-vscode-kit   && node --test "test/*.test.js"   # 139
-cd packages/dsh-kit-bridge   && node --test "test/*.test.js"   # 63
-cd packages/dsh-kit-demo     && node --test "test/*.test.js"   # 7
-cd packages/dsh-kit-bridge   && node scripts/e2e.mjs           # 13 跨进程
+cd packages/dsh-vscode-kit   && node --test "test/*.test.js"   # 193
+cd packages/dsh-kit-bridge   && node --test "test/*.test.js"   # 153
+cd packages/dsh-kit-demo     && node --test "test/*.test.js"   # 9
+cd packages/dsh-kit-bridge   && node scripts/e2e.mjs           # 22 跨进程
 ```
 
 打包 VSIX：
@@ -108,6 +108,15 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | `vscode.listOpenEditors` | `{limit?}` | `{editors:[{file, isActive, isDirty, languageId?}], total, truncated}` |
 | `vscode.applyEdit` ⚠️写入 | `{file, range:{start,end}, text, expectedVersion, expectedIncarnation, expectedRangeText?, grant:{id,epoch}}` —— `expectedVersion` 与 `expectedIncarnation` **必填**（缺一即 `-32602`，一个字节都不发；与当前文档/实例不符即 `-32012`），且必须持 grant，见「写入路径的边界」 | `{applied, file, saved:false, textLength}` |
 | `vscode.getDocumentState` | `{file, includeText?}` | `{file, version, incarnation?, isDirty, eol, lineCount, textLength, textUnavailable?, text?}` —— 写入锚点的读侧（版本与实例身份同一次读）；`includeText:true` 且超 8 MiB → `textUnavailable:true`（整份不给，不截断冒充全文） |
+| `vscode.save` ⚠️落盘 | `{file, expectedVersion, expectedIncarnation, expectedDisk:{mtime,size}, grant:{id,epoch}}` —— 双锚点必填；缓冲区脏时 grant 还必须带 `allowDirtySave`（**只认 grant 上的位，不认 params**）；磁盘真值与 `expectedDisk` 不符 → `-32013` | `{saved:true, file, disk:{mtime,size}, dirtyBefore}` —— `disk` 是**保存后重新 stat 的真值**，不是回显参数 |
+| `vscode.deleteFile` ⚠️**隔离归档，不真删** | `{file, expectedVersion, expectedIncarnation, expectedDisk, grant:{id,epoch}}` —— 目标移入 `<工作区根>/.dsh-quarantine/`，**不 `unlink`、不进回收站、一个字节都不销毁**；交不出整份无损备份就**直接拒**（不弹确认框）；跨卷/权限失败 → `-32603` `quarantine-failed`（**不退化 copy+delete**） | `{quarantined:true, file, from, to, confirmedSha256, confirmedByteLength, quarantinedSha256, quarantinedByteLength, bytesChanged, snapshot, backup, quarantine:{path,original,retained,restored}, nameCollision}` —— **没有 `deleted`/`trashed` 字段** |
+
+**消费者白名单（Tier 1 / 1+ / 2 / 3 / 4）**：DSH 宿主侧配置 `consumers: { 插件名: 档位 }`，插件自己声明身份与档位
+`kit.forPlugin('my-plugin', { declared: 'buffer-edit' })`；判定取 `effective = min(declared, allowed)`，
+方法档位高于 `effective` 即拒。未声明身份时**默认只读**，高于只读一律拒。拒绝**复用 `-32602`**（不自造新码）：
+`data.reason` ∈ `tier-unknown`（非法/未知档位）、`consumer-unbound`（没身份还想写）、`declared-above-allowed`（配的档位管不住它要的方法）；
+`data.stage = 'local'` 表示在 DSH 侧就拒了，**宿主一个字节都没收到**。档位轴 = `read` → `buffer-edit` → `disk-write` → `delete`，
+**没登记的方法 fail-closed 落到最高档**。这是**准入收窄，不是沙箱**：它管"谁能调哪一档"，不管"调用方拿到权限后干什么"。
 
 **坐标约定**：协议对外一律 **1-based**（line/column），只在调用 VS Code API 的边界转 0-based。
 **路径约定**：对外一律 `C:\…` 大写盘符（出口归一化，见经验手册 §4.7）。
@@ -127,6 +136,7 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | -32009 | `invalid-response` | 对端返回的响应形状不符合契约 |
 | -32010 | `edit-not-bound` | 写入没有有效的 grant 绑定（五种 `reason` 见下） |
 | -32012 | `document-version-conflict` | 文档版本或实例（`incarnation`）与调用方锚点不符；重读锚点后重发。`data` 只回长度/版本，不回文本 |
+| -32013 | `disk-state-conflict` | 磁盘真值与 `expectedDisk:{mtime,size}` 不符（或确认后字节已被换）。**处置与 `-32012` 相反：永不允许自动重试** —— 重发就是拿没见过的内容覆盖别人的改动；先读磁盘再决定 |
 
 `-32005` 与 `-32601` 的区别：前者是"能力协商没通过，你该降级"，
 后者是"方法名根本不存在，是编程错误"。
@@ -148,8 +158,10 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 1. **本机不是安全边界**。token 防的是「本机别的进程冒充编辑器」，不是防「本机进程读你的文件」。
    同用户下任何进程都能读发现文件拿到 token —— 这是设计上的取舍，不是遗漏。
 2. **写入是收窄放开的，不是「能随意改你代码」**。2026-10-22 起 `vscode.applyEdit` 可做**单文件文本
-   编辑**，但必须持 grant，且只能写 grant 绑定的那个窗口里的真实工作区文件；新建/删除文件、保存落盘
-   仍然不做。挡住什么、挡不住什么见下面「写入路径的边界」。
+   编辑**；2026-10-23 起再放开两项：`vscode.save`（落盘）与 `vscode.deleteFile`（**只搬不删**：移入工作区的
+   `.dsh-quarantine/`，不进回收站也不销毁任何字节）。三项都必须持 grant，且只能作用于 grant 绑定的那个窗口里的
+   真实工作区文件；**新建文件（`vscode.createFile`）仍然不做**。挡住什么、挡不住什么见下面「写入路径的边界」
+   与「写盘的三个边界」。
 3. **洞 3 仍开着**：协议层的响应分支不做 token 校验（见 `phase7-经验手册.md` §5.9 与
    `phase5-打样日志.md` 阶段 9）。它需要单独一轮设计，不要顺手改。
 4. **出站消息带不带 token，按消息类型区分**（`packages/dsh-vscode-kit/src/protocol.js`）：
@@ -221,11 +233,27 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 - **仍未验证，不要读成已支持**：多窗口仲裁的实际行为、macOS/Linux、VS Code 1.91–1.141
   版本区间、长期运行稳定性。
 
+### 写盘的三个边界（Tier 3 / Tier 4，2026-10-23）
+
+前面讲「谁能进来」「能改哪个窗口」。真正动磁盘的两项还多三层，逐条说清挡什么、挡不住什么。
+
+| 边界 | 挡什么 | 挡不住什么 |
+|---|---|---|
+| **磁盘锚点**（`expectedDisk:{mtime,size}`） | 调用方以为的磁盘状态与真实 `stat` 不符 → `-32013`,**一个字节都不写**。宿主的 `save()` 没有 CAS 参数，这是"写之前尽早发现不对"的唯一手段 | 检查之后被保存参与者改写（`editor.formatOnSave`、`files.trimTrailingWhitespace`、`onWillSaveTextDocument` 的监听者），以及 stat 之后、`save()` 真正落盘之前被外部改写 —— **保存不是 CAS**，这两段都在保证范围外 |
+| **双锚点**（版本 + `incarnation`，且磁盘锚点独立成码） | 只给版本锚点会被"关掉又打开"的文档骗过；`-32012`（文档变了，允许重读锚点重发）与 `-32013`（磁盘变了，**永不自动重试**）拆成两个码，处置相反才不会被混着执行 | 一次"同内容改了又改回去"的采样可能看不出来；锚点只证明"我看到的就是那一版"，不证明"那一版就是想要的" |
+| **隔离归档**（`vscode.deleteFile` → `rename` 进 `.dsh-quarantine/`） | **把所有"删了就没"的失败模式一刀切掉**：既不 `unlink` 也不走回收站，所以不存在"跨卷时 provider 先 copy 再 rimraf 源"这种事（那是 T46 实测到的真实行为，现在改走 `fs.promises.rename`，跨卷抛 EXDEV 就整个拒）。回执里的 `quarantine.retained:true` 是字面事实 | 移动之后**隔离体的字节仍可能被改写**（打开着的写句柄指向 inode 而不是路径，`rename` 不使它失效）—— 所以回执用 `bytesChanged` **如实标注**"现在这份 ≠ 人确认的那份"，但**两份都不丢**：确认时那份在 `snapshot`，现在这份在 `to`。另外`(dev, ino)` 只证明"移走的是同一个对象"，不证明"人看到的内容就是磁盘上的内容" |
+
+三条叠起来的结论：**写盘能在"动作之前"尽量早地发现问题（磁盘锚点 / 双锚点），并在"动作之后"不销毁任何东西（隔离归档）**。
+但**没有一条是 CAS**：`TextDocument.save()` 天生没有"写到我才认的那一版上"的语义，
+所以这套东西是**善意防护**（防误调、防幻觉、防手滑），不是**恶意防护**（防同用户进程刻意构造时间窗口）。
+
 ## 明确不做
 
-编辑器内容注入（**2026-10-22 起收窄，不是取消**：只放开 `vscode.applyEdit` 单文件文本编辑，且必须持
-grant、只写绑定的那个窗口；新建/删除文件、保存落盘、批量改动仍不做）、逐能力授权白名单、
-多 VSCode 仲裁、Remote/WSL 反向、Marketplace 发布、面板 UI。详见 `phase2-需求文档.md` 的 out-of-scope。
+编辑器内容注入（**2026-10-22 起收窄，2026-10-23 再放开一级，都不是取消**：`vscode.applyEdit` 单文件文本编辑、
+`vscode.save` 落盘、`vscode.deleteFile` **隔离归档（只搬不删）**，三项都必须持 grant、只作用于绑定窗口；新建文件
+`vscode.createFile` 与批量改动仍不做）、多 VSCode 仲裁、Remote/WSL 反向、Marketplace 发布、面板 UI。
+（per-plugin 授权白名单**已落地**，不再列在"明确不做"里 —— 见「能力面」的档位说明。）
+详见 `phase2-需求文档.md` 的 out-of-scope。
 
 ## 已知未验证
 
