@@ -1867,6 +1867,7 @@ export function apply(ctx, config = {}) {
     helloWaitMs = DEFAULT_HELLO_WAIT_MS,
     grantAckTimeoutMs = DEFAULT_GRANT_ACK_TIMEOUT_MS,
     enabled = true,
+    events = false,
     consumers,
     onLog,
   } = config ?? {}
@@ -2094,6 +2095,7 @@ export function apply(ctx, config = {}) {
         dshHome,
         dshVersion: readDshVersion(),
         capabilities: INBOUND_CAPABILITIES,
+        events: events === true,
         onRequest: handleInbound,
         onError: (err) => log('warn', `protocol error: ${err?.message ?? err}`),
         // hello 由协议层（server.js）自动下发；这里只做插件层的事：

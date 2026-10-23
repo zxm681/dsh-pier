@@ -174,8 +174,11 @@ export async function startBridgeServer(opts = {}) {
 
   const makeLink = (socket) => {
     const write = (line) => {
-      if (socket.destroyed || !socket.writable) return
-      socket.write(line)
+      if (socket.destroyed || !socket.writable) {
+        if (opts.events === true) throw new BridgeError(ERR.DISCONNECTED, 'socket not writable')
+        return // retain the legacy writer behavior when events are disabled
+      }
+      return socket.write(line)
     }
     // ★ 安全：连接建立 ≠ 准入。links 收纳全部 socket 以便 close() 销毁；
     // trusted 只收经过 token 校验的活连接，_activeLink() 不遍历 links。
@@ -187,6 +190,11 @@ export async function startBridgeServer(opts = {}) {
       timeoutMs,
       token,
       onError,
+      events: opts.events === true,
+      writableLength: () => socket.writableLength,
+      eventAllowed: () => trusted.has(link) && !socket.destroyed,
+      onEvent: opts.onEvent,
+      onEventState: opts.onEventState,
       // 所有入站消息都要求顶层 token 与本实例 token 一致（协议 §3.3）。
       authorize: (incoming) => {
         if (incoming !== token) return false
@@ -201,6 +209,7 @@ export async function startBridgeServer(opts = {}) {
     })
     link.authorized = false
     link.socket = socket
+    if (opts.events === true) socket.on('drain', () => link.events.drain())
     const feed = createLineSplitter((line) => link.handleLine(line))
     socket.on('data', (chunk) => {
       try { feed(chunk) } catch (err) { onError?.(err); socket.destroy() }
@@ -234,6 +243,7 @@ export async function startBridgeServer(opts = {}) {
       protocolVersion: PROTOCOL_VERSION,
       dshVersion,
       capabilities,
+      ...(opts.events === true ? { eventChannel: link.events.hello } : {}),
     })
     // 连接建立回调（插件层用来记录身份/唤醒等待者）。
     // 回调放 try/catch：插件层抛错不允许毒化连接建立。

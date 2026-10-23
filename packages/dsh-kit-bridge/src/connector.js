@@ -126,6 +126,7 @@ export function createConnector(deps) {
   function forgetLink(gone) {
     if (linkState.link === gone) linkState.link = null
     if (!gone) return 0
+    if (deps.events === true) gone.close('connector link forgotten')
     const n = grants.closeLink(gone)
     if (n > 0) log(`edit grant invalidated by disconnect (${n})`, 'info')
     return n
@@ -349,8 +350,21 @@ export function createConnector(deps) {
     socket = s
     // 新连接 = 新一轮协商：上一轮的版本判定不得为新对端背书。
     peer = pendingPeer()
-    link = connect({
-      write: (line) => { if (!s.destroyed && s.writable) s.write(line) },
+    let admitted = false
+    const attached = connect({
+      write: (line) => {
+        if (s.destroyed || !s.writable) {
+          if (deps.events === true) throw new BridgeError(ERR.DISCONNECTED, 'socket not writable')
+          return
+        }
+        return s.write(line)
+      },
+      events: deps.events === true,
+      writableLength: () => s.writableLength,
+      eventAllowed: () => admitted && socket === s && !s.destroyed
+        && peer.status === 'compatible' && isTrusted?.() === true,
+      onEvent: deps.onEvent,
+      onEventState: deps.onEventState,
       onRequest: handleInbound,
       timeoutMs: requestTimeoutMs,
       token: info.token,
@@ -361,7 +375,9 @@ export function createConnector(deps) {
       // 放行它不会削弱安全：hello 里没有任何秘密，且它只作协议版本公告，不触发任何动作。
       authorize: (incoming, method) => method === 'bridge.hello' || incoming === info.token,
     })
+    link = attached
     link.socket = s
+    if (deps.events === true) s.on('drain', () => attached.events.drain())
     // 这是"当前活连接"的**唯一**写入口；绑定门读的就是它（对象身份，不是序号）。
     linkState.link = link
 
@@ -398,11 +414,14 @@ export function createConnector(deps) {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: CAPABILITIES,
       features: PEER_FEATURES,
+      ...(deps.events === true ? { eventChannel: attached.events.hello } : {}),
       // ★ W3（多窗口寻址 §6）：**身份候选**，只供 DSH 签发 / 匹配 `windowId`。
       //   本端不判它、DSH 也不拿它做任何放行判定 —— 从这里删掉这一段，
       //   全部判定用例必须依然全绿（桥接侧 test/hello-window.test.js 守着这一点）。
       //   拿不到就整块不出现（老 DSH 只会当作"没上报"，与老扩展同一条降级路径）。
       ...(windowBlock ? { window: windowBlock } : {}),
+    }).then((ack) => {
+      admitted = ack?.ok === true && judgeProtocolVersion(ack?.protocolVersion).compatible
     }).catch((err) => log(`hello failed: ${err?.message ?? err}`, 'warn'))
   }
 

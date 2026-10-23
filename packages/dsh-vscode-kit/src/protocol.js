@@ -9,6 +9,13 @@
  * 分帧：ndjson。JSON.stringify 会把内部换行转义为 \n，故按 '\n' 切行无粘包歧义。
  */
 
+import { randomBytes } from 'node:crypto'
+import {
+  EVENT_METHOD, EVENT_CHANNEL_VERSION, EVENT_CHANNEL_HELLO, EVENT_TYPES,
+  EVENT_QUEUE_MAX_COUNT, EVENT_QUEUE_MAX_BYTES, EVENT_MAX_BYTES,
+  validEventStream, eventEnvelopeError,
+} from './event-contract.js'
+
 /** JSON-RPC 2.0 标准错误码 + 本协议扩展码（阶段4 §3.3）。 */
 export const ERR = Object.freeze({
   PARSE: -32700,
@@ -230,6 +237,11 @@ export class BridgeError extends Error {
  *        `notify()` / `respond()` **默认不带**，调用点显式 `{withToken: true}` 才带（见各自「安全边界」段）；
  *        `respondError()` **恒不带** —— 它没有 withToken 通道（见其 JSDoc 的已知限制）。
  *        换句话说：本字段是「凭据来源」，不是「所有出站消息都带 token」的总开关。
+ * @param {boolean} [opts.events=false] E1 transport opt-in (strict true only).
+ * @param {() => boolean} [opts.eventAllowed] Live admission/trust gate; missing = denied.
+ * @param {() => number} [opts.writableLength] Socket buffered bytes (separate from event queues).
+ * @param {(event, ctx) => any} [opts.onEvent] Internal E2/E3 boundary, not service subscription API.
+ * @param {(state) => void} [opts.onEventState] Metadata-only stale observation.
  * @param {(err: Error) => void} [opts.onError] 协议层内部异常（解析失败等）观察点
  * @param {(token: string|undefined, method: string) => boolean} [opts.authorize]
  *        入站请求/通知的鉴权钩子。返回 false → 请求方收到 -32001（通知则静默丢弃并上报）。
@@ -253,10 +265,196 @@ export function connect(opts) {
   let closed = false
   let closeReason = null
 
+  // E1 is opt-in. One internal stream per direction/link keeps the total bounded;
+  // E3 will multiplex consumer subscriptions ABOVE this transport, not in pending.
+  const eventsEnabled = opts.events === true
+  let eventPeer = false
+  let blocked = false
+  let outgoing = null
+  let incoming = null
+  let outQueue = []
+  let outBytes = 0
+  let inQueue = []
+  let inBytes = 0
+  let delivering = false
+
+  function eventAllowed() {
+    return eventsEnabled && !closed && eventPeer && opts.eventAllowed?.() === true
+  }
+  function eventState(stream, reason) {
+    if (!stream || stream.stale) return
+    stream.stale = true
+    stream.reason = reason
+    try {
+      opts.onEventState?.({ subscriptionId: stream.subscriptionId,
+        streamEpoch: stream.streamEpoch, stale: true, reason, link: self })
+    } catch { /* diagnostics must not poison RPC */ }
+  }
+  function clearInbound() {
+    // The running callback cannot be recalled; retain/count it until settlement.
+    inQueue = delivering ? inQueue.slice(0, 1) : []
+    inBytes = inQueue.reduce((sum, entry) => sum + entry.bytes, 0)
+  }
+  function invalidateEvents() {
+    eventState(outgoing, 'not-allowed'); eventState(incoming, 'not-allowed')
+    outQueue = []; outBytes = 0; clearInbound()
+  }
+  function eventFrame(envelope) {
+    return { jsonrpc: '2.0', method: EVENT_METHOD, params: envelope }
+  }
+  function flushEvents() {
+    while (!closed && !blocked && outQueue.length) {
+      if (!eventAllowed()) {
+        invalidateEvents()
+        return
+      }
+      if ((opts.writableLength?.() ?? 0) >= EVENT_QUEUE_MAX_BYTES) {
+        blocked = true
+        outgoingGap('queue-overflow')
+        return
+      }
+      const entry = outQueue.shift()
+      outBytes -= entry.bytes
+      try {
+        // false means ACCEPTED by Writable, but STOP until drain. Never retry it.
+        if (write(entry.line) === false) blocked = true
+      } catch {
+        eventState(outgoing, 'write-failed')
+        close('event write failed')
+      }
+    }
+  }
+  function outgoingGap(reason) {
+    if (!outgoing || outgoing.stale) return
+    eventState(outgoing, reason)
+    outQueue = []; outBytes = 0
+    if (outgoing.nextSeq >= Number.MAX_SAFE_INTEGER) return close('event sequence exhausted')
+    const envelope = { subscriptionId: outgoing.subscriptionId, streamEpoch: outgoing.streamEpoch,
+      seq: outgoing.nextSeq++, type: 'gap', observedAt: Date.now(), payload: { reason } }
+    // Explicit credentials, just like publish(): never rely on notify defaults.
+    const msg = eventFrame(envelope)
+    msg.token = token
+    const line = JSON.stringify(msg) + '\n'
+    outQueue.push({ line, bytes: Buffer.byteLength(line) })
+    outBytes = Buffer.byteLength(line)
+    flushEvents()
+  }
+  function enqueueEvent(msg) {
+    if (!eventAllowed()) { invalidateEvents(); return false }
+    if (!outgoing || outgoing.stale || msg.token !== token
+        || typeof token !== 'string' || token === '') return false
+    if (msg.params?.subscriptionId !== outgoing.subscriptionId
+        || msg.params?.streamEpoch !== outgoing.streamEpoch) return false
+    if (msg.params?.seq !== outgoing.nextSeq) { outgoingGap('invalid-event'); return false }
+    let line
+    try {
+      if (eventEnvelopeError(msg.params)) throw new Error('invalid event')
+      line = JSON.stringify(msg) + '\n'
+    } catch { outgoingGap('invalid-event'); return false }
+    const bytes = Buffer.byteLength(line)
+    if (bytes > EVENT_MAX_BYTES) { outgoingGap('event-too-large'); return false }
+    if (outQueue.length >= EVENT_QUEUE_MAX_COUNT || outBytes + bytes > EVENT_QUEUE_MAX_BYTES) {
+      outgoingGap('queue-overflow'); return false
+    }
+    outgoing.nextSeq++
+    outQueue.push({ line, bytes }); outBytes += bytes
+    flushEvents()
+    return !closed && outgoing?.stale === false
+  }
+  function deliverEvents() {
+    if (delivering || !inQueue.length) return
+    const entry = inQueue[0]
+    delivering = true
+    Promise.resolve().then(() => {
+      if (incoming !== entry.stream || entry.stream.stale) return
+      if (!eventAllowed()) { eventState(entry.stream, 'not-allowed'); clearInbound(); return }
+      return opts.onEvent?.(entry.envelope, { link: self })
+    }).catch(() => {
+      eventState(entry.stream, 'listener-failed'); clearInbound()
+    }).finally(() => {
+      if (inQueue[0] === entry) { inQueue.shift(); inBytes -= entry.bytes }
+      delivering = false
+      deliverEvents()
+    })
+  }
+  function receiveEvent(msg, wireBytes) {
+    // A dedicated per-frame token check also protects pure in-memory terminals.
+    if (typeof token !== 'string' || token === '' || msg.token !== token) return
+    if (!eventAllowed()) { invalidateEvents(); return }
+    if (!incoming || incoming.stale) return
+    const envelope = msg.params
+    if (envelope?.subscriptionId !== incoming.subscriptionId
+        || envelope?.streamEpoch !== incoming.streamEpoch) return
+    let bytes
+    try {
+      if (eventEnvelopeError(envelope)) throw new Error('invalid event')
+      bytes = wireBytes ?? Buffer.byteLength(JSON.stringify(msg) + '\n')
+    } catch { eventState(incoming, 'invalid-event'); clearInbound(); return }
+    if (bytes > EVENT_MAX_BYTES) {
+      eventState(incoming, 'event-too-large'); clearInbound(); return
+    }
+    if (envelope.seq <= incoming.lastSeq) return // duplicate, NEVER redeliver
+    if (envelope.seq !== incoming.lastSeq + 1) {
+      eventState(incoming, 'seq-gap'); clearInbound(); return
+    }
+    incoming.lastSeq = envelope.seq // synchronous admission, before any await
+    if (envelope.type === 'gap' || envelope.type === 'streamClosed') {
+      eventState(incoming, envelope.payload.reason); clearInbound(); return
+    }
+    if (inQueue.length >= EVENT_QUEUE_MAX_COUNT || inBytes + bytes > EVENT_QUEUE_MAX_BYTES) {
+      eventState(incoming, 'queue-overflow'); clearInbound(); return
+    }
+    // Snapshot at boundary: caller mutation cannot change queued bytes/fields.
+    inQueue.push({ envelope: JSON.parse(JSON.stringify(envelope)), bytes, stream: incoming })
+    inBytes += bytes
+    deliverEvents()
+  }
+  const eventChannel = {
+    get hello() { return eventsEnabled ? EVENT_CHANNEL_HELLO : undefined },
+    get ready() { return eventAllowed() },
+    // Internal transport installation only; NOT a consumer subscription API or RPC.
+    openStream(subscriptionId) {
+      const descriptor = { subscriptionId, streamEpoch: randomBytes(16).toString('hex'), startSeq: 1 }
+      if (!eventAllowed() || !validEventStream(descriptor)) return null
+      if (outgoing) return null // dispose before installing another stream
+      outgoing = { ...descriptor, nextSeq: descriptor.startSeq, stale: false }
+      return { ...descriptor }
+    },
+    acceptStream(descriptor) {
+      if (!eventAllowed() || !validEventStream(descriptor) || incoming || delivering) return false
+      incoming = { subscriptionId: descriptor.subscriptionId, streamEpoch: descriptor.streamEpoch,
+        startSeq: descriptor.startSeq, lastSeq: descriptor.startSeq - 1, stale: false }
+      return true
+    },
+    publish(type, payload, observedAt = Date.now()) {
+      if (!eventAllowed()) { invalidateEvents(); return false }
+      if (!outgoing || outgoing.stale) return false
+      if (!EVENT_TYPES.includes(type) || type === 'gap' || type === 'streamClosed') return false
+      if (outgoing.nextSeq >= Number.MAX_SAFE_INTEGER) { close('event sequence exhausted'); return false }
+      return notify(EVENT_METHOD, { subscriptionId: outgoing.subscriptionId,
+        streamEpoch: outgoing.streamEpoch, seq: outgoing.nextSeq, type, observedAt, payload },
+      { withToken: true })
+    },
+    dispose() {
+      eventState(outgoing, 'unsubscribed'); eventState(incoming, 'unsubscribed')
+      outgoing = null; incoming = null
+      outQueue = []; outBytes = 0; clearInbound()
+    },
+    drain() { blocked = false; flushEvents() },
+    snapshot() {
+      const state = (s) => s ? { subscriptionId: s.subscriptionId, streamEpoch: s.streamEpoch,
+        stale: s.stale, reason: s.reason ?? null } : null
+      return { enabled: eventsEnabled, ready: eventAllowed(), blocked,
+        outgoing: state(outgoing), incoming: state(incoming),
+        outCount: outQueue.length, outBytes, inCount: inQueue.length, inBytes }
+    },
+  }
+
   function send(obj) {
     if (closed) return false
     try {
-      write(JSON.stringify(obj) + '\n')
+      const accepted = write(JSON.stringify(obj) + '\n')
+      if (eventsEnabled && accepted === false) blocked = true
       return true
     } catch (err) {
       onError?.(err)
@@ -273,6 +471,8 @@ export function connect(opts) {
     if (closed) return
     closed = true
     closeReason = reason || 'connection closed'
+    eventState(outgoing, 'closed'); eventState(incoming, 'closed')
+    outQueue = []; outBytes = 0; clearInbound()
     for (const [, entry] of pending) {
       clearTimeout(entry.timer)
       entry.reject(new BridgeError(ERR.DISCONNECTED, closeReason, { method: entry.method }))
@@ -291,6 +491,9 @@ export function connect(opts) {
    * @returns {Promise<any>} 成功时 resolve result；失败 reject BridgeError。
    */
   function request(method, params, reqOpts = {}) {
+    if (eventsEnabled && method === EVENT_METHOD) {
+      return Promise.reject(new BridgeError(ERR.INVALID_REQUEST, 'events must be notifications'))
+    }
     if (closed) {
       return Promise.reject(new BridgeError(ERR.DISCONNECTED, closeReason || 'connection closed', { method }))
     }
@@ -335,6 +538,7 @@ export function connect(opts) {
   function notify(method, params, opts) {
     const msg = { jsonrpc: '2.0', method, params: params ?? {} }
     if (opts?.withToken === true && token !== undefined) msg.token = token
+    if (eventsEnabled && method === EVENT_METHOD) return enqueueEvent(msg)
     send(msg)
   }
 
@@ -368,7 +572,7 @@ export function connect(opts) {
   }
 
   /** 处理一条入站消息对象（已解析）。 */
-  function handleMessage(msg) {
+  function handleMessage(msg, wireBytes) {
     if (!msg || typeof msg !== 'object') {
       reportError(new BridgeError(ERR.INVALID_REQUEST, 'message is not an object'))
       return
@@ -415,6 +619,20 @@ export function connect(opts) {
       return
     }
 
+    if (eventsEnabled && method === 'bridge.hello') {
+      eventPeer = judgeProtocolVersion(msg.params?.protocolVersion).compatible
+        && msg.params?.eventChannel?.version === EVENT_CHANNEL_VERSION
+      if (!eventPeer) {
+        eventState(outgoing, 'not-allowed'); eventState(incoming, 'not-allowed')
+        outQueue = []; outBytes = 0; clearInbound()
+      }
+    }
+    if (eventsEnabled && method === EVENT_METHOD) {
+      if (msg.id !== undefined) respondError(msg.id, ERR.INVALID_REQUEST, 'events must be notifications')
+      else receiveEvent(msg, wireBytes)
+      return // Never call a business/write handler, never touch the pending map.
+    }
+
     if (msg.id === undefined) {
       // 入站通知：处理但不回包
       if (onRequest) {
@@ -456,7 +674,8 @@ export function connect(opts) {
       reportError(new BridgeError(ERR.PARSE, `invalid JSON: ${err.message}`))
       return
     }
-    handleMessage(msg)
+    // Count original wire bytes: whitespace and \\u escapes must not bypass the cap.
+    handleMessage(msg, eventsEnabled ? Buffer.byteLength(line) + 1 : undefined)
   }
 
   // 连接终端本体。先起名再返回，是为了让 handleMessage 能把 ctx.link 指向**这条连接**
@@ -464,6 +683,8 @@ export function connect(opts) {
   const self = {
     request,
     notify,
+    // Internal link-only control plane; deliberately absent from the service facade.
+    events: eventChannel,
     respond,
     respondError,
     handleLine,
