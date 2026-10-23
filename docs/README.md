@@ -48,13 +48,15 @@ VS Code
 
 | 包 | 作用 | 版本 | 测试 |
 |---|---|---|---|
-| `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 193 ✅ |
-| `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.2.0 | 153 ✅ |
+| `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 213 ✅（串行） |
+| `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.2.0 | 156 ✅ |
 | `packages/dsh-kit-demo` | 示例消费者，证明零耦合接入 | 0.1.0 | 9 ✅ |
 
-合计 **355 条单测 + 22 项跨进程 E2E**，全绿（T48 历史实跑快照，不含本轮多窗口新增测试；T52 文档同步未重跑测试）。
+合计 **378 条单测 + 22 项跨进程 E2E**（T54 验证门槛）。
 
-**多窗口源码已落地（未提交），真机双窗口尚未验**：本轮只静态核实实现，不把单窗口历史验收或设计稿当成双窗口实测。完整字段与证据见[契约 §3.1 / §9.4](<D:/code-workspace/projects/dsh-vscode-dev/docs/协作编辑-钩子契约.md#31-多窗口发现与读路径寻址t52按未提交实现核实>)。
+**多窗口 A10–A13 已真机确证（VS Code 1.143.1）**：两窗口 win-08 / win-09 均 stable:true；DSH 重启复用；getSelection 带 opts.target 各自命中，连续 4 轮一致；applyEdit 带 target:'#1' 被 -32014 target-not-routable 拒绝。证据：[探针 JSON](<D:/code-workspace/work/multiwin-probe.json>)（2026-10-23T18:34:27.346Z 起；重启复用采用用户已确证记录及运行态注册表），详见[设计稿 §7](<D:/code-workspace/projects/dsh-vscode-dev/docs/多窗口寻址-设计.md#71-a10a13-当前真机验收结果t54>)。
+
+**边界**：写路径 target 路由未开放，写目标仍只认 grant；普通安装链路、定向 openFile、关窗后的错误矩阵未覆盖。注册表 9 条/2 工作区的历史记录回收仍待验证；源码已有 64 条上限，并非完全无淘汰（设计稿 §9）。
 
 ## 快速开始
 
@@ -88,8 +90,8 @@ export function apply(ctx) {
 ## 跑测试
 
 ```bash
-cd packages/dsh-vscode-kit   && node --test "test/*.test.js"   # 193
-cd packages/dsh-kit-bridge   && node --test "test/*.test.js"   # 153
+cd packages/dsh-vscode-kit   && node --test --test-concurrency=1 "test/*.test.js"   # 213（或 npm test）
+cd packages/dsh-kit-bridge   && node --test "test/*.test.js"   # 156
 cd packages/dsh-kit-demo     && node --test "test/*.test.js"   # 9
 cd packages/dsh-kit-bridge   && node scripts/e2e.mjs           # 22 跨进程
 ```
@@ -114,6 +116,8 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | `vscode.getDocumentState` | `{file, includeText?}` | `{file, version, incarnation?, isDirty, eol, lineCount, textLength, textUnavailable?, text?}` —— 写入锚点的读侧（版本与实例身份同一次读）；`includeText:true` 且超 8 MiB → `textUnavailable:true`（整份不给，不截断冒充全文） |
 | `vscode.save` ⚠️落盘 | `{file, expectedVersion, expectedIncarnation, expectedDisk:{mtime,size}, grant:{id,epoch}}` —— 双锚点必填；缓冲区脏时 grant 还必须带 `allowDirtySave`（**只认 grant 上的位，不认 params**）；磁盘真值与 `expectedDisk` 不符 → `-32013` | `{saved:true, file, disk:{mtime,size}, dirtyBefore}` —— `disk` 是**保存后重新 stat 的真值**，不是回显参数 |
 | `vscode.deleteFile` ⚠️**隔离归档，不真删** | `{file, expectedVersion, expectedIncarnation, expectedDisk, grant:{id,epoch}}` —— 目标移入 `<工作区根>/.dsh-quarantine/`，**不 `unlink`、不进回收站、一个字节都不销毁**；交不出整份无损备份就**直接拒**（不弹确认框）；跨卷/权限失败 → `-32603` `quarantine-failed`（**不退化 copy+delete**） | `{quarantined:true, file, from, to, confirmedSha256, confirmedByteLength, quarantinedSha256, quarantinedByteLength, bytesChanged, snapshot, backup, quarantine:{path,original,retained,restored}, nameCollision}` —— **没有 `deleted`/`trashed` 字段** |
+
+**多窗口调用**：先 `kit.vscode.windows.list()` 发现，再 `kit.request('vscode.getSelection', {}, {target:'win-09'})` 读指定窗口（`target` 在 opts，不在 params）。本次 win-09 / win-08 各自读回不同工作区文件；`-32014` 按 reason 处理，写+target 只验证到拒绝，不是定向写入能力。
 
 **连接序不是身份**：`windowId` 是 DSH 按 `sessionId + 工作区根 + uiKind` 指纹签发/匹配复用的 `win-NN`，默认尽力持久化到 `~/.dsh/dsh-vscode-kit/windows.json`；指纹不成立则 `tmp-<connSeq>` + `stable:false`，不落盘。`connSeq` 只表示本进程连接先后，与 `windowId` **分字段、禁止互相比**；稳定性依赖指纹与记录，不保证跨 VS Code 重启不变或落盘成功。当前扩展未上报 focused，列表该字段为 null；元数据与 active 均不是安全判据。证据：[windows.js:135–147](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/windows.js#L135-L147>)、[windows.js:217–264](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/windows.js#L217-L264>)、[extension.js:515–530](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-kit-bridge/src/extension.js#L515-L530>)；完整字段类型见[契约 §3.1](<D:/code-workspace/projects/dsh-vscode-dev/docs/协作编辑-钩子契约.md#31-多窗口发现与读路径寻址t52按未提交实现核实>)。
 

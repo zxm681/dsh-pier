@@ -66,13 +66,25 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
 ## 验证门槛（声称完成前必须全绿）
 
 ```bash
-cd packages/dsh-vscode-kit && node --test "test/*.test.js"   # 193
-cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 153
+cd packages/dsh-vscode-kit && node --test --test-concurrency=1 "test/*.test.js"   # 213（或 npm test）
+cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 156
 cd packages/dsh-kit-demo   && node --test "test/*.test.js"   # 9
 cd packages/dsh-kit-bridge && node scripts/e2e.mjs           # 22
 ```
 
-条数是**实跑的 `pass` 计数**（T48 复跑：kit 193 / bridge 153 / demo 9 / E2E 22；四条全绿），不是历史快照 —— 加测试就得回来改这几行。
+条数是**实跑的 `pass` 计数**（T54：kit 213 / bridge 156 / demo 9 / E2E 22），加测试就得回来改这几行。
+
+**kit 必须串行执行**（包内 `npm test` 同样使用 `node --test --test-concurrency=1 "test/*.test.js"`）。
+14 个测试文件并行启动多实例，共用默认 7410–7419 的 10 个端口；端口区间争用是 flaky 的根因推断，串行化是测试门缓解，不是产品修复。
+**并行执行会偶发红，别当成产品 bug**（若串行仍红，必须继续排查，不得套用此解释）。用户观测 5 次中两次分别 3 红、11 红；
+T54 在 Node v24.20.0 复现三次并行：`tests/pass/fail = 213/210/3、213/202/11、213/213/0`，串行基线 `213/213/0`。
+原始输出保存在 [并行 1](<work/t54-parallel-1.log>)、[并行 2](<work/t54-parallel-2.log>)、[并行 3](<work/t54-parallel-3.log>)、[串行基线](<work/t54-serial-baseline.log>)。
+修改脚本后实际运行 `npm test` 三次，均为 `ℹ tests 213 / ℹ pass 213 / ℹ fail 0`：
+[串行 1](<work/t54-serial-final-1.log>)、[串行 2](<work/t54-serial-final-2.log>)、[串行 3](<work/t54-serial-final-3.log>)；bridge 156/156、demo 9/9、E2E 22/22 亦已本轮复跑全绿。
+
+**多窗口真机已验证的边界**：VS Code 1.143.1，A10 两窗口不同号且 stable:true、A11 DSH 重启复用、A12 getSelection 的 target 各自命中、A13 写+target 拒绝；
+见[设计稿 §7](<docs/多窗口寻址-设计.md#7-验收清单每条都能变红>)。这不代表写路径 target 路由开放，也不覆盖普通安装链路。
+注册表回收仍是待办：当前源码已有 64 条上限与按 lastSeenAt 淘汰，并非完全无淘汰；运行态生效、超限加载与历史会话回收需另验（设计稿 §9）。
 kit 里含两道门禁的条目：`-32009` 响应校验（`test/response-contract.test.js`）、
 写入绑定门与 `vscode.applyEdit`（`test/editing-grant.test.js`）；bridge 里含
 `test/apply-edit.test.js`。T38 白名单（`test/t38-whitelist.test.js`）与 T39 落盘
