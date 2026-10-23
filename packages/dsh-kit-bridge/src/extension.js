@@ -8,8 +8,8 @@
 
 import * as vscode from 'vscode'
 import { existsSync, writeFileSync, mkdirSync, readFileSync, statSync } from 'node:fs'
-import { randomBytes } from 'node:crypto'
-import { join } from 'node:path'
+import { createHash, randomBytes } from 'node:crypto'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 import { ERR, ERR_NAME } from '../../dsh-vscode-kit/src/protocol.js'
@@ -290,12 +290,14 @@ async function runSelfTest(dispatch, { grants } = {}) {
     return { ...evidence, staleRetry }
   })
 
-  // 5) T40：**真实删除**（`vscode.deleteFile`）。这是本项目的第一个不可逆操作，
-  //    单测与 E2E 都用假宿主，证明不了这三件事：真确认框真的会拦住人、真
-  //    `workspace.fs.delete(uri,{useTrash:true})` 真的把文件从盘上拿走、
-  //    走完回收站之后我们**仍然**只能说 `trashed:'unknown'`。
-  //    ⚠️ 只删本步骤自己刚造出来的 fixture（工作区根下 `dsh-selftest-delete-*`）：
-  //       真机验证绝不许碰仓库里任何既有文件。
+  // 5) T44：**隔离归档**（`vscode.deleteFile`）。这一格原来按 T40 语义断言
+  //    `deleted:true` + 回收站 `trashed:'unknown'`；T44 已裁决"**不删任何字节**，
+  //    只把目标 rename 进 `<工作区根>/.dsh-quarantine/<UTC 时间戳>-<原名>`
+  //    （跨卷 EXDEV 整个拒、绝不退化 copy+delete）"，所以断言换成隔离语义。
+  //    真机才能证明的三件事：① 真确认框真的会拦住人；② 真 rename 真的让原路径消失、
+  //    隔离体真的在盘上；③ 隔离体字节与回执里的 `quarantinedSha256` 一致。
+  //    ⚠️ 只动本步骤自己刚造出来的 fixture（工作区根下 `dsh-selftest-delete-*`）；
+  //       本步骤**一个字节都不销毁**，隔离体留在 `.dsh-quarantine/` 里供人复核。
   await step('delete:confirm', async () => {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath
     if (!root) return { skipped: 'no workspace folder open (deletes must land inside a trusted root)' }
@@ -330,11 +332,27 @@ async function runSelfTest(dispatch, { grants } = {}) {
       failure = err
     }
     const waitedMs = Date.now() - startedAt
+    // ★ 隔离语义的三个可核对面都在盘上量：原路径没了 / 隔离体在 / 隔离体字节真身是多少。
+    //   隔离体位置只接受回执里的 `to`（不自己拼路径：拼出来的"对上"证明不了什么）。
+    const quarantinePath = typeof res?.to === 'string' ? res.to : null
+    const quarantineBytes = quarantinePath && existsSync(quarantinePath)
+      ? readFileSync(quarantinePath)
+      : null
+    const quarantineSha = quarantineBytes === null
+      ? null
+      : createHash('sha256').update(quarantineBytes).digest('hex')
     const evidence = {
       file,
       waitedMs,
       beforeStat: expectedDisk,
       existsAfter: existsSync(file),
+      quarantinedPath: quarantinePath,
+      quarantineDir: quarantinePath === null ? null : dirname(quarantinePath),
+      quarantinedExists: quarantineBytes !== null,
+      quarantinedByteLength: quarantineBytes?.length ?? null,
+      quarantinedShaRecomputed: quarantineSha,
+      quarantinedShaReported: res?.quarantinedSha256 ?? null,
+      bytesChanged: res?.bytesChanged ?? null,
       result: res ?? null,
       error: failure
         ? {
@@ -346,17 +364,54 @@ async function runSelfTest(dispatch, { grants } = {}) {
         : null,
     }
     if (failure) {
-      throw new Error(`real delete failed: ${String(failure.code)} `
+      throw new Error(`real quarantine failed: ${String(failure.code)} `
         + `${String(failure.data?.reason ?? '')} ${failure.message}`)
     }
-    if (res.deleted !== true) throw new Error(`expected deleted:true, got ${String(res.deleted)}`)
-    // ★ 唯一诚实的取值：`useTrash` 是 "whenever possible"，扩展侧没有 Trash 能力位可探。
-    if (res.trashed !== 'unknown') {
-      throw new Error(`trashed must be 'unknown', got ${JSON.stringify(res.trashed)}`)
+    // ① 语义：是"隔离"，不是"删除" —— 字段本身就是判据（铁律 11：不许出现 deleted/trashed）。
+    if (res.quarantined !== true) {
+      throw new Error(`expected quarantined:true, got ${JSON.stringify(res.quarantined)}`)
     }
-    if (evidence.existsAfter) throw new Error('the file still exists after a reported delete')
+    const forbidden = ['deleted', 'trashed']
+      .filter((k) => Object.prototype.hasOwnProperty.call(res, k))
+    if (forbidden.length > 0) {
+      throw new Error(`T44 语义下返回体不许出现 ${forbidden.join('/')}（实际：`
+        + `${JSON.stringify(forbidden.map((k) => [k, res[k]]))}）`)
+    }
+    // ② 原路径消失，隔离体真的在盘上。
+    if (evidence.existsAfter) throw new Error('the original path still exists after a reported quarantine')
+    if (!evidence.quarantinedExists) {
+      throw new Error(`the quarantine body is missing at ${String(quarantinePath)}`)
+    }
+    // ③ 隔离体字节 = 回执里的 `quarantinedSha256`（那一份是移动**之后**在隔离体上实测的）。
+    if (quarantineSha !== res.quarantinedSha256) {
+      throw new Error(`quarantinedSha256 does not match the bytes on disk: reported `
+        + `${String(res.quarantinedSha256)}, recomputed ${String(quarantineSha)}`)
+    }
+    if (res.quarantine?.retained !== true) {
+      throw new Error('quarantine.retained must be true (this body is the one to keep), got '
+        + `${JSON.stringify(res.quarantine)}`)
+    }
+    // ④ 整份备份必须交出来（I1）：交不出恢复材料就不许动别人的文件。
+    if (res.backup?.delivered !== true) {
+      throw new Error(`backup.delivered must be true, got ${JSON.stringify(res.backup)}`)
+    }
     if (typeof res.snapshot?.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(res.snapshot.sha256)) {
       throw new Error(`snapshot.sha256 missing/malformed: ${JSON.stringify(res.snapshot)}`)
+    }
+    // ⑤ `bytesChanged`：**两种取值都算通过** —— false = 归档前后字节一致；true = 归档后
+    //    被就地改写过（那是 design：确认时那份在 `snapshot`，盘上这份在 `to`，两份都在）。
+    //    唯一的要求是"如实"：它必须等于隔离体实测 vs 人确认时那份的**真实差异**。
+    //    这里重算差异再比，断言的是诚实性，不是某个期望值。
+    if (typeof res.bytesChanged !== 'boolean') {
+      throw new Error(`bytesChanged must be a boolean, got ${JSON.stringify(res.bytesChanged)}`)
+    }
+    const reallyChanged = quarantineSha !== res.confirmedSha256
+      || evidence.quarantinedByteLength !== res.confirmedByteLength
+    if (res.bytesChanged !== reallyChanged) {
+      throw new Error(`bytesChanged=${String(res.bytesChanged)} is not honest: quarantined vs `
+        + `confirmed differ = ${String(reallyChanged)} (confirmed `
+        + `${String(res.confirmedSha256)}/${String(res.confirmedByteLength)}, quarantined `
+        + `${String(res.quarantinedSha256)}/${String(evidence.quarantinedByteLength)})`)
     }
     return evidence
   })

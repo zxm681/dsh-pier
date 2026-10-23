@@ -24,7 +24,7 @@ import { CAPABILITIES } from './capabilities.js'
 
 /** 扩展对外声明的身份（写进 hello，DSH 侧据此判能力）。 */
 export const CLIENT_ID = 'dsh-kit-bridge'
-export const EXTENSION_VERSION = '0.3.0'
+export const EXTENSION_VERSION = '0.3.1'
 
 /**
  * hello 里的 `features` 声明（T34）—— **能力清单之外**的语义能力公告。
