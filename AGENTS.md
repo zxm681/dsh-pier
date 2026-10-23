@@ -38,6 +38,11 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
     要改删除语义（真删、走回收站、加 `restore`）**必须在 commit message 里写明改了什么、为什么**，
     否则下一轮评审会把它当成偷偷加回来的 `unlink`。
 
+12. **连接序不是身份**。`windowId` 与 `connSeq` 必须分字段、禁止互相比；前者由 DSH 按指纹签发/复用，后者仅表示本进程连接先后。
+    `target` **只影响读路径**：写路径带 target 一律 `-32014 target-not-routable`，在 `_bindWriteTarget` 前拒绝；写目标永远由 grant 记录的 link 决定。
+    绑定读与 target 冲突 → `target-unauthorized`，不回退 `_activeLink()`。依据：[windows.js:217–244](<packages/dsh-vscode-kit/src/windows.js#L217-L244>)、
+    [index.js:895–918](<packages/dsh-vscode-kit/src/index.js#L895-L918>)、[index.js:1663–1708](<packages/dsh-vscode-kit/src/index.js#L1663-L1708>)；完整字段/降级见[契约 §3.1](<docs/协作编辑-钩子契约.md#31-多窗口发现与读路径寻址t52按未提交实现核实>)。
+
 ## 动手之前先查先例（用户 2026-10-21 明确要求）
 
 涉及**安全边界、鉴权、凭证、并发、协议状态机**的设计，**先去看成熟项目怎么做，再动手**。

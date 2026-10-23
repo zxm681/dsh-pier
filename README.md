@@ -52,7 +52,9 @@ VS Code
 | `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.2.0 | 153 ✅ |
 | `packages/dsh-kit-demo` | 示例消费者，证明零耦合接入 | 0.1.0 | 9 ✅ |
 
-合计 **355 条单测 + 22 项跨进程 E2E**，全绿。
+合计 **355 条单测 + 22 项跨进程 E2E**，全绿（T48 历史实跑快照，不含本轮多窗口新增测试；T52 文档同步未重跑测试）。
+
+**多窗口源码已落地（未提交），真机双窗口尚未验**：本轮只静态核实实现，不把单窗口历史验收或设计稿当成双窗口实测。完整字段与证据见[契约 §3.1 / §9.4](<D:/code-workspace/projects/dsh-vscode-dev/docs/协作编辑-钩子契约.md#31-多窗口发现与读路径寻址t52按未提交实现核实>)。
 
 ## 快速开始
 
@@ -102,6 +104,8 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 
 | 能力 | 参数 | 返回 |
 |---|---|---|
+| `vscode.windows.list()` | 无；本端同步 `read` 档，不依赖对端能力位 | 已准入活连接的窗口数组，按 `connSeq` 升序；字段：`windowId, stable, connSeq, label, workspace, uiKind, remoteName, focused, extensionVersion, protocolVersion, active`；未就绪 facade 返回 `[]`（[index.js:895–943](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/index.js#L895-L943>)、[index.js:1978–1979](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/index.js#L1978-L1979>)） |
+| `request(m, p, {target})` | 列表里的 `windowId` 或 `'#<connSeq>'`；`undefined` / `null` 视为未给 | **只影响读路径**；写路径带 target 一律 `-32014 target-not-routable`，在 `_bindWriteTarget` 前拒绝；写目标仍只认 grant 的 link。绑定读 target 与 grant link 冲突 → `target-unauthorized`，**不回退 `_activeLink()`**（[index.js:1663–1708](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/index.js#L1663-L1708>)） |
 | `vscode.openFile` | `{path, line?, column?, preview?}` | `{opened, path, mode:'text'\|'external'}` |
 | `vscode.getSelection` | — | `{text, file, start:{line,column}, end, isEmpty}` |
 | `vscode.getDiagnostics` | `{path?, severity?, limit?}` | `{total, files:[{file, diagnostics:[…]}], truncated}` |
@@ -110,6 +114,8 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | `vscode.getDocumentState` | `{file, includeText?}` | `{file, version, incarnation?, isDirty, eol, lineCount, textLength, textUnavailable?, text?}` —— 写入锚点的读侧（版本与实例身份同一次读）；`includeText:true` 且超 8 MiB → `textUnavailable:true`（整份不给，不截断冒充全文） |
 | `vscode.save` ⚠️落盘 | `{file, expectedVersion, expectedIncarnation, expectedDisk:{mtime,size}, grant:{id,epoch}}` —— 双锚点必填；缓冲区脏时 grant 还必须带 `allowDirtySave`（**只认 grant 上的位，不认 params**）；磁盘真值与 `expectedDisk` 不符 → `-32013` | `{saved:true, file, disk:{mtime,size}, dirtyBefore}` —— `disk` 是**保存后重新 stat 的真值**，不是回显参数 |
 | `vscode.deleteFile` ⚠️**隔离归档，不真删** | `{file, expectedVersion, expectedIncarnation, expectedDisk, grant:{id,epoch}}` —— 目标移入 `<工作区根>/.dsh-quarantine/`，**不 `unlink`、不进回收站、一个字节都不销毁**；交不出整份无损备份就**直接拒**（不弹确认框）；跨卷/权限失败 → `-32603` `quarantine-failed`（**不退化 copy+delete**） | `{quarantined:true, file, from, to, confirmedSha256, confirmedByteLength, quarantinedSha256, quarantinedByteLength, bytesChanged, snapshot, backup, quarantine:{path,original,retained,restored}, nameCollision}` —— **没有 `deleted`/`trashed` 字段** |
+
+**连接序不是身份**：`windowId` 是 DSH 按 `sessionId + 工作区根 + uiKind` 指纹签发/匹配复用的 `win-NN`，默认尽力持久化到 `~/.dsh/dsh-vscode-kit/windows.json`；指纹不成立则 `tmp-<connSeq>` + `stable:false`，不落盘。`connSeq` 只表示本进程连接先后，与 `windowId` **分字段、禁止互相比**；稳定性依赖指纹与记录，不保证跨 VS Code 重启不变或落盘成功。当前扩展未上报 focused，列表该字段为 null；元数据与 active 均不是安全判据。证据：[windows.js:135–147](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/windows.js#L135-L147>)、[windows.js:217–264](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/windows.js#L217-L264>)、[extension.js:515–530](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-kit-bridge/src/extension.js#L515-L530>)；完整字段类型见[契约 §3.1](<D:/code-workspace/projects/dsh-vscode-dev/docs/协作编辑-钩子契约.md#31-多窗口发现与读路径寻址t52按未提交实现核实>)。
 
 **消费者白名单（Tier 1 / 1+ / 2 / 3 / 4）**：DSH 宿主侧配置 `consumers: { 插件名: 档位 }`，插件自己声明身份与档位
 `kit.forPlugin('my-plugin', { declared: 'buffer-edit' })`；判定取 `effective = min(declared, allowed)`，
@@ -137,6 +143,17 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | -32010 | `edit-not-bound` | 写入没有有效的 grant 绑定（五种 `reason` 见下） |
 | -32012 | `document-version-conflict` | 文档版本或实例（`incarnation`）与调用方锚点不符；重读锚点后重发。`data` 只回长度/版本，不回文本 |
 | -32013 | `disk-state-conflict` | 磁盘真值与 `expectedDisk:{mtime,size}` 不符（或确认后字节已被换）。**处置与 `-32012` 相反：永不允许自动重试** —— 重发就是拿没见过的内容覆盖别人的改动；先读磁盘再决定 |
+| -32014 | `window-target-failed`（`WINDOW_TARGET_FAILED`） | 窗口寻址失败；按下表 `data.reason` 处置（[protocol.js:80–119](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/protocol.js#L80-L119>)） |
+
+| `data.reason` | 一句话判定 |
+|---|---|
+| `window-not-found` | 写法不合法，或无已准入活连接命中且无可用历史记录；未准入与不存在同码。 |
+| `window-closed` | 无活连接命中，但有该 windowId 的签发/关闭记录，或该 connSeq 的关闭墓碑。 |
+| `window-ambiguous` | windowId / connSeq 命中多条活连接，或 label 与多行相同（单个 label 也不路由）。 |
+| `target-unauthorized` | 绑定读的有效 grant link 与 target 解析出的 link 不是同一对象。 |
+| `target-not-routable` | 写路径带非 null/undefined 的 target，在 `_bindWriteTarget` 前一律拒。 |
+
+判据：[index.js:1013–1044](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/index.js#L1013-L1044>)、[index.js:1663–1708](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/index.js#L1663-L1708>)。绑定读没有有效 grant 仍为 `-32010`，不是 `target-unauthorized`。**`-32011` 仍为空号，`SUPPORTED_PROTOCOL` 未动（仍 `[1,1]`）**，见 [protocol.js:13–136](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/protocol.js#L13-L136>)。**broadcast 语义未变**：只遍历 trusted 活连接、拒写方法，业务广播逐连接判版本，零投递 `-32008`；`bridge.*` 豁免版本门且可返回 0，不引入定向广播（[server.js:322–378](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/server.js#L322-L378>)）。
 
 `-32005` 与 `-32601` 的区别：前者是"能力协商没通过，你该降级"，
 后者是"方法名根本不存在，是编程错误"。
