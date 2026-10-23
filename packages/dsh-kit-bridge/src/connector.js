@@ -21,6 +21,7 @@ import {
   GrantStore, extensionWriteGate, isWriteMethod,
 } from '../../dsh-vscode-kit/src/grant.js'
 import { CAPABILITIES } from './capabilities.js'
+import { createEditorEvents } from './editor-events.js'
 
 /** 扩展对外声明的身份（写进 hello，DSH 侧据此判能力）。 */
 export const CLIENT_ID = 'dsh-kit-bridge'
@@ -124,6 +125,7 @@ export function createConnector(deps) {
    * 断线时 DSH 可能自己都不在了。
    */
   function forgetLink(gone) {
+    editorEvents?.dispose()
     if (linkState.link === gone) linkState.link = null
     if (!gone) return 0
     if (deps.events === true) gone.close('connector link forgotten')
@@ -201,6 +203,15 @@ export function createConnector(deps) {
   let link = null
   let pollTimer = null
   let stopped = false
+  let started = false
+  let generation = 0
+  let abortConnect = null
+  // Internal E2 producer, not E3 consumer subscription API. Default metadata-only,
+  // empty roots; NO stream installation, so no unsolicited event/body is sent.
+  const editorEvents = deps.events === true && deps.editorEventHost
+    ? createEditorEvents({ host: deps.editorEventHost, filter: deps.editorEventFilter,
+      emit: (type, payload, at) => link?.events.publish(type, payload, at) ?? false })
+    : null
   /** 已自动重连的次数（诊断用） */
   let attempts = 0
 
@@ -328,6 +339,13 @@ export function createConnector(deps) {
           { port: info.port }))
       }, connectTimeoutMs)
       timer.unref?.()
+      abortConnect = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        s.destroy()
+        reject(new BridgeError(ERR.DISCONNECTED, 'connector stopped during connect'))
+      }
 
       s.once('connect', () => {
         if (settled) return
@@ -380,8 +398,9 @@ export function createConnector(deps) {
     if (deps.events === true) s.on('drain', () => attached.events.drain())
     // 这是"当前活连接"的**唯一**写入口；绑定门读的就是它（对象身份，不是序号）。
     linkState.link = link
+    editorEvents?.activate()
 
-    const feed = createLineSplitter((line) => link.handleLine(line))
+    const feed = createLineSplitter((line) => attached.handleLine(line))
     s.on('data', (chunk) => {
       try { feed(chunk) } catch (err) { log(`framing: ${err?.message ?? err}`, 'warn') }
     })
@@ -439,20 +458,25 @@ export function createConnector(deps) {
     const target = bridges[0]
     setState('connecting', { port: target.port, pid: target.pid })
     attempts += 1
+    const currentGeneration = generation
     try {
       const s = await connectTo(target)
-      if (stopped) { s.destroy(); return }
+      if (stopped || generation !== currentGeneration) { s.destroy(); return }
+      abortConnect = null
       attach(s, target)
     } catch (err) {
+      if (stopped || generation !== currentGeneration) return
+      abortConnect = null
       setState('idle', { reason: err?.message ?? String(err), attempts })
       log(`connect attempt #${attempts} failed: ${err?.message ?? err}`, 'warn')
     }
   }
 
-  function schedule() {
-    if (stopped) return
+  function schedule(currentGeneration = generation) {
+    if (stopped || !started || generation !== currentGeneration || pollTimer) return
     pollTimer = setTimeout(() => {
-      tick().finally(schedule)
+      pollTimer = null
+      tick().finally(() => schedule(currentGeneration))
     }, pollIntervalMs)
     pollTimer.unref?.()
   }
@@ -460,12 +484,18 @@ export function createConnector(deps) {
   return {
     /** 开始轮询（幂等）。 */
     start() {
-      if (stopped) return
-      if (pollTimer) return
-      tick().finally(schedule)
+      if (started) return
+      started = true
+      stopped = false
+      const currentGeneration = generation
+      tick().finally(() => schedule(currentGeneration))
     },
     /** 立刻重连（忽略当前轮询节奏）。旧的 grant 随旧连接一起作废。 */
     reconnect() {
+      stopped = false
+      generation++
+      abortConnect?.(); abortConnect = null
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null }
       if (socket || link) {
         const gone = link
         try { socket?.destroy() } catch { /* ignore */ }
@@ -475,10 +505,14 @@ export function createConnector(deps) {
         forgetLink(gone)
       }
       setState('idle', { reason: 'manual-reconnect' })
-      return tick()
+      const currentGeneration = generation
+      return tick().finally(() => schedule(currentGeneration))
     },
     stop() {
       stopped = true
+      started = false
+      generation++
+      abortConnect?.(); abortConnect = null
       if (pollTimer) { clearTimeout(pollTimer); pollTimer = null }
       const gone = link
       if (link) link.close('connector stopped')
@@ -500,6 +534,9 @@ export function createConnector(deps) {
     get grants() { return grants },
     /** 当前活连接的共享槽（`{link}`）；绑定门读的就是它。 */
     get linkState() { return linkState },
+    /** Internal E2/E3 seam, never registered as a remote method. */
+    get editorEvents() { return editorEvents },
+    get lifecycleStats() { return { started, pollTimers: pollTimer ? 1 : 0, connecting: !!abortConnect } },
     /** 供测试/扩展调用 DSH 侧方法。 */
     request(method, params, opts) {
       if (!link) {

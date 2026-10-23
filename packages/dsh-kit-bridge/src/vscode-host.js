@@ -669,6 +669,28 @@ export function createHost(output) {
     resolvePath,
     workspaceRoots,
     isTrusted: () => vscode.workspace.isTrusted,
+    // E2 raw API boundary; normalization is performed once by editor-events.js.
+    // All fields below exist at engines ^1.91.0 (audit in editor-events.js).
+    editorEvents: {
+      incarnationOf, // SAME function as readDocumentState / atomic edit anchors.
+      isTrusted: () => vscode.workspace.isTrusted,
+      textLength: (doc) => doc.offsetAt(new vscode.Position(doc.lineCount, 0)),
+      textDocuments: () => vscode.workspace.textDocuments,
+      visibleTextEditors: () => vscode.window.visibleTextEditors,
+      tabs: () => vscode.window.tabGroups.all.flatMap((group) => group.tabs),
+      tabUris: (tab) => tab.input instanceof vscode.TabInputText ? [tab.input.uri]
+        : tab.input instanceof vscode.TabInputTextDiff ? [tab.input.original, tab.input.modified] : [],
+      onDidOpenTextDocument: (fn) => vscode.workspace.onDidOpenTextDocument(fn),
+      onDidCloseTextDocument: (fn) => vscode.workspace.onDidCloseTextDocument(fn),
+      onDidSaveTextDocument: (fn) => vscode.workspace.onDidSaveTextDocument(fn),
+      onDidChangeTextDocument: (fn) => vscode.workspace.onDidChangeTextDocument(fn),
+      onDidChangeTextEditorSelection: (fn) => vscode.window.onDidChangeTextEditorSelection(fn),
+      onDidChangeTextEditorVisibleRanges: (fn) => vscode.window.onDidChangeTextEditorVisibleRanges(fn),
+      onDidChangeVisibleTextEditors: (fn) => vscode.window.onDidChangeVisibleTextEditors(fn),
+      onDidChangeTabs: (fn) => vscode.window.tabGroups.onDidChangeTabs(fn),
+      onDidChangeActiveTextEditor: (fn) => vscode.window.onDidChangeActiveTextEditor(fn),
+      onDidChangeWindowState: (fn) => vscode.window.onDidChangeWindowState(fn),
+    },
     openTextDocument,
     openExternalFile,
     activeEditor,

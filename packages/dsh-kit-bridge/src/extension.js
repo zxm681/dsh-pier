@@ -17,7 +17,7 @@ import { createDispatcher } from './vscode-host.js'
 import { createConnector } from './connector.js'
 
 /** @type {{connector: any, output: vscode.OutputChannel|null}} */
-const ctx = { connector: null, output: null }
+const ctx = { connector: null, output: null, instance: null, disposables: [] }
 
 /** 这些配置键改变后必须重建扩展宿主（改 dshHome / 轮询间隔需要新连接器）。 */
 const RESTART_KEYS = ['dshHome', 'pollIntervalMs', 'deleteConfirmTimeoutMs']
@@ -483,6 +483,7 @@ async function runSelfTest(dispatch, { grants } = {}) {
 }
 
 export function activate(context) {
+  if (ctx.instance) return ctx.instance
   const output = vscode.window.createOutputChannel('DSH Kit Bridge')
   ctx.output = output
   const log = (msg, level = 'info') => {
@@ -491,20 +492,19 @@ export function activate(context) {
   }
 
   const cfg = readConfig()
-  if (!cfg.enabled) {
-    log('disabled by dshKit.enabled; not connecting')
-    return { disabled: true }
-  }
-
   // 授权表与"当前活连接"共享槽都由 dispatcher 建：能力层（执行前复核）与连接层
   // （收 bridge.grant / 断线置失效）**必须共用同一份**，否则判定与状态各说各话。
-  const { dispatch, capabilities, grants, linkState } = createDispatcher(output, { deleteConfirmTimeoutMs: readConfig().deleteConfirmTimeoutMs })
+  const { dispatch, capabilities, grants, linkState, host } = createDispatcher(output, { deleteConfirmTimeoutMs: cfg.deleteConfirmTimeoutMs })
   log(`capabilities: ${capabilities.join(', ')}`)
 
   const connector = createConnector({
     dispatch,
     grants,
     linkState,
+    events: true,
+    editorEventHost: host.editorEvents,
+    // E3 must explicitly install/authorize a stream and configure its roots/mode.
+    // Negotiating E1 alone does not subscribe anyone or expose document bodies.
     // 评审 F7：连接层的绑定门也要先问信任 —— 否则「未信任工作区」这个事实
     // 会随「带不带 grant」变成两种回答（-32010 / -32006），调用方分不清该做什么。
     isTrusted: () => vscode.workspace.isTrusted,
@@ -537,7 +537,8 @@ export function activate(context) {
     },
   })
   ctx.connector = connector
-  connector.start()
+  if (cfg.enabled) connector.start()
+  else { connector.stop(); log('disabled by dshKit.enabled; not connecting') }
 
   // 自检（默认关）：仅当配置打开时跑，结果落 ~/.dsh/dsh-vscode-kit/selftest-<pid>.json
   if (cfg.selfTestOnStart) {
@@ -550,7 +551,7 @@ export function activate(context) {
     })()
   }
 
-  context.subscriptions.push(
+  const owned = [
     output,
     { dispose: () => connector.stop() },
 
@@ -605,13 +606,22 @@ export function activate(context) {
       log('connection config changed; reloading window')
       vscode.commands.executeCommand('workbench.action.reloadWindow')
     }),
-  )
-
+  ]
+  ctx.disposables = owned.map((disposable) => {
+    let disposed = false
+    return { dispose() { if (!disposed) { disposed = true; disposable.dispose() } } }
+  })
+  context.subscriptions.push(...ctx.disposables)
+  ctx.instance = { connector }
   log('activated')
-  return { connector }
+  return ctx.instance
 }
 
 export function deactivate() {
-  try { ctx.connector?.stop() } catch { /* ignore */ }
+  for (const disposable of ctx.disposables.splice(0).reverse()) {
+    try { disposable.dispose() } catch { /* continue releasing other resources */ }
+  }
   ctx.connector = null
+  ctx.output = null
+  ctx.instance = null
 }

@@ -23,3 +23,6 @@ work/t39-*
 work/t4[0-9]-*
 work/t41-*.mjs
 work/t4[0-9]-source-before.sha256
+
+# T57 变异证据（备份副本/tap 日志，不入库）
+work/t5*-mutation/
