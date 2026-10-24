@@ -40,13 +40,16 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
     **唯一例外（T68）**：`vscode-host.js` 的 `removeCreatedInThisCall(absPath, identity)`
     允许一处 `unlink`，因为它只回收**本次调用自己刚创建、此前不存在的对象**，不是用户数据。
     三个前提缺一不可：仅在本调用 createFile 的失败路径（先 close）；删前 lstat 的 `(dev,ino)`
-    与创建时 fstat 的 `(dev,ino)` 完全一致（不一致不删，返回 `identity-changed`）；全仓源码
-    单调用点，并由 `test/t68-unlink-surface.test.js` 静态守门。除此之外任何删除限制均不放宽。
+    与创建时 fstat 的 `(dev,ino)` 完全一致（不一致不删，返回 `identity-changed`）；T68 干净创建路径上唯一的 `unlink`
+    调用点（`vscode-host.js:36`，私有 helper `:23-41`、失败分支调用 `:565-570`），并由 `test/t68-unlink-surface.test.js` 静态守门。
+    静态门 `:22-29` 同时明确保留 `discovery.js:54/62/97/104` 四处既有 `rmSync`（发现元数据清理，与编辑能力无关）。
+    全仓删除面 = 1 unlink + 4 rmSync，均不在编辑能力路径上（指公开编辑能力的数据删除入口；unlink 仅为私有新建失败清理）。
+    统计范围为静态门扫描的 `packages/*/src` JS 源码，不得表述成「全仓只剩一处删除调用」。除此之外任何删除限制均不放宽。
 
 12. **连接序不是身份**。`windowId` 与 `connSeq` 必须分字段、禁止互相比；前者由 DSH 按指纹签发/复用，后者仅表示本进程连接先后。
     `target` **只影响读路径**：写路径带 target 一律 `-32014 target-not-routable`，在 `_bindWriteTarget` 前拒绝；写目标永远由 grant 记录的 link 决定。
     绑定读与 target 冲突 → `target-unauthorized`，不回退 `_activeLink()`。依据：[windows.js:217–244](<packages/dsh-vscode-kit/src/windows.js#L217-L244>)、
-    [index.js:895–918](<packages/dsh-vscode-kit/src/index.js#L895-L918>)、[index.js:1663–1708](<packages/dsh-vscode-kit/src/index.js#L1663-L1708>)；完整字段/降级见[契约 §3.1](<docs/协作编辑-钩子契约.md#31-多窗口发现与读路径寻址t52按未提交实现核实>)。
+    [index.js:895–918](<packages/dsh-vscode-kit/src/index.js#L895-L918>)、[index.js:1663–1708](<packages/dsh-vscode-kit/src/index.js#L1663-L1708>)；完整字段/降级见[契约 §3.1](<docs/协作编辑-钩子契约.md#31-多窗口发现与读路径寻址t52按源码核实>)。
 
 ## 动手之前先查先例（用户 2026-10-21 明确要求）
 

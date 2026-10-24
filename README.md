@@ -30,7 +30,9 @@ VS Code
 
 ## 现状
 
-**打样完成，六条验收标准全过。** 四段式链路已在真机（真 DSH 进程 + 真 VS Code）跑通。
+**初始打样六条验收已通过**，不代表后续全部能力已经部署。当前源码基线为 `d86ee8c`（2026-10-25），协议 `PROTOCOL_VERSION=2`、`SUPPORTED_PROTOCOL=[2,2]`；单一状态入口见[契约 §0](<D:/code-workspace/projects/dsh-vscode-dev/docs/协作编辑-钩子契约.md#0-当前状态2026-10-25head-d86ee8c>)。
+
+**部署状态**：扩展已安装 0.3.3；`createFile`（`b849759`）与 T70 两条修复（`e1fed0c`：save 全出口收尾、LRU 保留冻结/在飞证据）**未部署真机**，未重新构建 VSIX、未重载 VS Code 窗口、未重启 DSH。DSH 侧 kit 源码已同步进 profile，但未重启生效；本次仅改文档，不执行部署。
 
 | 阶段 | 产物 | 状态 |
 |---|---|---|
@@ -49,10 +51,10 @@ VS Code
 | 包 | 作用 | 版本 | 测试 |
 |---|---|---|---|
 | `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 299 ✅（串行） |
-| `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.3.3 | 295 ✅ |
+| `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.3.3 | 306 ✅ |
 | `packages/dsh-kit-demo` | 示例消费者，证明零耦合接入 | 0.1.0 | 9 ✅ |
 
-合计 **603 条单测 + 22 项跨进程 E2E**（T68 本轮实跑：kit 299 / bridge 295 / demo 9 / E2E 22；新增 33 条，含静态守门 2 条；未部署真机）。
+合计 **614 条单测 + 22 项跨进程 E2E**（T70 既有实跑：kit 299 / bridge 306 / demo 9 / E2E 22；[原始证据索引](<D:/code-workspace/projects/dsh-vscode-dev/work/T70-V1返工.md#L114-L124>)）。本次纯文档未重跑产品四门，不以测试绿色代替真机部署证明。
 
 **多窗口 A10–A13 已真机确证（VS Code 1.143.1）**：两窗口 win-08 / win-09 均 stable:true；DSH 重启复用；getSelection 带 opts.target 各自命中，连续 4 轮一致；applyEdit 带 target:'#1' 被 -32014 target-not-routable 拒绝。证据：[探针 JSON](<D:/code-workspace/work/multiwin-probe.json>)（2026-10-23T18:34:27.346Z 起；重启复用采用用户已确证记录及运行态注册表），详见[设计稿 §7](<D:/code-workspace/projects/dsh-vscode-dev/docs/多窗口寻址-设计.md#71-a10a13-当前真机验收结果t54>)。
 
@@ -91,7 +93,7 @@ export function apply(ctx) {
 
 ```bash
 cd packages/dsh-vscode-kit   && node --test --test-concurrency=1 "test/*.test.js"   # 299（或 npm test）
-cd packages/dsh-kit-bridge   && node --test "test/*.test.js"   # 295
+cd packages/dsh-kit-bridge   && node --test "test/*.test.js"   # 306
 cd packages/dsh-kit-demo     && node --test "test/*.test.js"   # 9
 cd packages/dsh-kit-bridge   && node scripts/e2e.mjs           # 22 跨进程
 ```
@@ -118,11 +120,15 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | `vscode.createFile` ⚠️排他新建（`disk-write`） | `{file, text, expectedDisk:null, grant:{id,epoch}}`；`text` 必填字符串可空，UTF-8 ≤1 MiB，无损编码；线性化点 = 宿主 `open(…,'wx')` 成功那一刻；不覆盖、不建父目录、不自动打开 | `{created:true, file, bytes, disk:{mtime,size}}`（创建后实测，`disk.size===bytes`）；失败先 close，仅 `(dev,ino)` 一致才回收本次创建物；不一致不删并报告 `cleanup.reason:'identity-changed'` |
 | `vscode.deleteFile` ⚠️**隔离归档，不真删** | `{file, expectedVersion, expectedIncarnation, expectedDisk, grant:{id,epoch}}` —— 目标移入 `<工作区根>/.dsh-quarantine/`，**不 `unlink`、不进回收站、一个字节都不销毁**；交不出整份无损备份就**直接拒**（不弹确认框）；跨卷/权限失败 → `-32603` `quarantine-failed`（**不退化 copy+delete**） | `{quarantined:true, file, from, to, confirmedSha256, confirmedByteLength, quarantinedSha256, quarantinedByteLength, bytesChanged, snapshot, backup, quarantine:{path,original,retained,restored}, nameCollision}` —— **没有 `deleted`/`trashed` 字段** |
 
+**事件入口**：`kit.vscode.events.subscribe(filter, listener, opts?)` 返回 handle，须检查 `handle.error` 并 `await handle.ready`；默认 metadata，delta 必须显式 files 白名单；`unsubscribe(id)` / `handle.dispose()` 先关本地分区。线上 `vscode.events.subscribe` / `vscode.events.unsubscribe` 为 read 档 RPC，`vscode.events.event` 为扩展→DSH 出站通知，**不是请求**。签名、回执与失败态见[契约 §3](<D:/code-workspace/projects/dsh-vscode-dev/docs/协作编辑-钩子契约.md#3-最小-api-面>)。
+
+**删除面范围**：T68 干净创建路径上唯一的 unlink（[私有 helper:23–41](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-kit-bridge/src/vscode-host.js#L23-L41>)，失败分支唯一调用 [:565–570](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-kit-bridge/src/vscode-host.js#L565-L570>)），加 [discovery.js:54/62/97/104](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/discovery.js#L54-L104>) 四处既有 rmSync（发现元数据清理，与编辑能力无关，[静态门:22–29](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-kit-bridge/test/t68-unlink-surface.test.js#L22-L29>) 明确保留）。**全仓删除面 = 1 unlink + 4 rmSync，均不在编辑能力路径上**（指公开编辑能力的数据删除入口；前者仅私有新建失败清理）。统计范围为静态门扫描的 `packages/*/src` JS 源码，不是「全仓只剩一处删除调用」。
+
 **多窗口调用**：先 `kit.vscode.windows.list()` 发现，再 `kit.request('vscode.getSelection', {}, {target:'win-09'})` 读指定窗口（`target` 在 opts，不在 params）。本次 win-09 / win-08 各自读回不同工作区文件；`-32014` 按 reason 处理，写+target 只验证到拒绝，不是定向写入能力。
 
-**连接序不是身份**：`windowId` 是 DSH 按 `sessionId + 工作区根 + uiKind` 指纹签发/匹配复用的 `win-NN`，默认尽力持久化到 `~/.dsh/dsh-vscode-kit/windows.json`；指纹不成立则 `tmp-<connSeq>` + `stable:false`，不落盘。`connSeq` 只表示本进程连接先后，与 `windowId` **分字段、禁止互相比**；稳定性依赖指纹与记录，不保证跨 VS Code 重启不变或落盘成功。当前扩展未上报 focused，列表该字段为 null；元数据与 active 均不是安全判据。证据：[windows.js:135–147](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/windows.js#L135-L147>)、[windows.js:217–264](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/windows.js#L217-L264>)、[extension.js:515–530](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-kit-bridge/src/extension.js#L515-L530>)；完整字段类型见[契约 §3.1](<D:/code-workspace/projects/dsh-vscode-dev/docs/协作编辑-钩子契约.md#31-多窗口发现与读路径寻址t52按未提交实现核实>)。
+**连接序不是身份**：`windowId` 是 DSH 按 `sessionId + 工作区根 + uiKind` 指纹签发/匹配复用的 `win-NN`，默认尽力持久化到 `~/.dsh/dsh-vscode-kit/windows.json`；指纹不成立则 `tmp-<connSeq>` + `stable:false`，不落盘。`connSeq` 只表示本进程连接先后，与 `windowId` **分字段、禁止互相比**；稳定性依赖指纹与记录，不保证跨 VS Code 重启不变或落盘成功。当前扩展未上报 focused，列表该字段为 null；元数据与 active 均不是安全判据。证据：[windows.js:135–147](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/windows.js#L135-L147>)、[windows.js:217–264](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/windows.js#L217-L264>)、[extension.js:515–530](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-kit-bridge/src/extension.js#L515-L530>)；完整字段类型见[契约 §3.1](<D:/code-workspace/projects/dsh-vscode-dev/docs/协作编辑-钩子契约.md#31-多窗口发现与读路径寻址t52按源码核实>)。
 
-**消费者白名单（Tier 1 / 1+ / 2 / 3 / 4）**：DSH 宿主侧配置 `consumers: { 插件名: 档位 }`，插件自己声明身份与档位
+**消费者白名单四档（`read < buffer-edit < disk-write < delete`；Tier 1+ 仍属 read，不是第五档）**：DSH 宿主侧配置 `consumers: { 插件名: 档位 }`，插件自己声明身份与档位
 `kit.forPlugin('my-plugin', { declared: 'buffer-edit' })`；判定取 `effective = min(declared, allowed)`，
 方法档位高于 `effective` 即拒。未声明身份时**默认只读**，高于只读一律拒。拒绝**复用 `-32602`**（不自造新码）：
 `data.reason` ∈ `tier-unknown`（非法/未知档位）、`consumer-unbound`（没身份还想写）、`declared-above-allowed`（配的档位管不住它要的方法）；
@@ -132,12 +138,12 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 **坐标约定**：协议对外一律 **1-based**（line/column），只在调用 VS Code API 的边界转 0-based。
 **路径约定**：对外一律 `C:\…` 大写盘符（出口归一化，见经验手册 §4.7）。
 
-错误码：
+### 错误码
 
 | 码 | 名字 | 含义 |
 |---|---|---|
 | -32602 | `invalid-params` | `createFile`：`expected-disk-missing`（缺显式 null 锚点）、`expected-disk-not-null`（非 null）、`parent-missing`（绝不建目录）、`payload-too-large`（UTF-8 >1 MiB）、`not-encodable`（有损编码拒绝）、`text-not-a-string`；内容/锚点错误宿主零调用 |
-| -32603 | `internal` | `createFile` I/O 失败 `reason:'create-failed'`，`cleanup` 如实报告是否回收；`identity-changed` 时保留替换对象；不保证任意 I/O 故障下必能清理 |
+| -32603 | `internal-error` | `createFile` I/O 失败 `reason:'create-failed'`，`cleanup` 如实报告是否回收；`identity-changed` 时保留替换对象；不保证任意 I/O 故障下必能清理 |
 | -32001 | `unauthorized` | token 缺失或错误 |
 | -32002 | `declined` | 用户拒绝 |
 | -32003 | `not-found` | 文件/编辑器不存在 |
@@ -185,7 +191,7 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 2. **写入是收窄放开的，不是「能随意改你代码」**。2026-10-22 起 `vscode.applyEdit` 可做**单文件文本
    编辑**；2026-10-23 起再放开两项：`vscode.save`（落盘）与 `vscode.deleteFile`（**只搬不删**：移入工作区的
    `.dsh-quarantine/`，不进回收站也不销毁任何字节）。三项都必须持 grant，且只能作用于 grant 绑定的那个窗口里的
-   真实工作区文件；T68 工作树新增 `vscode.createFile` 排他新建（未提交/未部署真机）：同样持 grant，`disk-write` 档，不覆盖、不建父目录、不自动打开。新文件没有文档双锚点，只接受 `expectedDisk:null`。挡住什么、挡不住什么见下面「写入路径的边界」
+   真实工作区文件；T68 `b849759` 已提交 `vscode.createFile` 排他新建（未部署真机）：同样持 grant，`disk-write` 档，不覆盖、不建父目录、不自动打开。新文件没有文档双锚点，只接受 `expectedDisk:null`。挡住什么、挡不住什么见下面「写入路径的边界」
    与「写盘的三个边界」。
 3. **洞 3 仍开着**：协议层的响应分支不做 token 校验（见 `phase7-经验手册.md` §5.9 与
    `phase5-打样日志.md` 阶段 9）。它需要单独一轮设计，不要顺手改。
@@ -275,7 +281,7 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 ## 明确不做
 
 编辑器内容注入（**2026-10-22 起收窄，2026-10-23 再放开一级，都不是取消**：`vscode.applyEdit` 单文件文本编辑、
-`vscode.save` 落盘、`vscode.deleteFile` **隔离归档（只搬不删）**，三项都必须持 grant、只作用于绑定窗口；T68 工作树已补 `vscode.createFile` 排他新建，批量改动仍不做）、多 VSCode 仲裁、Remote/WSL 反向、Marketplace 发布、面板 UI。
+`vscode.save` 落盘、`vscode.deleteFile` **隔离归档（只搬不删）**，三项都必须持 grant、只作用于绑定窗口；T68 `b849759` 已提交 `vscode.createFile` 排他新建，批量改动仍不做）、多 VSCode 仲裁、Remote/WSL 反向、Marketplace 发布、面板 UI。
 （per-plugin 授权白名单**已落地**，不再列在"明确不做"里 —— 见「能力面」的档位说明。）
 详见 `phase2-需求文档.md` 的 out-of-scope。
 
