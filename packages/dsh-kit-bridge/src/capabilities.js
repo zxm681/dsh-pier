@@ -24,6 +24,7 @@ import {
 } from './workspace-paths.js'
 import { createEventBroker } from '../../dsh-vscode-kit/src/event-subscriptions.js'
 import { canonicalPath, pathIdentityKey } from '../../dsh-vscode-kit/src/paths.js'
+import { createChangeLedger } from './change-ledger.js'
 
 /** 本扩展声明支持的能力清单（写进发现文件 / hello 的 capabilities）。 */
 export const CAPABILITIES = [
@@ -973,6 +974,107 @@ export function createCapabilities(host, opts = {}) {
     : DEFAULT_DELETE_CONFIRM_TIMEOUT_MS
 
   /**
+   * 文档变更关联账本（A1 / T61）—— `vscode.applyEdit` 回执里的归属字段由它给。
+   *
+   * 三条设计约束（都不是风格问题）：
+   *  ① **不判许可**：它是证据层。gate / 白名单 / 双锚点 / 隔离归档一个字都不动，
+   *     归属判定也不参与任何拦截 —— 写不写只看那几道门，写完怎么描述看这里。
+   *  ② **不采信入参**：`operationId` 由账本自己签发；`params` 里的 `operationId` /
+   *     `source` / `attribution` 一律不读。调用方自报的"是我干的"没有任何分量。
+   *  ③ **观察器可选**：宿主给不出变更事件（老宿主 / 假宿主）就整条降级成 unknown，
+   *     **不假装**"没看到别人"就是"只有我"。
+   *
+   * `opts.changeLedger === false` 可以整块关掉（只有诊断/极端降级场景该用；关掉之后
+   * 回执**不带**归属字段，旧消费者看到的就是 T61 之前的形状）。
+   */
+  /** 观察器订阅（若装上）；能力集不 dispose，诊断里它随扩展生命周期存活。 */
+  let changeLedgerDisposable = null
+  const changeLedger = opts.changeLedger === false
+    ? null
+    : (opts.changeLedger ?? createChangeLedger({ log: (level, msg, extra) => log(level, msg, extra) }))
+
+  if (changeLedger) {
+    if (typeof host.observeTextChanges === 'function') {
+      try {
+        const disposable = host.observeTextChanges((sample) => {
+          try { changeLedger.observeChange(sample) } catch (err) {
+            log('warn', `change-ledger observeChange failed: ${err?.message ?? err}`)
+          }
+        })
+        if (disposable && typeof disposable.dispose === 'function') {
+          changeLedger.markObserverAttached()
+          changeLedgerDisposable = disposable
+        } else {
+          changeLedger.markObserverUnavailable('host returned no disposable')
+        }
+      } catch (err) {
+        changeLedger.markObserverUnavailable(String(err?.message ?? err))
+      }
+    } else {
+      changeLedger.markObserverUnavailable('host does not implement observeTextChanges')
+    }
+  }
+
+  /**
+   * 归属证据里的「grant 身份」。
+   *
+   * `params.grant` 是调用方**自己填的**，所以它不能自证：这里按 id 去授权表里查，
+   * 记下**查到的**会话/世代；查不到就如实标 `resolved:false`（声明值只当日志线索）。
+   * 判定本身仍然只发生在 `judgeGrant` 里 —— 这里只留证据，不改变任何判序。
+   */
+  function grantIdentityFor(params, ctx) {
+    const claimed = params?.grant
+    const id = typeof claimed?.id === 'string' && claimed.id !== '' ? claimed.id : null
+    let resolved = null
+    if (id !== null && grants && typeof grants.lookup === 'function') {
+      try {
+        const found = grants.lookup(id)
+        resolved = found?.kind === 'active' ? found.record : null
+      } catch { resolved = null }
+    }
+    return {
+      id,
+      resolved: resolved !== null,
+      sessionId: typeof resolved?.sessionId === 'string' ? resolved.sessionId : null,
+      epoch: Number.isInteger(resolved?.epoch) ? resolved.epoch : null,
+      claimedEpoch: Number.isInteger(claimed?.epoch) ? claimed.epoch : null,
+      link: typeof ctx?.link?.name === 'string' ? ctx.link.name : null,
+    }
+  }
+
+  /**
+   * 结算一条账本记录：**先实测 after，再判定**。
+   *
+   * `after` 必须实测（重新 `readDocumentState(includeText:true)`）：回显"我期望的 after"
+   * 等于让归属自己给自己出证据 —— 那是本卡最要命的失败形态。实测失败就记 `afterError`
+   * 并让归属降级为 unknown（**失败 ≠ 没有变化**）。
+   */
+  async function settleChangeLedger(record, outcome, real) {
+    if (!changeLedger || !record) return null
+    let after = null
+    let afterError = null
+    try {
+      const measured = await readDocumentState(host, real, { includeText: true }, 'vscode.applyEdit')
+      after = {
+        version: measured.version,
+        incarnation: measured.incarnation ?? null,
+        text: typeof measured.text === 'string' ? measured.text : null,
+        textLength: measured.textLength,
+        dirty: measured.isDirty === true,
+      }
+      if (typeof measured.text !== 'string') afterError = 'after-text-unavailable'
+    } catch (err) {
+      afterError = err?.code === undefined ? String(err?.message ?? err) : String(err.code)
+    }
+    try {
+      return changeLedger.settle(record, { outcome, after, afterError })
+    } catch (err) {
+      log('warn', `change-ledger settle failed: ${err?.message ?? err}`)
+      return null
+    }
+  }
+
+  /**
    * 同文件写入串行化（T32 / 评审 T31-B1 建议 ③）：`规范化路径 → promise 链尾`。
    *
    * 解决的是**两个请求之间**的竞争（不是"请求与人之间"的竞争 —— 那个只能靠事务内判定）：
@@ -1441,28 +1543,78 @@ export function createCapabilities(host, opts = {}) {
     // 这一段与下面的 applyEditText 之间没有别的 await：窗口缩到一次同步调用。
     const writeTarget = revalidateWriteTarget({ abs, real }, host.workspaceRoots(), { method })
 
+    // ── ⑥b 变更账本（A1 / T61）：开一条记录 ──
+    // 位置在绑定门与路径重验**之后**、写宿主**之前**：只有"真的要写了"才值得记一条
+    // （前面任何一道门失败都属于"宿主零写入"，不该在账本里留下一条写入证据）。
+    // `edits` 与 `dirty / 双锚点` 都写在这里；`before` 快照由事务在**同步区间**里回调
+    // `changeLedger.construct` 填（`edits` 用 0-based 的 character 口径，与 VS Code
+    // 事件里的 `contentChanges[].range` 同一套 —— `toApiRange` 给的列名是 `column`）。
+    const apiRange = toApiRange(range)
+    const ledgerRecord = changeLedger
+      ? changeLedger.begin({
+        file: canonicalPath(abs),
+        grant: grantIdentityFor(params, ctx),
+        edits: [{
+          start: { line: apiRange.start.line, character: apiRange.start.column },
+          end: { line: apiRange.end.line, character: apiRange.end.column },
+          text,
+        }],
+        expectedVersion: state.version,
+        expectedIncarnation: state.incarnation ?? null,
+        dirty: state.isDirty === true,
+      })
+      : null
+
     // ── ⑦ 写宿主：版本等值的**唯一保证**在这一次调用的内部（T32）──
     // 传下去的是**锚点本身**（`expectedVersion`），不是一个"我已检查过"的布尔值：
     // 宿主/适配器在 `TextEditor.edit` 的同步 callback 里读 `document.version` 再比一次。
     // 上面 ④⑤ 已经跑过几个 await，人工编辑完全可能就发生在其中 —— 所以这一道不是重复劳动，
     // 而是唯一真正挡住 B1 的那一道（`edit-transaction.js`）。
-    const outcome = await host.applyEditText(
-      writeTarget, toApiRange(range), text, expectedVersion, expectedIncarnation,
-    )
+    //
+    // 第 6 个参数是 A1 的**观察回调**（不是参数、不是权限）：事务在同步区间里用它交
+    // before 快照。宿主不认识它时就当没传 —— 老宿主/测试替身不受影响。
+    let outcome
+    try {
+      outcome = await host.applyEditText(
+        writeTarget, apiRange, text, expectedVersion, expectedIncarnation,
+        ledgerRecord ? { observe: (sample) => changeLedger.construct(ledgerRecord, sample) } : undefined,
+      )
+    } catch (err) {
+      // 写入抛异常（冲突 / 编辑器拒绝 / 宿主抽风）：账本照样要结算，但结论是 unknown
+      // —— "我发起过一笔写"不等于"这些变化是我造成的"，更不等于"什么都没发生"。
+      // 超时单独记：它与其他失败的**证据状态不同**（可能已经落了点，也可能没落），
+      // 混成 'error' 会让报告分不清"确定没写"与"不知道写没写"。
+      await settleChangeLedger(ledgerRecord, err?.code === ERR.TIMEOUT ? 'timeout' : 'error', real)
+      throw err
+    }
     // ── 写后复核（评审 R2-1 ③） ──
     // 写入已经发生，本步阻止不了"落到了被换掉的目录"；它只是在**采样到路径差异/解析失败**
     // 时拒报成功（-32603）。它是采样而不是写入历史：替换持续到此刻才算数，
     // "没采样到差异"不代表没被替换过（换出再换回就看不出来）—— 完整判据在下一行。
-    assertTargetUnchanged(writeTarget, { method })
-    // ── 写入文档身份（评审 R3-1：这才是"写到底落在哪个文档"的判据） ──
-    // 写宿主必须报出它实际编辑的那个文档的规范化路径（`document.uri.fsPath` 之类）；
-    // 与写前验过的 `writeTarget` 不一致 → 不报成功（-32602）；报不出来 → 失败闭合（-32603）。
-    // 在此之前的所有检查都只能证明"这个路径此刻指向哪"，只有文档身份能证明"写进了哪个文档"。
-    assertWrittenDocumentIdentity(outcome, writeTarget, { method })
-    const applied = outcome?.applied !== false
+    let applied
+    try {
+      assertTargetUnchanged(writeTarget, { method })
+      // ── 写入文档身份（评审 R3-1：这才是"写到底落在哪个文档"的判据） ──
+      // 写宿主必须报出它实际编辑的那个文档的规范化路径（`document.uri.fsPath` 之类）；
+      // 与写前验过的 `writeTarget` 不一致 → 不报成功（-32602）；报不出来 → 失败闭合（-32603）。
+      // 在此之前的所有检查都只能证明"这个路径此刻指向哪"，只有文档身份能证明"写进了哪个文档"。
+      assertWrittenDocumentIdentity(outcome, writeTarget, { method })
+      applied = outcome?.applied !== false
+    } catch (err) {
+      // 写后复核失败：这一笔可能已经落进缓冲区了，但回执是错误 ⇒ 账本只能 unknown。
+      await settleChangeLedger(ledgerRecord, 'error', real)
+      throw err
+    }
+
+    // ── ⑧ 归属（A1 / T61）：写后**实测** after，再由账本给结论 ──
+    // 顺序不能反：先拿实测快照，再判定。回显期望值 = 自己给自己出证据。
+    const ledgerSummary = await settleChangeLedger(
+      ledgerRecord, applied ? 'applied' : 'rejected', real,
+    )
     log(`applyEdit: ${abs} ${applied ? 'applied' : 'rejected by host'}`
       + ` ${range.start.line}:${range.start.column}-${range.end.line}:${range.end.column}`
-      + ` (${text.length} chars, buffer only — not saved)`)
+      + ` (${text.length} chars, buffer only — not saved)`
+      + (ledgerSummary ? ` attribution=${ledgerSummary.attribution}` : ''))
     return {
       applied,
       // 回传**规范化后的绝对路径**（与 openFile/getSelection 同一口径），
@@ -1470,6 +1622,19 @@ export function createCapabilities(host, opts = {}) {
       file: canonicalPath(abs),
       saved: false,
       textLength: text.length,
+      // ── A1 / T61：归属字段（**只增不改**）──
+      // `applied` / `saved:false` / `file` / `textLength` 的语义一字未动；下面是新增的
+      // 证据摘要：`attribution` 只有四种取值，`unknown` 是**正常**结果，不是失败。
+      // `operationId` 由账本签发（不采信调用方 params 里的同名字段）。
+      ...(ledgerSummary
+        ? {
+          operationId: ledgerSummary.operationId,
+          attribution: ledgerSummary.attribution,
+          attributionReason: ledgerSummary.attributionReason,
+          before: ledgerSummary.before,
+          after: ledgerSummary.after,
+        }
+        : {}),
     }
   }
 

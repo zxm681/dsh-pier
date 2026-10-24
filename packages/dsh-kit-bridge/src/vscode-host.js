@@ -16,6 +16,7 @@ import { GrantStore } from '../../dsh-vscode-kit/src/grant.js'
 import { createCapabilities } from './capabilities.js'
 import { applyEditAtomically } from './edit-transaction.js'
 import { isInside, samePath } from './workspace-paths.js'
+import { canonicalPath } from '../../dsh-vscode-kit/src/paths.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 文档化身（incarnation，T34）：每个 `TextDocument` **实例**一个不透明身份
@@ -304,13 +305,16 @@ export function createHost(output) {
    *        走到这里是"事务被绕过"的最后一道失败闭合。旧宿主给不出化身 ⇒ 拒写
    *        （有意的不兼容收紧：没有实例身份就证明不了"写的是同一个文档实例"）。
    */
-  async function applyEditText(abs, range, text, expectedVersion, expectedIncarnation) {
+  async function applyEditText(abs, range, text, expectedVersion, expectedIncarnation, observation) {
     const editor = await editorFor(vscode.Uri.file(abs), abs)
     const outcome = await applyEditAtomically({
       editor,
       file: abs,
       expectedVersion,
       expectedIncarnation,
+      // A1（T61）：账本的 before 基准回调，事务在**同步区间**里调它一次。
+      // 能力层（capabilities.js）不 import vscode，所以只透传一个普通回调。
+      ...(typeof observation?.observe === 'function' ? { observe: observation.observe } : {}),
       // 与 `readDocumentState` **同一个** `incarnationOf`：读侧报的 id 与写侧判的 id
       // 同源，否则"我读到的化身"和"你比对的化身"会是两套。
       readIncarnation: (doc) => incarnationOf(doc),
@@ -659,6 +663,56 @@ export function createHost(output) {
     return { renamed: true }
   }
 
+  /**
+   * 观察**文档变更事件**（A1 / T61 变更账本的唯一事件源）。
+   *
+   * 为什么新开一条订阅、不复用 `editorEvents.onDidChangeTextDocument`：
+   * `editorEvents` 那一路是 E2/E3 的**推流**（要不要发、发多少由订阅策略决定，
+   * 没有订阅时一个字节都不发）。归属判定要的是**本地事实**，与有没有人订阅无关 ——
+   * 把它接在推流链上，等于让"没人订阅"变成"看不出谁改的"，那正好是我们要避免的未知态。
+   *
+   * 归一化**在这里一次做完**（能力层与账本都不认识 vscode 的 event 形状）：
+   * `{file, version, incarnation, changes[], reasonCode}`；`changes` 给不出就是 null
+   * （判据那边会把 null 当"无法逐条比对"，而不是"没有变化"）。
+   *
+   * 返回 `Disposable`（没有可订阅的源就返回 null）。异常一律吞掉并记日志：
+   * 观察者是**证据**，它绝不许影响编辑器主流程。
+   *
+   * ⚠️ 代价：每个文档事件会走一次 `incarnationOf`（WeakMap 首次分配一个 id）。
+   *    同一个 `incarnationOf` 也是 `readDocumentState` / 写事务用的那一个，所以读侧、
+   *    写侧、事件侧三处的化身口径**同源** —— 这是归属判定能成立的前提。
+   */
+  function observeTextChanges(handler) {
+    const source = vscode.workspace?.onDidChangeTextDocument
+    if (typeof source !== 'function' || typeof handler !== 'function') return null
+    return source((event) => {
+      try {
+        const doc = event?.document
+        handler({
+          file: typeof doc?.uri?.fsPath === 'string' ? canonicalPath(doc.uri.fsPath) : null,
+          version: Number.isInteger(doc?.version) ? doc.version : null,
+          incarnation: doc ? incarnationOf(doc) : null,
+          changes: Array.isArray(event?.contentChanges)
+            ? event.contentChanges.map((change) => ({
+              start: {
+                line: change?.range?.start?.line,
+                character: change?.range?.start?.character,
+              },
+              end: {
+                line: change?.range?.end?.line,
+                character: change?.range?.end?.character,
+              },
+              text: typeof change?.text === 'string' ? change.text : null,
+            }))
+            : null,
+          reasonCode: typeof event?.reason === 'number' ? event.reason : null,
+        })
+      } catch (err) {
+        log(`observeTextChanges: handler failed: ${err?.message ?? err}`)
+      }
+    })
+  }
+
   return {
     // `fileExists` 由 `openFile` 与 `deleteFile`（隔离体存在性 / 同名冲突探测）共用 ——
     // **重排这个对象时别漏掉它**。
@@ -691,6 +745,8 @@ export function createHost(output) {
       onDidChangeActiveTextEditor: (fn) => vscode.window.onDidChangeActiveTextEditor(fn),
       onDidChangeWindowState: (fn) => vscode.window.onDidChangeWindowState(fn),
     },
+    // A1（T61）：变更事件的归一化来源（变更账本用；与推流侧的 editorEvents 分开）。
+    observeTextChanges,
     openTextDocument,
     openExternalFile,
     activeEditor,

@@ -75,6 +75,43 @@ const isSha256Hex = (v) => typeof v === 'string' && /^[0-9a-f]{64}$/.test(v)
 const isObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v)
 
 /**
+ * A1（T61）归属字段的**取值全集**，与 bridge 侧 `change-ledger.js` 的 `ATTRIBUTION`
+ * 逐字一致。这里必须抄一份而不 import：kit 是**零依赖协议库**，反向往 bridge 里
+ * import 会把扩展侧的实现拖进协议层（铁律 3）。防漂移的手段是 bridge 的
+ * `test/change-ledger.test.js` 里那条静态比对（读本文件的字面量对账）。
+ *
+ * ★ `unknown` 是**正常结果**，不是失败：它表达"我说不清这些变化是谁造成的"，
+ *   正是本卡要求的保留态。把 unknown 判成畸形响应会逼对端去猜一个更好看的答案。
+ */
+const ATTRIBUTION_VALUES = ['bridge-correlated', 'self-only', 'mixed', 'unknown']
+
+/** 可空整数（锚点字段在没有基线时是 `null`，不是缺失）。 */
+const isNullableIntegerAtLeast = (min) => (v) => v === null || (Number.isInteger(v) && v >= min)
+/** 可空非空字符串（`incarnation`）。 */
+const isNullableNonEmptyString = (v) => v === null || (typeof v === 'string' && v.trim() !== '')
+/** 可空 sha256（`hash`：算不出/文本不可用时是 `null`）。 */
+const isNullableSha256Hex = (v) => v === null || isSha256Hex(v)
+/** 可空布尔。 */
+const isNullableBoolean = (v) => v === null || typeof v === 'boolean'
+
+/**
+ * 锚点字段清单（`before` / `after` 共用**同一份**形状定义）。
+ *
+ * 为什么两边必须同形：消费者会把 `before.version` 与 `after.version` 直接相减/相比，
+ * 一边允许 `undefined`、另一边要求整数，就会出现"看着像缺字段"的静默分支。
+ * 所以两个锚点的字段集在契约里是同一份，差异只在**值**上。
+ */
+function anchorFields(prefix) {
+  return [
+    [`${prefix}.version`, isNullableIntegerAtLeast(0), `${prefix}.version:int|null`],
+    [`${prefix}.incarnation`, isNullableNonEmptyString, `${prefix}.incarnation:string(non-empty)|null`],
+    [`${prefix}.hash`, isNullableSha256Hex, `${prefix}.hash:sha256|null`],
+    [`${prefix}.textLength`, isNullableIntegerAtLeast(0), `${prefix}.textLength:int|null`],
+    [`${prefix}.dirty`, isNullableBoolean, `${prefix}.dirty:boolean|null`],
+  ]
+}
+
+/**
  * 已发布能力的返回形状清单（契约 §5.1 第 3 条表格，逐字对应）。
  *
  * 结构：
@@ -176,12 +213,38 @@ const RESPONSE_CONTRACTS = Object.freeze({
    *   `textLength` = 本次写入文本的长度（UTF-16 码元数，即 `text.length`）。
    */
   'vscode.applyEdit': {
-    expected: 'object with applied:boolean, file:string(non-empty), saved===false, textLength:int>=0',
+    expected: 'object with applied:boolean, file:string(non-empty), saved===false, textLength:int>=0, '
+      + 'and optionally operationId:string(non-empty), attribution:in{'
+      + ATTRIBUTION_VALUES.join(',') + '}, attributionReason:string(non-empty), '
+      + 'before:{version:int|null, incarnation:string(non-empty)|null, hash:sha256|null, '
+      + 'textLength:int|null, dirty:boolean|null}, after:{…same shape…}',
     fields: [
       ['applied', isBoolean, 'applied:boolean'],
       ['file', isNonEmptyString, 'file:string(non-empty)'],
       ['saved', (v) => v === false, 'saved===false'],
       ['textLength', isIntegerAtLeast(0), 'textLength:int>=0'],
+    ],
+    // ── A1（T61）归属字段：**只增不改**，且**整组可选** ──
+    // ① 既有四个字段的语义一字未动（`saved === false` 仍是业务承诺）。
+    // ② 整组可选的理由是**向后兼容**：老扩展（没有账本）根本不回这些键，
+    //    把任何一个改成必填，都会让旧对端在一夜之间变成 `-32009` 畸形响应。
+    // ③ 但"可选"只表示**可以不给**，不表示"给了可以乱给"：键一旦出现就走类型谓词，
+    //    显式 `null` 对非可空字段同样被拒（与 `languageId?` 同一口径）。
+    optional: [
+      ['operationId', isNonEmptyString, 'operationId?:string(non-empty)'],
+      ['attribution', oneOf(...ATTRIBUTION_VALUES), `attribution?:in{${ATTRIBUTION_VALUES.join(',')}}`],
+      ['attributionReason', isNonEmptyString, 'attributionReason?:string(non-empty)'],
+      ['before', isObject, 'before?:object'],
+      ['after', isObject, 'after?:object'],
+      ...anchorFields('before'),
+      ...anchorFields('after'),
+    ],
+    // 归属字段是**一组**：只给 `attribution` 却不给锚点，消费者没法自己核对，
+    // 等于把一个"结论"当证据发出去（本卡明确不要这种东西）。所以要么一起给，要么都不给。
+    consistency: [
+      [(r) => r.attribution === undefined
+        || (typeof r.operationId === 'string' && isObject(r.before) && isObject(r.after)),
+      'attribution requires operationId + before + after (or none of them at all)'],
     ],
   },
 

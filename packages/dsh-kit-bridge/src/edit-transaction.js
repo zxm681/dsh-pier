@@ -132,6 +132,8 @@ export function versionConflictError({ file, expected, actual, method = TRANSACT
  */
 export async function applyEditAtomically({
   editor, file, expectedVersion, expectedIncarnation, readIncarnation, apply, log,
+  // A1（T61）：变更账本的 before 基准回调 —— 在同步区间里、构造 edit 之前调用一次。
+  observe,
   method = TRANSACTION_METHOD,
 }) {
   const doc = editor?.document
@@ -196,6 +198,32 @@ export async function applyEditAtomically({
       }
     }
     constructed = true
+    // ── A1（T61）变更账本：把 before 基准交出去 —— **只在同步区间里给** ──
+    // 为什么必须在这里：这份坐标所基于的那一版，只有"构造 edit 的同一个同步区间"里
+    // 读到的才算数。放到事务外（哪怕只提前一个 await）就可能读到"另一版"的快照，
+    // 于是 after 与预期的比对、以及事件链的版本衔接全部判错 —— 那正好会把我跟别人判反。
+    //
+    // 观察者是**证据**，不是闸：它抛异常绝不许影响写入本身（`constructed` 已经置位，
+    // 这里再抛会把一次本来成功的写入变成失败，那是最糟的失败形态）。
+    if (typeof observe === 'function') {
+      try {
+        observe({
+          version: actual,
+          incarnation: observedIncarnation,
+          documentPath: typeof editor.document?.uri?.fsPath === 'string'
+            ? editor.document.uri.fsPath
+            : null,
+          // `getText()` 是 O(n) 的一份拷贝：调用方（账本）自己按上限决定留不留，
+          // 这里只如实把"这一版是什么"交出去。
+          text: typeof editor.document?.getText === 'function'
+            ? editor.document.getText()
+            : null,
+        })
+      } catch (err) {
+        log?.(`applyEdit transaction: ${file} change-ledger observe failed: ${err?.message ?? err}`
+          + ' (the write is unaffected)')
+      }
+    }
     apply(builder)
     // ───────────────────────────────────────────────────────────────────────
     // 同步区间结束
