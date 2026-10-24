@@ -33,6 +33,7 @@ import { join } from 'node:path'
 
 import { GrantStore } from '../../dsh-vscode-kit/src/grant.js'
 import { ERR } from '../../dsh-vscode-kit/src/protocol.js'
+import { pathIdentityKey } from '../../dsh-vscode-kit/src/paths.js'
 import { createCapabilities } from '../src/capabilities.js'
 import { applyEditAtomically, TRANSACTION_METHOD } from '../src/edit-transaction.js'
 
@@ -64,6 +65,7 @@ function applyReplace(doc, range, value) {
 function humanInsert(doc, line, column, value) {
   applyReplace(doc, { start: { line, column }, end: { line, column } }, value)
   doc.version += 1
+  doc.dirty = true
 }
 
 /**
@@ -75,6 +77,9 @@ function humanInsert(doc, line, column, value) {
 function makeHost(root, abs, { hooks = {} } = {}) {
   const doc = {
     version: 0,
+    // A2（T62）：缓冲区是否**未保存**。真机的 `isDirty` 就是这么来的：改了就脏，保存才清。
+    // 旧版本这个假宿主恒报 `isDirty: true`，v2 之后那等于"每个文件天生来源不明"——全部拒写。
+    dirty: false,
     // ★ T35：化身无条件必填 ⇒ 假文档必须带实例身份（写侧在事务里比对的就是它）。
     incarnation: INCARNATION,
     lines: readFileSync(abs, 'utf8').split(/\r?\n/),
@@ -82,6 +87,13 @@ function makeHost(root, abs, { hooks = {} } = {}) {
   }
   const calls = []
   const builtEdits = []
+  const listeners = []
+  /** 走观察器报一次变更（真机：`onDidChangeTextDocument`）。位置是 `character` 口径。 */
+  const emit = (changes) => {
+    for (const fn of listeners.slice()) {
+      fn({ file: abs, version: doc.version, incarnation: doc.incarnation, changes, reasonCode: 1 })
+    }
+  }
   const host = {
     doc,
     calls,
@@ -90,6 +102,13 @@ function makeHost(root, abs, { hooks = {} } = {}) {
     fileExists: (p) => p === abs,
     resolvePath: (p) => p,
     workspaceRoots: () => [root],
+    listeners,
+    // A2（T62）：真观察器。没有它桥接拒绝一切写入（observation-gap），有它才能把
+    // "人工键入"与"我这笔写的"分开 —— B1 那些用例正是"两笔变更落在同一个窗口里"的故事。
+    observeTextChanges: (fn) => {
+      listeners.push(fn)
+      return { dispose() { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1) } }
+    },
     isTrusted: () => true,
     openTextDocument: async () => {},
     openExternalFile: async () => {},
@@ -113,7 +132,7 @@ function makeHost(root, abs, { hooks = {} } = {}) {
       return {
         version: doc.version,
         incarnation: doc.incarnation,
-        isDirty: true,
+        isDirty: doc.dirty,
         eol: 'lf',
         lineCount: doc.lines.length,
         textLength: text.length,
@@ -135,7 +154,7 @@ function makeHost(root, abs, { hooks = {} } = {}) {
      * 真事务的写宿主。`expectedVersion` 是能力层传下来的**锚点本身**（不是一个布尔值）；
      * 判定发生在 `applyEditAtomically` 里 —— 版本不等就**一次 edit 都不构造**。
      */
-    applyEditText: async (_abs, range, text, expectedVersion, expectedIncarnation) => {
+    applyEditText: async (_abs, range, text, expectedVersion, expectedIncarnation, observation) => {
       calls.push({
         range, text, expectedVersion, expectedIncarnation, versionAtEntry: doc.version,
       })
@@ -149,12 +168,20 @@ function makeHost(root, abs, { hooks = {} } = {}) {
           cb({ replace: (r, v) => ops.push({ r, v }) })
           builtEdits.push(ops.length)
           for (const op of ops) { applyReplace(doc, op.r, op.v); doc.version += 1 }
+          if (ops.length > 0) {
+            doc.dirty = true
+            // 真机：WorkspaceEdit 落地同样触发 onDidChangeTextDocument（在写窗口内）。
+            emit(ops.map((op) => ({ start: op.r.start, end: op.r.end, text: op.v })))
+          }
           return true
         },
       }
       const outcome = await applyEditAtomically({
         editor, file: abs, expectedVersion, expectedIncarnation,
         readIncarnation: (d) => d.incarnation,
+        // A1/A2：两个回调都**原样**下到事务 —— 只在同步区间里各调一次。
+        ...(typeof observation?.observe === 'function' ? { observe: observation.observe } : {}),
+        ...(typeof observation?.verify === 'function' ? { verify: observation.verify } : {}),
         apply: (builder) => builder.replace(range, text),
       })
       return { applied: outcome.applied, documentPath: abs, version: outcome.version }
@@ -171,7 +198,10 @@ function env({ hooks, lines = LINES } = {}) {
   const host = makeHost(root, abs, { hooks })
   const grants = new GrantStore()
   const link = { name: 'link-t32' }
-  grants.adopt({ id: ID, epoch: EPOCH, link })
+  // ★ A2（T62）：脏缓冲的写入许可来自 **grant**（生产链路上扩展就是这么签发的），
+  // 调用方传参一律不读。这里带上它，因为本文件的用例讲的是"锚点/事务窗口"，
+  // 不是"授权表里没有这条"。
+  grants.adopt({ id: ID, epoch: EPOCH, link, allowDirtySave: true })
   const caps = createCapabilities(host, { grants })
   return {
     root, abs, host, caps, link,
@@ -497,7 +527,7 @@ async function readStateOf(host, abs, { includeText = false } = {}) {
   return {
     version: host.doc.version,
     incarnation: host.doc.incarnation,
-    isDirty: true,
+    isDirty: host.doc.dirty === true,
     eol: 'lf',
     lineCount: host.doc.lines.length,
     textLength: text.length,
@@ -651,5 +681,39 @@ test('★ T33 不同文件仍可并行（大写别名没把锁做成全局锁）
     assert.equal(rb.applied, true, 'b.js 也写成功')
     assert.equal(e.host.buffer().split('\n')[1], 'DSH!!', 'a.js 落点正确')
     assert.equal(otherHost.buffer().split('\n')[1], 'DSH!!', 'b.js 落点正确（并行）')
+  } finally { e.dispose() }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★ T62（A2）：写许可的**第二道**在构造 builder 的同步区间里
+//
+// 排队时判一次（宿主零调用的早拒），构造 builder 前再判一次 —— 后者是"从判定到落笔之间
+// 没有 await"的唯一区间。这条用例把"判定之后、落笔之前**新来一份证据**"的情形钉死：
+// 少了这道复核，旧代码会照写下去（变异 M1 就红在这里）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('★ T62 门在同步区间：排队后、构造前来了冻结证据 → 零构造 + -32011', async () => {
+  const e = env({
+    hooks: {
+      // 让出点：排队判定已经过了（干净），事务还没开始构造 builder。
+      // 这里模拟"同一刻别处报来一条本桥接无法归属的证据"（真实的例子：另一个工具
+      // 通过适配器报了 `markForeign`，或者上一笔写结算后判成 mixed-origin）。
+      beforeTransaction: () => {
+        const key = pathIdentityKey(e.abs)
+        e.caps.writePolicy.markForeign(key, { reason: 'foreign-change', note: 'landed after queue gate' })
+      },
+    },
+    lines: ['alpha one', 'beta two'],
+  })
+  try {
+    let err = null
+    try {
+      await write(e.caps, e.link, params(e.abs, { expectedVersion: 0, text: 'DSH!!' }))
+    } catch (x) { err = x }
+    assert.equal(err?.code, ERR.DOCUMENT_DIRTY, '构造前必须再判一次：这道门晚了就等于没有')
+    assert.equal(err?.data?.phase, undefined, 'phase 只是诊断，不进 data；这里确认码本身')
+    assert.equal(err?.data?.reason, 'foreign-change')
+    assert.equal(totalOps(e.host), 0, '★ 一个 builder.replace 都不许发生')
+    assert.equal(e.host.buffer().includes('DSH!!'), false, '缓冲区一个字都没变')
   } finally { e.dispose() }
 })

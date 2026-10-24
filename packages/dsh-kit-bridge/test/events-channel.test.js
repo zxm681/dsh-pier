@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { createConnector } from '../src/connector.js'
 import { startBridgeServer } from '../../dsh-vscode-kit/src/server.js'
 import { EVENT_METHOD } from '../../dsh-vscode-kit/src/event-contract.js'
+import { PROTOCOL_VERSION } from '../../dsh-vscode-kit/src/protocol.js'
 
 async function until(fn) {
   for (let i = 0; i < 400; i++) { if (fn()) return; await delay(5) }
@@ -20,7 +21,7 @@ async function fixture(t, serverExtra = {}, connectorExtra = {}) {
     dshHome: home, portRange: [7550, 7559], events: true,
     onEvent: (event, ctx) => delivered.push({ event, link: ctx.link }),
     onRequest: (method, params) => {
-      if (method === 'bridge.hello') { hellos.push(params); return { ok: true, protocolVersion: 1 } }
+      if (method === 'bridge.hello') { hellos.push(params); return { ok: true, protocolVersion: PROTOCOL_VERSION } }
       return { pong: true }
     }, ...serverExtra,
   })

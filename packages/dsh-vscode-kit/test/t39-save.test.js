@@ -110,7 +110,7 @@ async function withKit({ consumers, saveResult } = {}) {
   const shared = ctx.provided.get('dshVscodeKit').v
   const editor = await fakeEditor(handle.kit.server, { saveResult })
   await editor.link.request('bridge.hello', {
-    client: 'fake-editor', extensionVersion: '0.1.0', protocolVersion: 1, capabilities: SAVE_CAPS,
+    client: 'fake-editor', extensionVersion: '0.1.0', protocolVersion: PROTOCOL_VERSION, capabilities: SAVE_CAPS,
   })
   const cleanup = async () => {
     if (!editor.socket.destroyed) await editor.close().catch(() => {})
@@ -138,8 +138,10 @@ test('T39 协议：-32013 只加码，且与 -32012 分家（磁盘冲突永不�
   assert.equal(ERR_NAME[-32013], 'disk-state-conflict')
   assert.notEqual(ERR.DISK_STATE_CONFLICT, ERR.DOCUMENT_VERSION_CONFLICT)
   assert.equal(ERR.DOCUMENT_VERSION_CONFLICT, -32012, '旧码数字不许漂移')
-  assert.equal(PROTOCOL_VERSION, 1, '加码不许改协议版本')
-  assert.equal(ERR_NAME[-32011], undefined, '-32011 保持空号')
+  assert.equal(PROTOCOL_VERSION, 2, '★ T62：脏缓冲的拒绝码变了→整版升 v2')
+  // ★ T62 把 -32011 用了：document-dirty。它与 -32013 必须分家（一个是来源不明，一个是磁盘字节变了）。
+  assert.equal(ERR.DOCUMENT_DIRTY, -32011)
+  assert.equal(ERR_NAME[-32011], 'document-dirty')
   // 档位表：save 属于 disk-write（白名单的判据就在这张表上）
   assert.equal(METHOD_TIERS['vscode.save'], 'disk-write')
   assert.equal(tierOf('vscode.save'), 'disk-write')

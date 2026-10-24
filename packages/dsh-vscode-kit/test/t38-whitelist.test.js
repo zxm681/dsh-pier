@@ -24,7 +24,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply, TIERS, METHOD_TIERS, tierOf, UNBOUND_CONSUMER, HOST_CONSUMER } from '../src/index.js'
-import { connect, createLineSplitter, ERR } from '../src/protocol.js'
+import { connect, createLineSplitter, ERR, PROTOCOL_VERSION } from '../src/protocol.js'
 import { judgeCall, normalizePolicy, minTier, isTier } from '../src/whitelist.js'
 
 const FILE = '/ws/a.js'
@@ -131,7 +131,7 @@ async function withKit({ consumers, caps = [...READ_CAPS, 'vscode.applyEdit'] } 
   const server = handle.kit.server
   const editor = await fakeEditor(server)
   await editor.link.request('bridge.hello', {
-    client: 'fake-editor', extensionVersion: '0.1.0', protocolVersion: 1, capabilities: caps,
+    client: 'fake-editor', extensionVersion: '0.1.0', protocolVersion: PROTOCOL_VERSION, capabilities: caps,
   })
   const cleanup = async () => {
     if (!editor.socket.destroyed) await editor.close().catch(() => {})

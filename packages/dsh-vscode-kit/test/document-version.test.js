@@ -55,16 +55,21 @@ const INC = 'inc-kit-t30'
 // ① 错误码：只加不改
 // ---------------------------------------------------------------------------
 
-test('T30 协议：-32012 document-version-conflict 只加码，既有码与协议版本一字未动', () => {
+test('T30 协议：-32012 document-version-conflict 只加码，既有码不动（T62 后整版升 v2）', () => {
   assert.equal(ERR.DOCUMENT_VERSION_CONFLICT, -32012)
   assert.equal(ERR_NAME[-32012], 'document-version-conflict')
-  // 紧邻 -32010，且 -32011 仍是空位（没有偷偷占用邻居的名字）
+  // 紧邻 -32010。★ T62 把 -32011 用掉了（document-dirty）（旧断言说它是空号）——
+  //   原意是「不许偷偷占用邻居的名字」，所以这里改成守相反的一面：它必须叫得出名字，
+  //   而且不得被写成 -32012 的别名。
   assert.equal(ERR.EDIT_NOT_BOUND, -32010)
-  assert.equal(ERR_NAME[-32011], undefined)
+  assert.equal(ERR.DOCUMENT_DIRTY, -32011)
+  assert.equal(ERR_NAME[-32011], 'document-dirty')
   // 既有码不许动：这些数字一旦漂移，两侧判定就整体错位
   assert.equal(ERR.INVALID_PARAMS, -32602)
   assert.equal(ERR.INVALID_RESPONSE, -32009)
-  assert.equal(PROTOCOL_VERSION, 1, '加一个错误码不改协议版本：旧端只是收不到这条错误')
+  // ★ T62：协议整版升到 v2（不是因为加了一个码，而是因为脏缓冲的拒绝码从 -32012 换成了 -32011：
+  //   旧消费者会把新码当成「重读重发」的信号，那正是要阻止的行为）。
+  assert.equal(PROTOCOL_VERSION, 2, 'v2：-32011 的处置与 -32012 相反，不能让旧端按旧语义重发')
 
   // 能原样跨线往返（-32012 的 data 是结构化对象，序列化后必须还原）
   const round = BridgeError.from({

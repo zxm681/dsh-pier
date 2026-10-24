@@ -50,13 +50,29 @@ function makeBufferHost(roots) {
   const buffers = new Map()
   /** abs → number（版本号，只增）。 */
   const versions = new Map()
+  /** abs → true（缓冲区里有**未保存**内容）。真机的 `isDirty` 就是这么来的。 */
+  const dirties = new Set()
+  /** 观察器订阅者（A2：桥接判定归属的唯一证据源）。 */
+  const listeners = []
   const read = (abs) => {
     if (!buffers.has(abs)) buffers.set(abs, readFileSync(abs, 'utf8').split(/\r?\n/))
     return buffers.get(abs)
   }
   const versionOf = (abs) => (versions.has(abs) ? versions.get(abs) : 0)
   /** 缓冲区被改一次，版本 +1（人工键入与 DSH 写入走同一条）。 */
-  const bump = (abs) => { versions.set(abs, versionOf(abs) + 1) }
+  const bump = (abs) => {
+    versions.set(abs, versionOf(abs) + 1)
+    // 缓冲区一变就是脏的（真机语义）；只有保存才清。
+    dirties.add(abs)
+  }
+  /** 走观察器报一次变更（对应 `vscode.workspace.onDidChangeTextDocument`）。 */
+  const emit = (abs, changes) => {
+    for (const fn of listeners.slice()) {
+      fn({ file: abs, version: versionOf(abs), incarnation: INCARNATION, changes, reasonCode: 1 })
+    }
+  }
+  /** 测试用：把脏标记清掉（模拟"人手动保存了"）。 */
+  const markSaved = (abs) => { dirties.delete(abs) }
   const host = {
     calls,
     buffers,
@@ -69,11 +85,22 @@ function makeBufferHost(roots) {
       const tail = buf[line - 1].slice(column - 1)
       buf[line - 1] = head + text + tail
       bump(abs)
+      // 人工键入同样要过观察器 —— 桥接就是靠这个把"不是我写的"认出来的。
+      emit(abs, [{ start: { line, column }, text }])
     },
+    listeners,
+    markSaved,
+    isDirtyOf: (abs) => dirties.has(abs),
     buffer: (abs) => read(abs).join('\n'),
     fileExists: (p) => { try { return existsSync(p) && statSync(p).isFile() } catch { return false } },
     resolvePath: (p) => (isAbsolute(p) ? normalize(p) : join(roots[0], p)),
     workspaceRoots: () => roots.slice(),
+    // A2（T62）：**同源变更观察器**。没有它桥接连干净基线都建立不起来（observation-gap），
+    // 有它才能把"人工键入"与"自己写的"分开 —— 本文件的故事全靠它。
+    observeTextChanges: (fn) => {
+      listeners.push(fn)
+      return { dispose() { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1) } }
+    },
     isTrusted: () => true,
     openTextDocument: async () => {},
     openExternalFile: async () => {},
@@ -94,7 +121,7 @@ function makeBufferHost(roots) {
       return {
         version: versionOf(abs),
         incarnation: INCARNATION,
-        isDirty: true,
+        isDirty: dirties.has(abs),
         eol: 'lf',
         lineCount: read(abs).length,
         textLength: text.length,
@@ -118,7 +145,7 @@ function makeBufferHost(roots) {
     // `edit-transaction.js` 里做同一件事）。不等 → 不构造 edit、抛 `-32012`。
     // ★ T35：`expectedIncarnation` 也是锚点的一部分，无条件必填；这一层与真适配器一样
     // 在"提交那一刻"再判一次（两条锚点都判）。
-    applyEditText: async (abs, range, text, expectedVersion, expectedIncarnation) => {
+    applyEditText: async (abs, range, text, expectedVersion, expectedIncarnation, observation) => {
       const versionAtWrite = versionOf(abs)
       calls.push({ abs, range, text, expectedVersion, expectedIncarnation, versionAtWrite })
       if (expectedIncarnation !== INCARNATION) {
@@ -132,6 +159,15 @@ function makeBufferHost(roots) {
           `document version is ${versionAtWrite}, but the request was prepared for version ${expectedVersion}`,
           { method: 'vscode.applyEdit', file: abs, expected: expectedVersion, actual: versionAtWrite })
       }
+      // A1/A2：写宿主**必须**把这个"写之前那一刻"报给账本 —— 没有 before 基准，账本只能
+      // 给出 `no-baseline`（unknown），这个文件的后续写入就全被冻结。真适配器在
+      // `edit-transaction.js` 的同步区间里做同一件事。
+      observation?.observe({
+        version: versionOf(abs),
+        incarnation: INCARNATION,
+        documentPath: abs,
+        text: read(abs).join('\n'),
+      })
       const buf = read(abs)
       const head = buf[range.start.line].slice(0, range.start.column)
       const tail = buf[range.end.line].slice(range.end.column)
@@ -139,6 +175,17 @@ function makeBufferHost(roots) {
         ...buf.slice(range.end.line + 1)]
       buffers.set(abs, merged)
       bump(abs)
+      // 真机：`WorkspaceEdit` 落地同样触发 onDidChangeTextDocument。它落在写窗口内，
+      // 所以桥接把它记进"自己的窗口"，不当成别人的增量。
+      // 真 VS Code 的 contentChanges 带**完整 range**（start+end）—— 账本按它逐条比对
+      // 自己这一笔，所以少一个 end 就会被判成"还有别人的改动"（mixed）。
+      // 事件里的位置是 VS Code 口径（`character`），能力层交给宿主的是协议口径（`column`）——
+      // 真适配器（`vscode-host.js`）在这两层之间翻一次；假宿主不翻的话账本逐条比对会对不上。
+      emit(abs, [{
+        start: { line: range.start.line, character: range.start.character ?? range.start.column },
+        end: { line: range.end.line, character: range.end.character ?? range.end.column },
+        text,
+      }])
       return { applied: true, documentPath: abs }
     },
     log: () => {},
@@ -165,7 +212,11 @@ function env() {
   writeFileSync(join(root, 'b.js'), 'bee1\nbee2\n')
   const link = { name: 'link-t30' }
   const grants = new GrantStore()
-  grants.adopt({ id: ID, epoch: EPOCH, link })
+  // ★ A2（T62）：`allowDirtySave` 从"调用方传参"改成 **grant 级显式许可**。
+  // 生产链路上扩展就是这么签发 grant 的（`extension.js` 的
+  // `grants.adopt({ id, epoch, link, allowDirtySave: true })`），所以这些讲"编辑语义"的
+  // 用例按生产口径带许可；"没有许可就不许写脏缓冲"由 t39/t40 单独守着。
+  grants.adopt({ id: ID, epoch: EPOCH, link, allowDirtySave: true })
   const host = makeBufferHost([root])
   const caps = createCapabilities(host, { grants })
   return {
@@ -208,7 +259,7 @@ async function expectCode(promise, code, label) {
 // ① T4 的 NO-GO 正面替代：旧版本写入被拦，人工改动留下
 // ---------------------------------------------------------------------------
 
-test('T30 ★ 旧版本写入：人工改过缓冲区后用旧版本写 → -32012，人工的字留下，宿主零调用', async () => {
+test('T62 ★ 重读锚点洗不白：人工键入后拿最新 version 重写 → 仍 -32011；isDirty=false 也不解冻', async () => {
   const e = env()
   try {
     const f = e.file('a.js')
@@ -238,14 +289,33 @@ test('T30 ★ 旧版本写入：人工改过缓冲区后用旧版本写 → -320
       '人工改动必须原样留下 —— 这条是 T4 丢字场景的反面')
     assert.equal(e.host.buffer(f).includes('HUMAN-WROTE-THIS'), true)
 
-    // 按冲突提示重读版本再写：这一次才允许落地。
+    // ★ A2（T62）：**拿到最新锚点出来也仍然拒写**。
+    // 版本号能重读，但"这行字是谁敲的"重读不出来 —— 账本没有这条变更的归属证据
+    // （人工键入落在写窗口之外 ⇒ `foreign-change`）。冻结是**逐文件**的，与版本无关。
     const fresh = await e.state(f)
     assert.equal(fresh.version, 2)
-    const retry = await e.edit(f, wholeLine(1, e.host.buffer(f).split('\n')[0].length), 'DSH-LINE1-V3',
-      { expectedVersion: fresh.version })
-    assert.equal(retry.applied, true)
-    assert.equal(e.host.buffer(f).includes('HUMAN-WROTE-THIS'), false,
-      '拿到新版本后整行覆盖是**调用方的选择**，不是机制偷偷替他做的')
+    const callsAfterStale = e.host.calls.length
+    const tainted = await expectCode(
+      e.edit(f, wholeLine(1, e.host.buffer(f).split('\n')[0].length), 'DSH-LINE1-V3',
+        { expectedVersion: fresh.version }),
+      ERR.DOCUMENT_DIRTY, 'fresh-anchor-still-dirty')
+    assert.equal(tainted.data.reason, 'foreign-change', '原因要具体到"别人的改动"')
+    assert.equal(tainted.data.attribution, 'unknown')
+    assert.equal(tainted.data.retryable, false, '-32011 的处置是"别重发"，不是"重读再试"')
+    assert.equal(tainted.data.mayHaveApplied, false, '还没碰宿主就拒了')
+    assert.equal(tainted.data.recovery, 'human-rebase')
+    assert.equal(e.host.calls.length, callsAfterStale, '冻结时宿主零调用')
+    assert.equal(e.host.buffer(f).includes('HUMAN-WROTE-THIS'), true,
+      '人工的字必须留下 —— 这次不是"整行覆盖"的选择，而是根本不许写')
+
+    // ★ A2：`isDirty` 转 false（人手动保存了）**不能**洗白已经观察到的非桥接修改。
+    // 保存解决的是"盘上有没有这段字"，不解决"这段字是谁写的"。
+    e.host.markSaved(f)
+    assert.equal(e.host.isDirtyOf(f), false)
+    await expectCode(
+      e.edit(f, wholeLine(1, 5), 'DSH-AFTER-SAVE', { expectedVersion: e.host.versionOf(f) }),
+      ERR.DOCUMENT_DIRTY, 'taint-survives-save')
+    assert.equal(e.host.buffer(f).includes('HUMAN-WROTE-THIS'), true)
   } finally { e.dispose() }
 })
 

@@ -25,6 +25,9 @@ import {
 import { createEventBroker } from '../../dsh-vscode-kit/src/event-subscriptions.js'
 import { canonicalPath, pathIdentityKey } from '../../dsh-vscode-kit/src/paths.js'
 import { createChangeLedger } from './change-ledger.js'
+import {
+  createWritePolicy, documentDirtyError, WRITE_POLICY_REASONS,
+} from './document-write-policy.js'
 
 /** 本扩展声明支持的能力清单（写进发现文件 / hello 的 capabilities）。 */
 export const CAPABILITIES = [
@@ -993,13 +996,40 @@ export function createCapabilities(host, opts = {}) {
     ? null
     : (opts.changeLedger ?? createChangeLedger({ log: (level, msg, extra) => log(level, msg, extra) }))
 
+  /**
+   * 逐文件写许可门（A2 / T62）—— `-32011 document-dirty` 的**唯一**判定处。
+   *
+   * 与账本的分工（别混）：
+   *  - `changeLedger` 是**证据**：这次增量是谁的，四值归属；
+   *  - `writePolicy` 是**许可**：这个文件现在能不能写。
+   *  账本给 `writePolicy` 喂两样东西（`noteChange` 的观察、`endWrite` 的归属裁决），
+   *  自己一个字都不判许可；`writePolicy` 反过来不自己造证据，只消费账本判出来的归属。
+   *
+   * `opts.writePolicy` 可以注入替身（单测用）；`opts.changeLedger === false` 时账本为空，
+   * 于是"没有证据源" → 三种写全拒 `observation-gap`（**不许**当成干净放行）。
+   */
+  const writePolicy = opts.writePolicy ?? createWritePolicy({
+    log: (level, msg) => log(level, msg),
+  })
+
+  /**
+   * 观察器的**两个**消费者：账本（证据）+ 写许可（冻结）。
+   * ★ 顺序不许反：先记证据再判许可，否则 `noteChange` 会拿不到本轮已经落进环里的事件。
+   */
+  function onDocumentChanged(sample) {
+    try { changeLedger.observeChange(sample) } catch (err) {
+      log('warn', `change-ledger observeChange failed: ${err?.message ?? err}`)
+    }
+    try { writePolicy.noteChange(sample) } catch (err) {
+      log('warn', `write-policy noteChange failed: ${err?.message ?? err}`)
+    }
+  }
+
   if (changeLedger) {
     if (typeof host.observeTextChanges === 'function') {
       try {
         const disposable = host.observeTextChanges((sample) => {
-          try { changeLedger.observeChange(sample) } catch (err) {
-            log('warn', `change-ledger observeChange failed: ${err?.message ?? err}`)
-          }
+          onDocumentChanged(sample)
         })
         if (disposable && typeof disposable.dispose === 'function') {
           changeLedger.markObserverAttached()
@@ -1070,6 +1100,65 @@ export function createCapabilities(host, opts = {}) {
       return changeLedger.settle(record, { outcome, after, afterError })
     } catch (err) {
       log('warn', `change-ledger settle failed: ${err?.message ?? err}`)
+      return null
+    }
+  }
+
+  /**
+   * 写许可门的输入（三个调用点共用一份，避免各拼一份之后漂移 —— 铁律 10 的同一要求）。
+   *
+   * @param {object} ctxIn
+   * @param {string} ctxIn.method
+   * @param {string} ctxIn.abs       规范化后的真实路径（错误回执里的 `file`）
+   * @param {string} ctxIn.fileKey   `serializeKeyFor(real)`：同一文件的稳定身份（taint 的键）
+   * @param {object} ctxIn.state     `readDocumentState` 的实测结果（**不许**用期望值代替）
+   * @param {object} ctxIn.params    业务参数 —— **只**用来回查授权表里的 grant，不读任何位
+   * @param {string} ctxIn.phase     'queue' | 'construct' | 'pre-save' | 'pre-delete'（诊断用）
+   */
+  function policyInput({ method, abs, fileKey, state, params, phase }) {
+    return {
+      method,
+      file: abs,
+      fileKey,
+      version: Number.isInteger(state?.version) ? state.version : null,
+      incarnation: typeof state?.incarnation === 'string' ? state.incarnation : null,
+      isDirty: state?.isDirty === true,
+      // ★ 许可只从**授权表**里回查；`params.allowDirtySave` 从这里到判定链上**没有任何读者**。
+      grantAllowsDirty: grants ? grantAllowsDirtySave(grants, params?.grant) : false,
+      hasEvidenceSource: evidenceSourceAvailable(),
+      phase,
+    }
+  }
+
+  /**
+   * 有没有**同源**观察能力：账本在，且它的观察器真的装上了（宿主返回了可 dispose 的订阅）。
+   *
+   * "观测器缺失" 与 "观测器装上了但此刻没有事件" 是两件事：前者整条写路径 fail-closed，
+   * 后者是正常的 `self-only event-chain-pending`。这里只回答前者。
+   */
+  function evidenceSourceAvailable() {
+    if (!changeLedger) return false
+    try {
+      return changeLedger.status().observer === 'attached'
+    } catch {
+      return false
+    }
+  }
+
+  /** 判 + 抛：判不过就是 `-32011`（数据形状由 `document-write-policy.js` 一处给出）。 */
+  function assertWriteAllowed(input) {
+    return writePolicy.assertWritable(input)
+  }
+
+  /**
+   * 写结束：把账本裁决翻译成写许可要的两条状态（`dirtyOwned` / `taint`）。
+   * 没有裁决（账本被关掉、settle 失败）时按"不可判"处理 —— **不许**当成自己写的。
+   */
+  function finishPolicyWrite(fileKey, verdict, after) {
+    try {
+      return writePolicy.endWrite(fileKey, { verdict, after })
+    } catch (err) {
+      log('warn', `write-policy endWrite failed: ${err?.message ?? err}`)
       return null
     }
   }
@@ -1543,6 +1632,18 @@ export function createCapabilities(host, opts = {}) {
     // 这一段与下面的 applyEditText 之间没有别的 await：窗口缩到一次同步调用。
     const writeTarget = revalidateWriteTarget({ abs, real }, host.workspaceRoots(), { method })
 
+    // ── ⑥a 写许可（A2 / T62）：**同文件队列内**的第一道 ──
+    // 位置说明（改之前先想清楚，见 4.7「门的位置」）：
+    //  · 在**同文件队列内**（`serializeByPath` 的回调里）—— 同一文件的两笔请求不并发判；
+    //  · 在绑定门与路径重验**之后**：本门是**额外**一层，绝不在既有判定之前抢先放行；
+    //  · 在写宿主**之前**：拒绝路径上宿主调用数为 0（有用例守着）。
+    // 第二道在 `edit-transaction.js` 的**同步区间**（构造 builder 时，见下面的 `verify`），
+    // 那里从判定到落笔之间没有 await，窗口最小。
+    const policyKey = serializeKeyFor(real)
+    assertWriteAllowed(policyInput({
+      method, abs, fileKey: policyKey, state, params, phase: 'queue',
+    }))
+
     // ── ⑥b 变更账本（A1 / T61）：开一条记录 ──
     // 位置在绑定门与路径重验**之后**、写宿主**之前**：只有"真的要写了"才值得记一条
     // （前面任何一道门失败都属于"宿主零写入"，不该在账本里留下一条写入证据）。
@@ -1574,17 +1675,51 @@ export function createCapabilities(host, opts = {}) {
     // 第 6 个参数是 A1 的**观察回调**（不是参数、不是权限）：事务在同步区间里用它交
     // before 快照。宿主不认识它时就当没传 —— 老宿主/测试替身不受影响。
     let outcome
+    // 写窗口开始（A2）：窗口内观察到的变更**可能**是自己引起的，交给账本判归属；
+    // 窗口外观察到的变更没有在飞的本端写入却能改文档 → 来源不明 → 冻结该文件。
+    writePolicy.beginWrite(policyKey, { method })
     try {
       outcome = await host.applyEditText(
         writeTarget, apiRange, text, expectedVersion, expectedIncarnation,
-        ledgerRecord ? { observe: (sample) => changeLedger.construct(ledgerRecord, sample) } : undefined,
+        {
+          // 观察回调（A1，不是参数、不是权限）：事务在同步区间里用它交 before 快照。
+          ...(ledgerRecord
+            ? { observe: (sample) => changeLedger.construct(ledgerRecord, sample) }
+            : {}),
+          // 写许可的**第二道**（A2 / T62）：事务在构造 builder 的**同步区间**里、真正
+          // `apply(builder)` 之前调它。抛错就必须**一个字符都不写**（宿主实现负责这一点，
+          // `edit-transaction.js` 保证 verify 在 `apply` 之前）。
+          //
+          // ★ 这里用的是区间内**刚读到**的 version/incarnation（不是排队时那份）；
+          //   而 `isDirty` 只能沿用排队时的实测值 —— 同步区间里**不许** await，
+          //   拿不到新鲜的 isDirty。这不是疏漏：脏内容的判定本来由账本在同期记录
+          //   `dirtyBefore`，本道门补的是"版本/实例/冻结原因"在最后这段窗口里有没有变。
+          verify: (sample) => {
+            assertWriteAllowed(policyInput({
+              method,
+              abs,
+              fileKey: policyKey,
+              state: {
+                version: sample?.version,
+                incarnation: sample?.incarnation ?? null,
+                // 沿用实测脏态（见上）；脏态由账本 `dirtyBefore` 与冻结表独立守住。
+                isDirty: state.isDirty === true,
+              },
+              params,
+              phase: 'construct',
+            }))
+          },
+        },
       )
     } catch (err) {
       // 写入抛异常（冲突 / 编辑器拒绝 / 宿主抽风）：账本照样要结算，但结论是 unknown
       // —— "我发起过一笔写"不等于"这些变化是我造成的"，更不等于"什么都没发生"。
       // 超时单独记：它与其他失败的**证据状态不同**（可能已经落了点，也可能没落），
       // 混成 'error' 会让报告分不清"确定没写"与"不知道写没写"。
-      await settleChangeLedger(ledgerRecord, err?.code === ERR.TIMEOUT ? 'timeout' : 'error', real)
+      const failedVerdict = await settleChangeLedger(
+        ledgerRecord, err?.code === ERR.TIMEOUT ? 'timeout' : 'error', real,
+      )
+      finishPolicyWrite(policyKey, failedVerdict, failedVerdict?.after ?? null)
       throw err
     }
     // ── 写后复核（评审 R2-1 ③） ──
@@ -1602,7 +1737,8 @@ export function createCapabilities(host, opts = {}) {
       applied = outcome?.applied !== false
     } catch (err) {
       // 写后复核失败：这一笔可能已经落进缓冲区了，但回执是错误 ⇒ 账本只能 unknown。
-      await settleChangeLedger(ledgerRecord, 'error', real)
+      const reviewVerdict = await settleChangeLedger(ledgerRecord, 'error', real)
+      finishPolicyWrite(policyKey, reviewVerdict, reviewVerdict?.after ?? null)
       throw err
     }
 
@@ -1611,6 +1747,10 @@ export function createCapabilities(host, opts = {}) {
     const ledgerSummary = await settleChangeLedger(
       ledgerRecord, applied ? 'applied' : 'rejected', real,
     )
+    // 写许可（A2）：把归属裁决翻译成"这个文件的脏是不是我写的"。
+    // `bridge-correlated` / `self-only` → 记成自己写的（后续保存/继续改允许）；
+    // `mixed` → 冻结该文件；其余不可判 → 不许当成自己写的（脏则拒，下次由人处理）。
+    finishPolicyWrite(policyKey, ledgerSummary, ledgerSummary?.after ?? null)
     log(`applyEdit: ${abs} ${applied ? 'applied' : 'rejected by host'}`
       + ` ${range.start.line}:${range.start.column}-${range.end.line}:${range.end.column}`
       + ` (${text.length} chars, buffer only — not saved)`
@@ -1711,27 +1851,18 @@ export function createCapabilities(host, opts = {}) {
     assertVersionMatches(state.version, expectedVersion, canonicalPath(abs), method)
     assertIncarnationMatches(state.incarnation, expectedIncarnation, canonicalPath(abs), method)
 
-    // ── ⑤ 意图门（§6.2.2 的结论）──
-    // `isDirty` 是宿主给的**布尔汇总**，分不清"DSH 自己改的"与"人敲的"。所以：
-    // 脏 = 缓冲区里有本端不能证明来源的内容，默认**拒**；只有**授权方**在 grant 上
-    // 显式给了 `allowDirtySave: true` 才放行。★ 这个位**不许**从 `params` 读 ——
-    // 那样等于调用方自己给自己授权，这道门就等于不存在。
+    // ── ⑤ 写许可（A2 / T62）：**同文件队列内**的第一道 ──
+    // 取代旧版这里那道 `-32012 reason:'buffer-dirty'`：
+    //  · 旧版把"脏"混进 `-32012`（处置是"重读锚点重发"，而脏**重发多少次都还在**）；
+    //  · 旧版允许 `params.allowDirtySave` 放行 —— 调用方自己给自己授权。
+    // 现在：脏 → `-32011 document-dirty`，许可只从**授权表**回查（grant 级 `allowDirtySave`），
+    // 而且还要账本能证明"这份脏是我自己写的"（首版无逃逸口，见 4.7）。
+    // ★ `params.allowDirtySave` 在整条判定链上**没有任何读者**；传了也只当没看见。
     const dirtyBefore = state.isDirty === true
-    if (dirtyBefore && !grantAllowsDirtySave(grants, params?.grant)) {
-      throw new BridgeError(ERR.DOCUMENT_VERSION_CONFLICT,
-        'the buffer has unsaved changes that this request is not authorized to write to disk; '
-        + 'either save with a grant issued with allowDirtySave:true, or discard/re-read the '
-        + 'buffer first (nothing was saved)',
-        {
-          method,
-          file: canonicalPath(abs),
-          reason: 'buffer-dirty',
-          // 回显版本只用于"我基于哪一版"的对照；不把文本/差异放进来。
-          expectedVersion,
-          actualVersion: state.version,
-          allowDirtySave: false,
-        })
-    }
+    const policyKey = serializeKeyFor(real)
+    assertWriteAllowed(policyInput({
+      method, abs, fileKey: policyKey, state, params, phase: 'queue',
+    }))
 
     // ── ⑥ 磁盘锚点（§6.2.3）：真实 stat 比 {mtime, size}，不符即 -32013 ──
     // 放在 `save()` 之前是它能起作用的唯一位置 —— 之后就没有"拒绝"这个选项了。
@@ -1751,9 +1882,32 @@ export function createCapabilities(host, opts = {}) {
     // ── ⑧ 写前重验路径，并把**刚验过的那个字符串**交给宿主 ──
     const writeTarget = revalidateWriteTarget({ abs, real }, host.workspaceRoots(), { method })
 
+    // ── ⑧b 写许可的**最后一次本地复核**（A2 / T62）：紧贴 `saveDocument` ──
+    // `save()` 没有同步区间可挂（没有 builder），所以能做的只有把窗口缩到最小：
+    // 这里**重新读一次**文档状态，用刚读到的事实再判一遍。这不是强 CAS，也不承诺强 CAS
+    // （§6.2.6 的硬上限不变：复核之后仍有保存参与者/人工交错的窗口）。
+    // 两条用途：
+    //  ① 双锚点在这段窗口里动了 → 按原合同 `-32012`（**不许**用 -32011 顶替版本冲突）；
+    //  ② 文档实例换了 / 刚观察到别人的增量 → `-32011`（来源不明，不能重发）。
+    const freshState = await readDocumentState(host, real, { includeText: false }, method)
+    assertVersionMatches(freshState.version, expectedVersion, canonicalPath(abs), method)
+    assertIncarnationMatches(freshState.incarnation, expectedIncarnation, canonicalPath(abs), method)
+    assertWriteAllowed(policyInput({
+      method, abs, fileKey: policyKey, state: freshState, params, phase: 'pre-save',
+    }))
+
     // ── ⑨ 线性化点：`save()`。它没有 CAS，所以这里**不提供**"只写在锚定的那一版上"，
     //    只提供"走到这里之前，两边的锚点都还对得上"。──
-    const outcome = await host.saveDocument(writeTarget, { expectedVersion, expectedIncarnation })
+    writePolicy.beginWrite(policyKey, { method })
+    let outcome
+    try {
+      outcome = await host.saveDocument(writeTarget, { expectedVersion, expectedIncarnation })
+    } catch (err) {
+      // 保存抛异常：缓冲区可能已经清了、磁盘也可能已经换了 —— 一律按"不可判"收尾
+      // （不 taint：`save` 没有账本记录，判不出因果就不许凭空冻结）。
+      finishPolicyWrite(policyKey, null, null)
+      throw err
+    }
 
     // `save()` 的返回值只可能是布尔（`Thenable<boolean>`）。非布尔 = 适配器坏了 → -32009，
     // 不许把 `undefined` 当成"大概成功了吧"（§5.1「成功外形的错误结果」同一条禁令）。
@@ -1788,6 +1942,43 @@ export function createCapabilities(host, opts = {}) {
     assertTargetUnchanged(writeTarget, { method })
     assertWrittenDocumentIdentity(outcome, writeTarget, { method })
 
+    // ── ⑩b 保存后的**诚实观测**（A2 / T62）──
+    // 保存参与者（`editor.formatOnSave` / `trimTrailingWhitespace` / `onWillSaveTextDocument`）
+    // 可能在 `save()` 内部或紧随其后改缓冲区/磁盘。这些变化**本门拦不住**（无 CAS，§6.2.6），
+    // 所以**不许**事后补一个 `-32011` 声称"我阻止了它"—— 那时字已经落盘了。
+    // 能做的只有如实报告，并且**立即冻结该文件**（暂停后续写，保留原文件，不回滚）：
+    //  · 存完还是脏 ⇒ 缓冲区在保存窗口里又被改了 ⇒ 内容来源不可判；
+    //  · 冻结后这个文件的下一次写会拿到 `-32011 attribution-unknown`。
+    let dirtyAfter = false
+    let postSave = null
+    try {
+      const measured = await readDocumentState(host, real, { includeText: false }, method)
+      dirtyAfter = measured.isDirty === true
+      if (dirtyAfter) {
+        writePolicy.markForeign(policyKey, {
+          reason: WRITE_POLICY_REASONS.ATTRIBUTION_UNKNOWN,
+          version: measured.version,
+          incarnation: measured.incarnation,
+          note: 'still-dirty-after-save',
+        })
+        postSave = {
+          dirtyAfter: true,
+          reason: WRITE_POLICY_REASONS.ATTRIBUTION_UNKNOWN,
+          // 字节已经落盘了 —— 这里报的是"应用过、但结果里混了来源不明的内容"，
+          // **不是**"没应用"。M5 变异就是把这句说成零应用；用例守着这条。
+          mayHaveApplied: true,
+          retryable: false,
+          tainted: true,
+        }
+        log('warn', `save: ${abs} still dirty right after save → frozen (${WRITE_POLICY_REASONS.ATTRIBUTION_UNKNOWN})`)
+      }
+    } catch (err) {
+      // 观测不到就不许吹"零污染"：如实标 unknown，但不冻结（没有证据，不能凭空拒写）。
+      postSave = { dirtyAfter: false, observed: false, note: 'post-save-state-unavailable' }
+      log('warn', `save: post-save state unavailable on ${abs}: ${err?.message ?? err}`)
+    }
+    finishPolicyWrite(policyKey, null, null)
+
     // ── ⑪ 重新 stat：`disk` 必须是**保存后的真值**，不是回显 `expectedDisk` ──
     // 回显等于骗人：`formatOnSave` / 保存参与者改过字节、或保存根本没改变文件时，
     // 回显会让调用方以为"磁盘现在就是我给的那个锚点"。
@@ -1807,13 +1998,17 @@ export function createCapabilities(host, opts = {}) {
         })
     }
 
-    log(`save: ${abs} v${state.version}${dirtyBefore ? ' (dirty, allowDirtySave)' : ''} `
+    log(`save: ${abs} v${state.version}${dirtyBefore ? ' (dirty, grant-level allowDirtySave)' : ''} `
       + `disk ${expectedDisk.mtime}/${expectedDisk.size} -> ${disk.mtime}/${disk.size}`)
     return {
       saved: true,
       file: canonicalPath(abs),
       disk,
       dirtyBefore,
+      // ── A2 / T62：保存后的诚实观测（**只增不改**）──
+      // `saved` / `file` / `disk` / `dirtyBefore` 的语义一字未动。
+      dirtyAfter,
+      ...(postSave ? { postSave } : {}),
     }
   }
 
@@ -2008,25 +2203,18 @@ export function createCapabilities(host, opts = {}) {
     assertVersionMatches(state.version, expectedVersion, canonicalPath(abs), method)
     assertIncarnationMatches(state.incarnation, expectedIncarnation, canonicalPath(abs), method)
 
-    // ── 意图门（Tier 3 的 ⑪）：脏缓冲区默认拒 ──
+    // ── 写许可（A2 / T62）：**同文件队列内**的第一道 ──
     // 删除比 save 更严的地方：save 的出路是"把缓冲区写下去"，delete **没有**这个出路 ——
     // 脏缓冲区意味着"磁盘上那份不是人眼下的全部内容"，快照盖不住未保存的编辑。
-    // 仍然只由**授权方**在 grant 上给的 `allowDirtySave` 放行（不许从 `params` 读）。
+    // 所以本门对 delete 的处理是：**脏就拒**（`dirty-quarantine`），连 grant 许可见到它
+    // 也不放行 —— 归档首版要求干净基线（4.7 决策表第 2 行的例外，与 T40 的隔离语义无关）。
+    // 旧版这里用 `-32012 reason:'buffer-dirty'`：处置完全不对（重读锚点重发不会让缓冲区
+    // 变干净），而且把"脏"与"版本冲突"混成同一个码。现在归 `-32011`。
     const dirtyBefore = state.isDirty === true
-    if (dirtyBefore && !grantAllowsDirtySave(grants, params?.grant)) {
-      throw new BridgeError(ERR.DOCUMENT_VERSION_CONFLICT,
-        'the buffer has unsaved changes that are not on disk; the snapshot would not cover them, '
-        + 'so nothing was deleted — save/discard first, or delete with a grant issued with '
-        + 'allowDirtySave:true',
-        {
-          method,
-          file: canonicalPath(abs),
-          reason: 'buffer-dirty',
-          expectedVersion,
-          actualVersion: state.version,
-          allowDirtySave: false,
-        })
-    }
+    const policyKey = serializeKeyFor(real)
+    assertWriteAllowed(policyInput({
+      method, abs, fileKey: policyKey, state, params, phase: 'queue',
+    }))
 
     // ── 磁盘锚点（Tier 3 的 ⑫ 后半）：真实 stat 比 {mtime, size}，不符即 -32013 ──
     const diskBefore = await readDiskStatOf(host, real, method)
@@ -2082,6 +2270,21 @@ export function createCapabilities(host, opts = {}) {
 
     // ── 执行前复核 ②：确认框开着的时候授权可能已经死了（另一条 await）──
     grantGate(method, params, ctx)
+
+    // ── 执行前复核 ③（A2 / T62）：确认期间缓冲区可能被人写脏了 ──
+    // 确认框能开两分钟，`state` 是那之前读的。删除是**不可逆**动作（只搬不删也是搬），
+    // 所以这里重读一次，用此刻的事实再判一遍写许可 —— 脏/来源不明/观察缺口 → 什么都没搬。
+    // 这是"人工确认后、动手前"的最后一道，插在 `identityBefore` 之前所以它也是
+    // 最后一次可以做选择的机会。
+    const freshDeleteState = await readDocumentState(host, real, { includeText: false }, method)
+    assertWriteAllowed(policyInput({
+      method,
+      abs,
+      fileKey: policyKey,
+      state: freshDeleteState,
+      params,
+      phase: 'pre-archive',
+    }))
 
     // ── 对象身份（T44 / 评审 B1-a）：**紧贴归档之前**取一次 (dev, ino) ──
     // 为什么不是"再算一次 hash"：hash 只说明"这两个名字下的字节相同"，而 B1 的两条实证
@@ -2366,6 +2569,8 @@ export function createCapabilities(host, opts = {}) {
   // `deps.dispatch?.eventBroker` 取。这是唯一既能不动禁区文件、又保持
   // "登记簿只有一本"的通道 —— 另建一个 broker 等于两份判据，迟早漂移。
   dispatch.eventBroker = eventBroker
+  // A2（T62）：写许可的只读诊断面（不参与判定，只给测试/运维看"为什么被拒"）。
+  dispatch.writePolicy = writePolicy
 
-  return { dispatch, handlers, CAPABILITIES, eventBroker }
+  return { dispatch, handlers, CAPABILITIES, eventBroker, writePolicy }
 }

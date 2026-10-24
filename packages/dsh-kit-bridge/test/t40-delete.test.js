@@ -45,6 +45,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, normalize } from 'node:path'
 
 import { ERR } from '../../dsh-vscode-kit/src/protocol.js'
+import { pathIdentityKey } from '../../dsh-vscode-kit/src/paths.js'
 import { GrantStore } from '../../dsh-vscode-kit/src/grant.js'
 import { validateResponse } from '../../dsh-vscode-kit/src/response-contract.js'
 import {
@@ -121,6 +122,10 @@ function makeHost(roots, {
     fileExists: (p) => { try { return existsSync(p) && statSync(p).isFile() } catch { return false } },
     resolvePath: (p) => (isAbsolute(p) ? normalize(p) : join(roots[0], p)),
     workspaceRoots: () => roots.slice(),
+    // A2（T62）：本桥接**没有同源变更观察器就不许写**（observation-gap）。这些用假宿主
+    // 的用例关心的是别的东西（编辑语义 / 锚点 / 删除），所以给一个"什么都不发生"的真实
+    // 观察器：宿主确实实现了这个口，只是这个假宿主永远不报变更。
+    observeTextChanges: () => ({ dispose() {} }),
     isTrusted: () => trusted,
     openTextDocument: async () => {},
     openExternalFile: async () => {},
@@ -680,32 +685,50 @@ test('★ T44 D3b 最后一次预验之后、rename 之前顶名（**同字节�
   } finally { ws.dispose() }
 })
 
-test('T40 意图门：脏缓冲区且 grant 无 allowDirtySave → -32012 reason:buffer-dirty，文件仍在', async () => {
+test('T62 意图门：脏缓冲区（来源不明）→ -32011 dirty-quarantine，文件仍在、连确认框都不弹', async () => {
   const ws = tempWorkspace()
   try {
     const { host, caps, link, file } = grantedEnv({ root: ws.root, isDirty: true })
     const err = await expectCode(
       caps.dispatch('vscode.deleteFile', deleteParams(file, host, { allowDirtySave: true }), { link }),
-      ERR.DOCUMENT_VERSION_CONFLICT,
+      ERR.DOCUMENT_DIRTY,
       '脏缓冲区',
     )
-    assert.equal(err.data?.reason, 'buffer-dirty')
-    // params 里的同名位不算授权（与 T39 同一条结论，删除更不容许自己给自己授权）。
-    assert.equal(err.data?.allowDirtySave, false)
+    // ★ 语义变更（v1→v2）：脏缓冲的拒绝从 `-32012 reason:buffer-dirty` 改成 `-32011`。
+    //   `-32012` 的处置是"重读锚点重发"，而这里重发一万次结论都一样。
+    assert.equal(err.data?.reason, 'dirty-quarantine')
+    assert.equal(err.data?.method, 'vscode.deleteFile')
+    assert.equal(err.data?.retryable, false)
+    assert.equal(err.data?.mayHaveApplied, false)
+    assert.equal(err.data?.recovery, 'human-rebase')
+    // params 里的同名位不算授权：v2 之后这个参数**不存在**，连诊断字段都不再回显。
+    assert.equal(err.data?.allowDirtySave, undefined)
     assertHostUntouched(host, '脏缓冲区')
     assert.equal(readFileSync(file, 'utf8'), FIXTURE_TEXT)
   } finally { ws.dispose() }
 })
 
-test('T40 意图门：grant 带 allowDirtySave 时脏缓冲区可以归档（记录上是授权方给的）', async () => {
+test('T62 意图门：grant 授权了脏缓冲、脏**还是自己写的** → 归档仍然拒（首版要求干净基线）', async () => {
   const ws = tempWorkspace()
   try {
     const { host, caps, link, file } = grantedEnv({ root: ws.root, isDirty: true, allowDirtySave: true })
-    const res = await caps.dispatch('vscode.deleteFile', deleteParams(file, host), { link })
-    assert.equal(res.quarantined, true)
-    assert.equal(existsSync(file), false, '原名字没了，但字节在隔离体里')
-    assert.equal(readFileSync(res.to, 'utf8'), FIXTURE_TEXT)
-    assert.equal(host.calls.delete, 0)
+    // 造出"脏是桥接自己写的"证据（与 t39 ③ 同一条路）。
+    const key = pathIdentityKey(file)
+    caps.writePolicy.beginWrite(key, { method: 'vscode.applyEdit' })
+    caps.writePolicy.endWrite(key, {
+      verdict: { attribution: 'bridge-correlated', after: { version: host.state.version, incarnation: host.state.incarnation, dirty: true } },
+    })
+    const err = await expectCode(
+      caps.dispatch('vscode.deleteFile', deleteParams(file, host), { link }),
+      ERR.DOCUMENT_DIRTY,
+      '脏 + 授权 + 自己写的',
+    )
+    // 4.7 决策表第 2 行：`deleteFile` 比写/保存**更紧** —— 归档要求干净基线。
+    // 理由不是洁癖：隔离体是"这份字节的未来证据"，而脏缓冲区里根本没有那份字节
+    // （它在编辑器里，没落盘），拿脏缓冲区去归档等于拿旧盘内容冒充"原件"。
+    assert.equal(err.data?.reason, 'dirty-quarantine')
+    assertHostUntouched(host, '脏 + 授权 + 自己写的')
+    assert.equal(readFileSync(file, 'utf8'), FIXTURE_TEXT, '原件一个字节都没动')
   } finally { ws.dispose() }
 })
 

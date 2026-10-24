@@ -61,6 +61,9 @@ const api = {
   workspace: {
     isTrusted: true,
     workspaceFolders: [{ uri: { fsPath: root } }],
+    // A2（T62）：真宿主用 `onDidChangeTextDocument` 当同源变更观察器；缺了它能力层会判
+    // 「没有证据源」而统一拒写（observation-gap），那会把本文件要验的原语问题盖掉。
+    onDidChangeTextDocument: () => ({ dispose() {} }),
     openTextDocument: async () => api.__doc,
     fs: {
       createDirectory: async (uri) => { safe(uri.fsPath); fs.mkdirSync(uri.fsPath, { recursive: true }) },

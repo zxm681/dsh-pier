@@ -177,10 +177,10 @@ function assertIncompatible(err, { peer, peerType, reason, method, side = 'dsh' 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. 常量：形状必须是区间（契约 §4.1 ①：写成单值就是实现错）
 // ─────────────────────────────────────────────────────────────────────────────
-test('SUPPORTED_PROTOCOL 是冻结的 [min,max] 区间，今天等于 [1,1]', () => {
+test('SUPPORTED_PROTOCOL 是冻结的 [min,max] 区间，今天等于 [2,2]（A2 整版升 v2）', () => {
   assert.ok(Array.isArray(SUPPORTED_PROTOCOL), '必须是数组形式的区间，不是单值')
   assert.equal(SUPPORTED_PROTOCOL.length, 2)
-  assert.deepEqual([...SUPPORTED_PROTOCOL], [1, 1])
+  assert.deepEqual([...SUPPORTED_PROTOCOL], [2, 2])
   assert.deepEqual([...SUPPORTED_PROTOCOL], [PROTOCOL_VERSION, PROTOCOL_VERSION])
   assert.ok(Object.isFrozen(SUPPORTED_PROTOCOL), '区间是契约常量，不许被运行时改写')
 })
@@ -198,9 +198,9 @@ test('§5 失败表：-32008 的名字是 protocol-incompatible，且没有复�
 // ─────────────────────────────────────────────────────────────────────────────
 test('判定表：整数且在区间内才放行，越界/缺失/非整数/非数字一律不兼容', () => {
   const cases = [
-    [1, 'ok', true, true],
+    [2, 'ok', true, true],
     [0, 'out-of-range', false, false],
-    [2, 'out-of-range', false, false],
+    [3, 'out-of-range', false, false],
     [-1, 'out-of-range', false, false],
     [undefined, 'missing', false, false],
     [null, 'missing', false, false],
@@ -248,11 +248,11 @@ test('判定结果里 peer/peerType 能区分「没有这个字段」与「值�
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. DSH 侧权威门：放行路径
 // ─────────────────────────────────────────────────────────────────────────────
-test('ptv=1 合法 → 放行，请求真的到达对端', async () => {
+test('ptv=2 合法 → 放行，请求真的到达对端', async () => {
   const { svc, connectEditor, cleanup } = await withKit()
   try {
     const editor = await connectEditor()
-    await hello(editor, 1)
+    await hello(editor, PROTOCOL_VERSION)
     const res = await svc.request('vscode.getSelection', {})
     assert.deepEqual(res, FAKE_SELECTION)
     assert.deepEqual(editor.received, ['vscode.getSelection'], '门放行后业务请求应到达对端')
@@ -264,18 +264,18 @@ test('ptv=1 合法 → 放行，请求真的到达对端', async () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. DSH 侧权威门：拒绝路径（三种：越界 / 缺失 / 类型非法）
 // ─────────────────────────────────────────────────────────────────────────────
-test('整数越界（2）→ -32008，且一条业务请求都没发出对端', async () => {
+test('整数越界（3）→ -32008，且一条业务请求都没发出对端', async () => {
   const { svc, kit, connectEditor, cleanup } = await withKit()
   try {
     const editor = await connectEditor()
-    await hello(editor, 2) // 未来版本：hello 本身仍可应答（协议层不受门约束）
-    assert.equal(kit.lastEditor.protocolVersion, 2)
+    await hello(editor, 3) // 未来版本：hello 本身仍可应答（协议层不受门约束）
+    assert.equal(kit.lastEditor.protocolVersion, 3)
     assert.equal(kit.lastEditor.protocolCompatible, false)
 
     await assert.rejects(
       svc.request('vscode.getSelection', {}),
       (e) => { assertIncompatible(e, {
-        peer: 2, peerType: 'number', reason: 'out-of-range', method: 'vscode.getSelection',
+        peer: 3, peerType: 'number', reason: 'out-of-range', method: 'vscode.getSelection',
       }); return true },
     )
     assert.deepEqual(editor.received, [],
@@ -368,7 +368,7 @@ test('还没收到 hello 就发请求 → 等一小段后按「未知版本」�
         assert.equal(e.code, ERR.PROTOCOL_INCOMPATIBLE)
         assert.equal(e.data.reason, 'missing')
         assert.equal(e.data.helloReceived, false, '诊断上要能看出「压根没收到 hello」')
-        assert.deepEqual(e.data.required, { min: 1, max: 1 })
+        assert.deepEqual(e.data.required, { min: 2, max: 2 })
         return true
       },
     )
@@ -383,7 +383,7 @@ test('新连接不给旧连接的版本背书：换了对端就要重新报版�
   const { svc, connectEditor, cleanup } = await withKit({ helloWaitMs: 40 })
   try {
     const first = await connectEditor()
-    await hello(first, 1)
+    await hello(first, PROTOCOL_VERSION)
     assert.deepEqual(await svc.request('vscode.getSelection', {}), FAKE_SELECTION)
 
     // 第二台编辑器连上并准入（活跃目标按连接序号换成它），但还没报 hello
@@ -397,7 +397,7 @@ test('新连接不给旧连接的版本背书：换了对端就要重新报版�
     assert.deepEqual(first.received, ['vscode.getSelection'], '旧对端只收到过它当活跃目标时的那一条')
 
     // 新对端报了 v1 → 放行
-    await hello(second, 1)
+    await hello(second, PROTOCOL_VERSION)
     assert.deepEqual(await svc.request('vscode.getSelection', {}), FAKE_SELECTION)
     assert.deepEqual(second.received, ['vscode.getSelection'])
   } finally {
@@ -412,7 +412,7 @@ test('版本不兼容时 bridge.* 协议方法仍可通（只拦业务能力，�
   const { svc, connectEditor, cleanup } = await withKit()
   try {
     const editor = await connectEditor()
-    await hello(editor, 2)
+    await hello(editor, 3)
     assert.deepEqual(await svc.request('bridge.ping', { x: 1 }), { done: 'bridge.ping' })
     await assert.rejects(
       svc.request('vscode.openFile', { path: 'x' }),
@@ -430,17 +430,17 @@ test('snapshot() 暴露兼容区间与对端判定结果（诊断可读）', asy
   try {
     const editor = await connectEditor()
     const before = kit.snapshot()
-    assert.deepEqual(before.supportedProtocol, [1, 1])
+    assert.deepEqual(before.supportedProtocol, [2, 2])
     assert.equal(before.protocolVersion, PROTOCOL_VERSION)
     assert.equal(before.protocolCompatible, false, '还没 hello 时不得自认兼容')
 
-    await hello(editor, 2)
+    await hello(editor, 3)
     const after = kit.snapshot()
     assert.equal(after.protocolCompatible, false)
-    assert.equal(after.lastEditor.protocolVersion, 2)
+    assert.equal(after.lastEditor.protocolVersion, 3)
     assert.equal(after.lastEditor.protocolReason, 'out-of-range')
 
-    await hello(editor, 1)
+    await hello(editor, PROTOCOL_VERSION)
     assert.equal(kit.snapshot().protocolCompatible, true)
   } finally {
     await cleanup()
@@ -459,7 +459,7 @@ test('★ F1 回归①：双窗口，目标从兼容的 A 切到不兼容的 B �
   try {
     // 窗口 A：v1，目标明确、业务正常
     const a = await connectEditor()
-    await hello(a, 1, ['vscode.getSelection'], 'window-A')
+    await hello(a, PROTOCOL_VERSION, ['vscode.getSelection'], 'window-A')
     assert.deepEqual(await svc.request('vscode.getSelection', {}), FAKE_SELECTION)
     assert.equal(businessCount(a), 1, 'A 是当时的目标：应收到 1 条业务帧')
 
@@ -480,13 +480,13 @@ test('★ F1 回归①：双窗口，目标从兼容的 A 切到不兼容的 B �
     assert.equal(businessCount(b), 0, 'B 报版本前不得收到业务帧（旧实现这里是 1）')
     assert.equal(businessCount(a), 1, 'A 一条都不许多收')
 
-    // B 明确自称 v2：拒绝理由必须是 B 的版本，不是 A 的。
-    await hello(b, 2, ['vscode.getSelection'], 'window-B')
+    // B 明确自称一个越界版本：拒绝理由必须是 B 的版本，不是 A 的。
+    await hello(b, 3, ['vscode.getSelection'], 'window-B')
     await assert.rejects(
       svc.request('vscode.getSelection', {}),
       (e) => {
         assertIncompatible(e, {
-          peer: 2, peerType: 'number', reason: 'out-of-range', method: 'vscode.getSelection',
+          peer: 3, peerType: 'number', reason: 'out-of-range', method: 'vscode.getSelection',
         })
         return true
       },
@@ -504,11 +504,11 @@ test('★ F1 回归①：双窗口，目标从兼容的 A 切到不兼容的 B �
 test('★ F1 回归②：目标窗口关掉后回退到另一条不兼容连接 → 仍然拒，业务帧增量 0', async () => {
   const { svc, kit, connectEditor, cleanup } = await withKit({ helloWaitMs: 40 })
   try {
-    // B 先连、自称 v2（不兼容）；A 后连、自称 v1（兼容）→ 目标按序号是 A
+    // B 先连、自称越界版本（不兼容）；A 后连、自称兼容版本 → 目标按序号是 A
     const b = await connectEditor()
-    await hello(b, 2, ['vscode.getSelection'], 'window-B')
+    await hello(b, 3, ['vscode.getSelection'], 'window-B')
     const a = await connectEditor()
-    await hello(a, 1, ['vscode.getSelection'], 'window-A')
+    await hello(a, PROTOCOL_VERSION, ['vscode.getSelection'], 'window-A')
     assert.deepEqual(await svc.request('vscode.getSelection', {}), FAKE_SELECTION)
     assert.equal(businessCount(a), 1)
     assert.equal(businessCount(b), 0, 'B 从头到尾没收到业务帧')
@@ -521,13 +521,13 @@ test('★ F1 回归②：目标窗口关掉后回退到另一条不兼容连接 
       svc.request('vscode.getSelection', {}),
       (e) => {
         assertIncompatible(e, {
-          peer: 2, peerType: 'number', reason: 'out-of-range', method: 'vscode.getSelection',
+          peer: 3, peerType: 'number', reason: 'out-of-range', method: 'vscode.getSelection',
         })
         return true
       },
     )
     assert.equal(businessCount(b), 0,
-      'B 业务帧增量必须是 0 —— 旧实现会沿用已关窗口 A 的 v1 背书把包发给 B（评审探针 D：增量 1）')
+      'B 业务帧增量必须是 0 —— 旧实现会沿用已关窗口 A 的版本背书把包发给 B（评审探针 D：增量 1）')
     assert.equal(kit.snapshot().lastEditor.client, 'window-B', 'snapshot 必须跟着目标走，不许停在已关窗口')
     assert.equal(kit.snapshot().protocolCompatible, false)
     assert.equal(kit.snapshot().protocolReason, 'out-of-range')
@@ -543,13 +543,13 @@ test('★ F2 回归：不兼容时 notify() 发业务方法同样 -32008，对�
   const { svc, connectEditor, cleanup } = await withKit()
   try {
     const editor = await connectEditor()
-    await hello(editor, 2) // 不兼容
+    await hello(editor, 3) // 不兼容
     // 同步 throw ⇒ notify 仍是单向语义（没被改成「等回执的 request」）
     assert.throws(
       () => svc.notify('vscode.getSelection', {}),
       (e) => {
         assertIncompatible(e, {
-          peer: 2, peerType: 'number', reason: 'out-of-range', method: 'vscode.getSelection',
+          peer: 3, peerType: 'number', reason: 'out-of-range', method: 'vscode.getSelection',
         })
         return true
       },
@@ -566,7 +566,7 @@ test('★ F2 回归：不兼容时 bridge.* 通知仍放行（协商通道不被
   const { svc, connectEditor, cleanup } = await withKit()
   try {
     const editor = await connectEditor()
-    await hello(editor, 2)
+    await hello(editor, 3)
     assert.equal(svc.notify('bridge.ping', { n: 1 }), undefined, 'notify 不返回 Promise')
     await waitFor(() => editor.notifications.some((m) => m.method === 'bridge.ping'),
       { label: 'bridge.ping 到达对端' })
@@ -580,7 +580,7 @@ test('★ F2：兼容时 notify() 业务方法照常发出，且能力预检同�
   const { svc, connectEditor, cleanup } = await withKit()
   try {
     const editor = await connectEditor()
-    await hello(editor, 1, ['vscode.getSelection'])
+    await hello(editor, PROTOCOL_VERSION, ['vscode.getSelection'])
     assert.equal(svc.notify('vscode.getSelection', { probe: true }), undefined)
     await waitFor(() => editor.notifications.some((m) => m.method === 'vscode.getSelection'),
       { label: '业务通知到达对端' })
@@ -618,7 +618,7 @@ test('★ N1 回归①：不兼容连接在 broadcast 时零业务帧，且零�
   const { server, connectEditor, cleanup } = await withKit()
   try {
     const editor = await connectEditor()
-    await hello(editor, 2) // 越界 → 不兼容
+    await hello(editor, 3) // 越界 → 不兼容
     assert.equal(server.trusted.size, 1, '前置：这条连接已准入')
 
     assert.throws(
@@ -626,7 +626,7 @@ test('★ N1 回归①：不兼容连接在 broadcast 时零业务帧，且零�
       (e) => {
         // 形状对齐契约 §4.1 ③；单个候选时回显它的判定
         assertIncompatible(e, {
-          peer: 2, peerType: 'number', reason: 'out-of-range', method: 'vscode.selectionChanged',
+          peer: 3, peerType: 'number', reason: 'out-of-range', method: 'vscode.selectionChanged',
         })
         assert.equal(e.data.delivered, 0)
         return true
@@ -738,7 +738,7 @@ test('★ N1：bridge.* 广播继续豁免版本门（协商通道不被自己�
   const { server, connectEditor, cleanup } = await withKit()
   try {
     const editor = await connectEditor()
-    await hello(editor, 2) // 不兼容
+    await hello(editor, 3) // 不兼容
     const delivered = server.broadcast('bridge.hello', { client: 'dsh-vscode-kit' })
     assert.equal(delivered, 1, '协议层方法不受版本门约束，照常投递并返回计数')
     await waitFor(

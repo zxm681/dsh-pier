@@ -27,6 +27,7 @@ import { tmpdir } from 'node:os'
 import { isAbsolute, join, normalize } from 'node:path'
 
 import { ERR } from '../../dsh-vscode-kit/src/protocol.js'
+import { pathIdentityKey } from '../../dsh-vscode-kit/src/paths.js'
 import { GrantStore } from '../../dsh-vscode-kit/src/grant.js'
 import { validateResponse } from '../../dsh-vscode-kit/src/response-contract.js'
 import { CAPABILITIES, createCapabilities } from '../src/capabilities.js'
@@ -78,6 +79,10 @@ function makeHost(roots, {
     fileExists: (p) => { try { return existsSync(p) && statSync(p).isFile() } catch { return false } },
     resolvePath: (p) => (isAbsolute(p) ? normalize(p) : join(roots[0], p)),
     workspaceRoots: () => roots.slice(),
+    // A2（T62）：本桥接**没有同源变更观察器就不许写**（observation-gap）。这些用假宿主
+    // 的用例关心的是别的东西（编辑语义 / 锚点 / 删除），所以给一个"什么都不发生"的真实
+    // 观察器：宿主确实实现了这个口，只是这个假宿主永远不报变更。
+    observeTextChanges: () => ({ dispose() {} }),
     isTrusted: () => trusted,
     openTextDocument: async () => {},
     openExternalFile: async () => {},
@@ -202,29 +207,37 @@ test('★ T39 ① 磁盘锚点不符 → -32013，宿主零次 saveDocument（�
   }
 })
 
-test('★ T39 ② 缓冲区脏且 grant 无 allowDirtySave → -32012 reason:buffer-dirty（params 里的位不算授权）', async () => {
+test('★ T62 ② 缓冲区脏且 grant 无 dirty 授权 → -32011 dirty-quarantine（params 里的位不算授权）', async () => {
   const ws = tempWorkspace()
   try {
     const { host, caps, link, file } = grantedEnv({ root: ws.root, isDirty: true })
     const params = saveParams(file, host, {
-      // 调用方自己往 params 里塞（§6.2.2 的结论：这样等于自己给自己授权）。
+      // ★ v2：这个参数**已经不存在**。调用方塞进来只是为了让下面证明"它一点用都没有"。
       allowDirtySave: true,
     })
     const err = await expectCode(
       caps.dispatch('vscode.save', params, { link }),
-      ERR.DOCUMENT_VERSION_CONFLICT,
-      '脏缓冲区 + grant 无位',
+      ERR.DOCUMENT_DIRTY,
+      '脏缓冲区 + grant 无 dirty 授权',
     )
-    assert.equal(err.data?.reason, 'buffer-dirty', '复用 -32012，reason 区分意图门')
-    assert.equal(err.data?.allowDirtySave, false, '诊断字段说明"没被授权"')
-    assert.equal(host.calls.save, 0, '意图门拒绝时不得落盘')
+    // ★ 语义变更（v1→v2，报告里逐条列出）：脏缓冲的拒绝从 `-32012 reason:buffer-dirty`
+    //   改成本码。`-32012` 的处置是"重读锚点重发"，而"缓冲里有别人的字"重发多少次都还在。
+    assert.equal(err.data?.reason, 'dirty-quarantine')
+    assert.equal(err.data?.method, 'vscode.save')
+    assert.equal(err.data?.isDirty, true)
+    assert.equal(err.data?.retryable, false, '这不是可以自动重试的失败')
+    assert.equal(err.data?.mayHaveApplied, false, '还没碰宿主')
+    assert.equal(err.data?.recovery, 'human-rebase')
+    // 旧参数**不生效**：既不放行，也不再出现在诊断字段里（不是"忽略但记一笔许可"）。
+    assert.equal(err.data?.allowDirtySave, undefined, 'v2 不再有这个名字')
+    assert.equal(host.calls.save, 0, '门拒绝时不得落盘')
     assert.equal(readFileSync(file, 'utf8'), 'hello world\nsecond line\n')
   } finally {
     ws.dispose()
   }
 })
 
-test('★ T39 ③ grant 带 allowDirtySave → 脏缓冲区能保存，返回的 disk 是保存后重新 stat 的真值', async () => {
+test('★ T62 ③ 脏的**是自己写的**（bridge-correlated）+ grant 授权 → 能保存；disk 是保存后重新 stat 的真值', async () => {
   const ws = tempWorkspace()
   try {
     // 保存时磁盘被写新（mtime +1234、size 变大）—— 回显 expectedDisk 的实现必红。
@@ -238,17 +251,48 @@ test('★ T39 ③ grant 带 allowDirtySave → 脏缓冲区能保存，返回的
         state.isDirty = false
       },
     })
+    // 造出"这份脏是桥接自己写的"证据：走生产同一条路（写入窗口 + 归属结论）。
+    // A1 的账本会在真实 `vscode.applyEdit` 之后给出 `bridge-correlated`，
+    // 这里直接把同一条结论交给同一扇门 —— 门本身没有第二条入口。
+    const key = pathIdentityKey(file)
+    caps.writePolicy.beginWrite(key, { method: 'vscode.applyEdit' })
+    caps.writePolicy.endWrite(key, {
+      verdict: { attribution: 'bridge-correlated', after: { version: host.state.version, incarnation: host.state.incarnation, dirty: true } },
+    })
     const before = host.disk.get(file)
     const res = await caps.dispatch('vscode.save', saveParams(file, host), { link })
 
     assert.equal(res.saved, true)
     assert.equal(res.file, file)
-    assert.equal(res.dirtyBefore, true, '保存前缓冲区是脏的（正是 allowDirtySave 放行的情形）')
+    assert.equal(res.dirtyBefore, true, '保存前缓冲区是脏的（这正是"自己写的脏"那条许可）')
     assert.deepEqual(res.disk, AFTER, '★ disk 必须是保存后重新 stat 的真值，不是回显 expectedDisk')
     assert.notDeepEqual(res.disk, before, '假宿主在保存时改了磁盘，回显参数会回到 before')
+    assert.equal(res.dirtyAfter, false, '保存后缓冲区干净')
     assert.equal(host.calls.save, 1)
     // 返回体同时要过 kit 侧的响应校验（同一份形状，两侧各判一次）。
     assert.doesNotThrow(() => validateResponse('vscode.save', res))
+  } finally {
+    ws.dispose()
+  }
+})
+
+test('★ T62 ③b 脏的**不是自己写的**（哪怕 grant 授权了）→ 仍然 -32011，一个字节都不落盘', async () => {
+  const ws = tempWorkspace()
+  try {
+    const { host, caps, link, file } = grantedEnv({
+      root: ws.root, isDirty: true, allowDirtySave: true,
+    })
+    const err = await expectCode(
+      caps.dispatch('vscode.save', saveParams(file, host), { link }),
+      ERR.DOCUMENT_DIRTY,
+      '脏且归属不明',
+    )
+    // 授权表里那条 allowDirtySave 只回答"允许在脏缓冲上写吗"，回答不了
+    // "这份脏是谁写的"。后者没有证据 ⇒ 失败闭合（首版无逃逸口）。
+    assert.equal(err.data?.reason, 'attribution-unknown')
+    assert.equal(err.data?.attribution, 'unknown')
+    assert.equal(host.calls.save, 0)
+    assert.equal(readFileSync(file, 'utf8'), 'hello world\nsecond line\n')
   } finally {
     ws.dispose()
   }
@@ -454,6 +498,52 @@ test('干净缓冲区不需要 allowDirtySave：dirtyBefore:false 正常保存',
     assert.equal(res.dirtyBefore, false)
     assert.deepEqual(res.disk, { mtime: 1_700_000_000_999, size: 100 })
     assert.doesNotThrow(() => validateResponse('vscode.save', res))
+  } finally {
+    ws.dispose()
+  }
+})
+
+test('★ T62 ④ 保存后缓冲**仍是脏的**（formatOnSave 之类）→ 回执如实说 mayHaveApplied:true，并且立刻冻结该文件', async () => {
+  const ws = tempWorkspace()
+  try {
+    const AFTER = { mtime: 1_700_000_000_321, size: 777 }
+    // 保存参与者把磁盘写新了，缓冲区**没被清干净**（真机上 formatOnSave 之后
+    // 仍 isDirty:true 是见过的形态）。此时字已经落盘 —— 本门拦不住，只能如实报。
+    const { host, caps, link, file } = grantedEnv({
+      root: ws.root,
+      isDirty: true,
+      allowDirtySave: true,
+      onSave: ({ disk }) => { disk.set(file, AFTER) },
+    })
+    const key = pathIdentityKey(file)
+    caps.writePolicy.beginWrite(key, { method: 'vscode.applyEdit' })
+    caps.writePolicy.endWrite(key, {
+      verdict: {
+        attribution: 'bridge-correlated',
+        after: { version: host.state.version, incarnation: host.state.incarnation, dirty: true },
+      },
+    })
+
+    const res = await caps.dispatch('vscode.save', saveParams(file, host), { link })
+    assert.equal(res.saved, true, '写确实发生了，不许谎报失败')
+    assert.equal(res.dirtyAfter, true, '★ 保存后缓冲还是脏的，回执必须说出来')
+    assert.equal(res.postSave?.reason, 'attribution-unknown')
+    assert.equal(res.postSave?.mayHaveApplied, true,
+      '★ 已经落盘了 —— 报"零应用"就是撒谎（变异 M5 把这句改成 false，本条必红）')
+    assert.equal(res.postSave?.retryable, false, '内容来源不明时重试没有意义')
+    assert.equal(host.calls.save, 1)
+    assert.doesNotThrow(() => validateResponse('vscode.save', res))
+
+    // 冻结真的生效：这个文件的下一次写被拒（同一份 grant、同一份参数都不行），
+    // 而且拒绝发生在宿主之前 —— 已经落过一次盘的文件不能继续被写。
+    const err = await expectCode(
+      caps.dispatch('vscode.save', saveParams(file, host), { link }),
+      ERR.DOCUMENT_DIRTY,
+      '保存后仍脏 → 冻结',
+    )
+    assert.equal(err.data?.reason, 'attribution-unknown')
+    assert.equal(err.data?.isDirty, true)
+    assert.equal(host.calls.save, 1, '★ 第二次保存压根没碰宿主')
   } finally {
     ws.dispose()
   }

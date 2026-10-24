@@ -134,6 +134,9 @@ export async function applyEditAtomically({
   editor, file, expectedVersion, expectedIncarnation, readIncarnation, apply, log,
   // A1（T61）：变更账本的 before 基准回调 —— 在同步区间里、构造 edit 之前调用一次。
   observe,
+  // A2（T62）：写许可的**第二道**判定。在同一个同步区间里、`observe`/`apply` **之前**调用；
+  // 它抛异常 ⇒ 零写入并把该错误原样抛给调用方（`observe` 抛异常则不影响写入）。
+  verify,
   method = TRANSACTION_METHOD,
 }) {
   const doc = editor?.document
@@ -168,6 +171,14 @@ export async function applyEditAtomically({
   let conflict = null
   /** edit 是否被构造过。**零构造**是"宿主零写入"的唯一判据（测试按它断言）。 */
   let constructed = false
+  /**
+   * A2（T62）：同步区间里最后一道写许可判定抛出的错误。
+   *
+   * 为什么先存后抛：`editor.edit(cb)` 里抛出的异常会被 VS Code **吞掉**（`edit()`
+   * 只回 `false`），那就把"来源不明"退化成了一次静默的"编辑器拒绝"。所以 cb 里只记录、
+   * 一个字都不写，出区间再抛 —— 这样调用方拿到的仍是 `-32011`（而不是 -32603）。
+   */
+  let verifyError = null
 
   const applied = await editor.edit((builder) => {
     // ───────────────────────────────────────────────────────────────────────
@@ -195,6 +206,30 @@ export async function applyEditAtomically({
       if (observedIncarnation !== expectedIncarnation) {
         conflict = { kind: 'incarnation', expected: expectedIncarnation, actual: observedIncarnation }
         return // ← 不构造任何 edit
+      }
+    }
+    // ── A2（T62）第二道写许可：**就在构造 builder 之前**，用区间内刚读到的事实判 ──
+    //
+    // 为什么必须在这一行：从能力层的排队判定到这里之间有若干 await（打开文档、读形状、
+    // 绑门前复核…），人、格式化器、另一个窗口都可能刚好插进来。这一段是从"判定"到
+    // "落笔"之间**唯一没有 await 的区间**，所以它是能给出的最小窗口。
+    //
+    // 与 `observe` 的区别（别混）：`observe` 是**证据**（抛异常绝不影响写入），
+    // 本回调是**闸**（抛异常必须零写入）。两者都不能省：证据解释"发生了什么"，
+    // 闸决定"能不能发生"。
+    if (typeof verify === 'function') {
+      try {
+        verify({
+          version: actual,
+          incarnation: observedIncarnation,
+          documentPath: typeof editor.document?.uri?.fsPath === 'string'
+            ? editor.document.uri.fsPath
+            : null,
+        })
+      } catch (err) {
+        // 一个字都还没写：记录错误、不构造 edit，出区间再抛（见 verifyError 的说明）。
+        verifyError = err
+        return
       }
     }
     constructed = true
@@ -229,6 +264,13 @@ export async function applyEditAtomically({
     // 同步区间结束
     // ───────────────────────────────────────────────────────────────────────
   })
+
+  if (verifyError) {
+    // 写许可在同步区间里判不过：零写入，**原样**把 -32011 抛出去（别包装成 -32603）。
+    log?.(`applyEdit transaction: ${file} write-policy refused inside the transaction `
+      + `(${verifyError?.code ?? 'no-code'}) — no edit constructed`)
+    throw verifyError
+  }
 
   if (conflict?.kind === 'incarnation') {
     // 文档实例换了（关闭重开 / 撤销到初始态后版本数字复用）：一个字都没写。

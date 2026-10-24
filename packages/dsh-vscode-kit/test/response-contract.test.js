@@ -19,7 +19,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { VscodeKit, apply } from '../src/index.js'
-import { BridgeError, ERR, ERR_NAME, connect, createLineSplitter } from '../src/protocol.js'
+import { BridgeError, ERR, ERR_NAME, PROTOCOL_VERSION, connect, createLineSplitter } from '../src/protocol.js'
 import {
   MIN_RESPONSE_EXPECTED, REGISTERED_METHODS, validateResponse,
 } from '../src/response-contract.js'
@@ -493,7 +493,7 @@ function kitWith(resultOrError) {
   const link = {
     connSeq: 1,
     socket: { destroyed: false },
-    editor: { client: 'fake', extensionVersion: '0.1.0', protocolVersion: 1, capabilities: Object.keys(VALID) },
+    editor: { client: 'fake', extensionVersion: '0.1.0', protocolVersion: PROTOCOL_VERSION, capabilities: Object.keys(VALID) },
     async request() {
       if (resultOrError instanceof Error) throw resultOrError
       return resultOrError
@@ -605,7 +605,7 @@ test('真 socket：对端回一条「既无 result 也无 error」的响应帧 �
 
   try {
     await link.request('bridge.hello', {
-      client: 'fake', extensionVersion: '0.1.0', protocolVersion: 1, capabilities: ['vscode.getSelection'],
+      client: 'fake', extensionVersion: '0.1.0', protocolVersion: PROTOCOL_VERSION, capabilities: ['vscode.getSelection'],
     })
     await assert.rejects(
       svc.request('vscode.getSelection', {}, { waitForEditor: false }),

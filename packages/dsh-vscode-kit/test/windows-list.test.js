@@ -16,7 +16,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
-import { ERR } from '../src/protocol.js'
+import { ERR, PROTOCOL_VERSION } from '../src/protocol.js'
 import { windowsFilePath } from '../src/windows.js'
 import { waitFor, windowBlock, withKit } from './windows-harness.js'
 
@@ -137,7 +137,7 @@ test('★ W1 A9：老扩展不上报身份 → windowId=tmp-<connSeq>、stable:f
     assert.equal(row.label, 'unnamed · tmp-1')
     // 老扩展也是扩展：它的版本仍然要在表里看得见。
     assert.equal(row.extensionVersion, '0.3.1')
-    assert.equal(row.protocolVersion, '1')
+    assert.equal(row.protocolVersion, String(PROTOCOL_VERSION), '表里报的是对端实际声明值（v2）')
 
     // 老扩展的降级号也能被 target 命中（§6：target 仍可用）。
     const sel = await kit.svc.request('vscode.getSelection', {}, { target: 'tmp-1' })

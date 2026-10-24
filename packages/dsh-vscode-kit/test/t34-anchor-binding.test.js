@@ -29,7 +29,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply, PEER_FEATURE_DOCUMENT_INCARNATION } from '../src/index.js'
-import { ERR } from '../src/protocol.js'
+import { ERR, PROTOCOL_VERSION } from '../src/protocol.js'
 import { connect, createLineSplitter } from '../src/protocol.js'
 
 /**
@@ -127,7 +127,7 @@ async function windowClient(server, { label, docVersion, docIncarnation, feature
   await link.request('bridge.hello', {
     client: `win-${label}`,
     extensionVersion: '0.3.0',
-    protocolVersion: 1,
+    protocolVersion: PROTOCOL_VERSION,
     capabilities: ['vscode.applyEdit', 'vscode.getDocumentState', 'vscode.getSelection'],
     ...(features === undefined ? {} : { features }),
   })

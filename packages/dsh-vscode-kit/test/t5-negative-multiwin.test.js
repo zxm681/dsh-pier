@@ -31,7 +31,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply } from '../src/index.js'
-import { BridgeError, ERR, connect, createLineSplitter } from '../src/protocol.js'
+import { BridgeError, ERR, PROTOCOL_VERSION, connect, createLineSplitter } from '../src/protocol.js'
 
 /**
  * 测试消费者身份（T38 白名单落地后，**写类调用必须来自已绑定身份的入口**）。
@@ -157,7 +157,7 @@ async function windowClient(server, { label, docVersion, docIncarnation }) {
     seen,
     count(method) { return seen.filter((m) => m.method === method).length },
     last(method) { return seen.filter((m) => m.method === method).at(-1) },
-    hello(ptv = 1, capabilities = ['vscode.applyEdit', 'vscode.getDocumentState', 'vscode.getSelection']) {
+    hello(ptv = PROTOCOL_VERSION, capabilities = ['vscode.applyEdit', 'vscode.getDocumentState', 'vscode.getSelection']) {
       return link.request('bridge.hello', {
         client: `win-${label}`, extensionVersion: '0.3.0', protocolVersion: ptv, capabilities,
       })

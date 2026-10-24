@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply, name, inject, VscodeKit, replayPendingAuthorized } from '../src/index.js'
-import { ERR, connect, createLineSplitter } from '../src/protocol.js'
+import { ERR, PROTOCOL_VERSION, connect, createLineSplitter } from '../src/protocol.js'
 import { discoveryDir, listLiveBridges } from '../src/server.js'
 
 /**
@@ -157,13 +157,13 @@ test('端到端：apply → 服务注册 → 假编辑器连上 → 消费者 vs
   // 1) 编辑器收到 hello（协议 §3.4：每连接第一条消息）
   const hello = await editor.next()
   assert.equal(hello.method, 'bridge.hello')
-  assert.equal(hello.params.protocolVersion, 1)
+  assert.equal(hello.params.protocolVersion, PROTOCOL_VERSION, 'DSH 发出的 hello 带的就是协议库的版本常量')
 
   // 1b) 编辑器回报身份**必须带 protocolVersion**（契约 §4.1：版本门只认 hello 里的 ptv，
   //     缺它就等于「未知版本」→ 业务能力一律 -32008，见 test/compat-gate.test.js）。
   await editor.link.request('bridge.hello', {
     client: 'fake-editor', extensionVersion: '0.1.0',
-    protocolVersion: 1, capabilities: ['vscode.getSelection'],
+    protocolVersion: PROTOCOL_VERSION, capabilities: ['vscode.getSelection'],
   })
 
   // 2) 编辑器 → DSH 方向：bridge.ping 由 handleInbound 应答
@@ -274,7 +274,7 @@ async function withKit(editorTexts) {
  * 一律 -32008。所以凡是要发 `vscode.*` 的用例都得先 announce。
  * 刻意不放进 withKit —— 报身份会顺带完成准入，会打乱「准入顺序」类用例的前置条件。
  */
-async function announce(editor, { ptv = 1, capabilities = ['vscode.getSelection'] } = {}) {
+async function announce(editor, { ptv = PROTOCOL_VERSION, capabilities = ['vscode.getSelection'] } = {}) {
   const params = { client: 'fake-editor', extensionVersion: '0.1.0', capabilities }
   if (ptv !== undefined) params.protocolVersion = ptv
   return editor.link.request('bridge.hello', params)
@@ -425,7 +425,7 @@ test('安全回归：真编辑器准入后抢位失败（active 位只认 token 
   assert.equal([...handle.kit.server.links][0].authorized, true, 'token 通过即准入')
   // 报身份带协议版本：否则兼容门按「未知版本」拒绝，这条用例要验的是抢位不是版本门。
   await editor.link.request('bridge.hello', {
-    client: 'real-editor', extensionVersion: '0.1.0', protocolVersion: 1, capabilities: [],
+    client: 'real-editor', extensionVersion: '0.1.0', protocolVersion: PROTOCOL_VERSION, capabilities: [],
   })
 
   // 2) 攻击者随后裸连 —— 它是「最后连上的」，但没准入

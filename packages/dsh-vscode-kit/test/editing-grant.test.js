@@ -161,7 +161,7 @@ async function fakeEditor(server, { onRequest } = {}) {
 }
 
 /** 让假编辑器报身份（协议版本 + 能力清单）。 */
-async function announce(editor, { ptv = 1, capabilities = ['vscode.applyEdit', 'vscode.getSelection'] } = {}) {
+async function announce(editor, { ptv = PROTOCOL_VERSION, capabilities = ['vscode.applyEdit', 'vscode.getSelection'] } = {}) {
   const params = { client: 'fake-editor', extensionVersion: '0.1.0', capabilities }
   if (ptv !== undefined) params.protocolVersion = ptv
   return editor.link.request('bridge.hello', params)
@@ -236,11 +236,13 @@ function writeParams(extra = {}) {
 // 1) 错误码只加不改
 // ─────────────────────────────────────────────────────────────────────────────
 
-test('协议：-32010 只加码，不改既有码语义、不动 PROTOCOL_VERSION', () => {
+test('协议：-32010 只加码，不改既有码语义（T62 之后整版在 v2）', () => {
   assert.equal(ERR.EDIT_NOT_BOUND, -32010)
   assert.equal(ERR_NAME[-32010], 'edit-not-bound')
   assert.equal(typeof ERR_NAME[-32010], 'string')
-  assert.equal(PROTOCOL_VERSION, 1, '加码不许改协议版本（旧端不该被这条新门影响）')
+  // ★ T62：加码本身不改版本，但 A2 改的不止是码——脏缓冲的拒绝码从 -32012 换成了 -32011，
+  //   处置也从「重读重发」变成「别重发」，所以整版升 v2。
+  assert.equal(PROTOCOL_VERSION, 2, 'v2：-32011 与 -32012 的应对方式相反，不能不升版')
   // 既有码不动（这些数字一旦漂移，扩展侧与本侧的判定就全错位）
   assert.equal(ERR.PROTOCOL_INCOMPATIBLE, -32008)
   assert.equal(ERR.INVALID_RESPONSE, -32009)

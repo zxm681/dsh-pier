@@ -91,6 +91,10 @@ function makeHost(root, abs, { lines, version = 1 } = {}) {
     fileExists: (p) => p === abs,
     resolvePath: (p) => p,
     workspaceRoots: () => [root],
+    // A2（T62）：本桥接**没有同源变更观察器就不许写**（observation-gap）。这些用假宿主
+    // 的用例关心的是别的东西（编辑语义 / 锚点 / 删除），所以给一个"什么都不发生"的真实
+    // 观察器：宿主确实实现了这个口，只是这个假宿主永远不报变更。
+    observeTextChanges: () => ({ dispose() {} }),
     isTrusted: () => true,
     openTextDocument: async () => {},
     openExternalFile: async () => {},
@@ -253,16 +257,26 @@ test('★ T5 Q2b 脏缓冲区+外部改写：版本不变、旧锚点放行；�
     assert.equal(state.isDirty, true)
     assert.match(e.host.buffer(), /USER-EDIT/, '缓冲区保留用户改动，没被磁盘内容替换')
 
-    // 旧锚点（=2）写入：门按"缓冲区版本"判，相等 → 放行。
-    const result = await write(e, {
-      range: { start: { line: 2, column: 1 }, end: { line: 2, column: 5 } },
-      text: 'DSH-STALE',
-      expectedVersion: 2,
-      grant: { id: ID, epoch: EPOCH },
-    })
-    assert.equal(result.applied, true)
-    assert.equal(result.saved, false, 'DSH 从不保存（capabilities 里没有 save）')
-    assert.match(e.host.buffer(), /DSH-STALE/, '写入落在缓冲区')
+    // 旧锚点（=2）写入：**版本相等也不放行**。缓冲区里有用户没保存的字，DSH 拿不出
+    // 它的归属证据；在它上面继续写等于拿旧镜像覆盖人工修改 —— 那正是 A2 要闭的洞。
+    const callsBefore = e.host.calls?.length ?? 0
+    let err = null
+    try {
+      await write(e, {
+        range: { start: { line: 2, column: 1 }, end: { line: 2, column: 5 } },
+        text: 'DSH-STALE',
+        expectedVersion: 2,
+        grant: { id: ID, epoch: EPOCH },
+      })
+    } catch (x) { err = x }
+    assert.equal(err?.code, ERR.DOCUMENT_DIRTY, '脏且来源不明 ⇒ -32011（不是 -32012）')
+    assert.equal(err?.data?.reason, 'dirty-quarantine')
+    assert.equal(err?.data?.isDirty, true)
+    assert.equal(err?.data?.version, 2, '回执说清"我基于哪一版"，但版本相等不是放行理由')
+    assert.equal(err?.data?.mayHaveApplied, false, '还没碰宿主')
+    assert.equal(e.host.calls?.length ?? 0, callsBefore, '宿主零调用')
+    assert.match(e.host.buffer(), /USER-EDIT/, '缓冲区原样不动')
+    assert.doesNotMatch(e.host.buffer(), /DSH-STALE/, '一个字符都没写进去')
     assert.equal(e.host.disk(), 'alpha one\nbeta two\nEXTERNAL-B\ngamma three\n',
       '磁盘上的外部改动必须一个字节都没被动过 —— DSH 没有写磁盘的路径')
   } finally {

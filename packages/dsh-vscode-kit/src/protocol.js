@@ -1,5 +1,5 @@
 /**
- * DSH Editor Bridge Protocol v1 —— 传输无关的协议核心。
+ * DSH Editor Bridge Protocol v2 —— 传输无关的协议核心。
  *
  * 设计原则（阶段4 架构草图 §3）：
  *  1. 零依赖：只用 Node 内置模块，绝 import @deepseek-ai/*（ERR_MODULE_NOT_FOUND 前科）。
@@ -51,6 +51,31 @@ export const ERR = Object.freeze({
    * 不许拿 -32001（未授权）/ -32005（能力缺失）/ -32007（未连接）/ -32008（版本不兼容）代替。
    */
   EDIT_NOT_BOUND: -32010,
+  /**
+   * 文档**来源不明**（A2 / T62：逐文件失败闭合的写许可；协议 v2 新增码位）。
+   *
+   * 说的是"这个文件里现在有本端**证明不出来源**的内容，所以不许写"——不是"你的锚点过期了"
+   * （那是 `-32012`），也不是"磁盘上那份变了"（那是 `-32013`）。三者处置完全不同：
+   *
+   *  - `-32012`：重读双锚点 → **可以**用新版本重发；
+   *  - `-32013`：磁盘冲突 → **永不**自动重试（那盘字节不是本端写的）；
+   *  - `-32011`：来源不明 → **停在这个文件上**，不得自动重发（重读锚点不消除它）。
+   *
+   * `data = { method, file, reason, isDirty, attribution, version, incarnation,
+   *           retryable:false, recovery:'human-rebase' }`，`reason` 五选一：
+   *  - `foreign-change`：观察到**不是本 grant 写入**引起的文档变更（人 / 别的扩展 / 别的窗口）；
+   *  - `mixed-origin`：本端写入窗口里混进了别人的增量（账本判 `mixed`）；
+   *  - `attribution-unknown`：缓冲区有脏内容，但本端证不出那是自己写的（含**实例已换**：
+   *    上一份证据对应的文档实例已经不在，默认 unknown）；
+   *  - `observation-gap`：没有同源变更观察器 / 账本被关掉 —— 看不见别人不等于没有别人；
+   *  - `dirty-quarantine`：脏缓冲区在没有 grant 级许可时要求写盘或归档
+   *    （grant 缺 `allowDirtySave`，或归档本身要求干净基线）。
+   *
+   * ★ **不许复用 `-32012`**：`-32012` 的处置是"重读锚点、重发"，本码的处置是"别重发"
+   * —— 共用一个码等于让消费者把"来源不明"当成"锚点过期"来自动重试，那正是 A2 要挡的事。
+   * 也不许用 `-32013`：磁盘冲突说的是**盘上**那份字节，本码说的是**缓冲区/观察链**里的来源。
+   */
+  DOCUMENT_DIRTY: -32011,
   /**
    * 文档版本锚点冲突（T30：`vscode.applyEdit` 的前置条件）。**新增**码位，不动既有码语义。
    *
@@ -121,24 +146,39 @@ export const ERR_NAME = Object.freeze({
   [ERR.PROTOCOL_INCOMPATIBLE]: 'protocol-incompatible',
   [ERR.INVALID_RESPONSE]: 'invalid-response',
   [ERR.EDIT_NOT_BOUND]: 'edit-not-bound',
+  [ERR.DOCUMENT_DIRTY]: 'document-dirty',
   [ERR.DOCUMENT_VERSION_CONFLICT]: 'document-version-conflict',
   [ERR.DISK_STATE_CONFLICT]: 'disk-state-conflict',
   [ERR.WINDOW_TARGET_FAILED]: 'window-target-failed',
 })
 
 /**
- * 协议版本（本端声明值）。
+ * 协议版本（本端声明值）。**v2**（T62 / A2）。
  *
  * 注意：这个常量只是「我这边是第几版」，**不是判据**。能不能和对端通话只看
  * 对端 hello 携带的 `protocolVersion` 是否落在 `SUPPORTED_PROTOCOL` 区间内（契约 §4.1 ①）。
+ *
+ * v1 → v2 到底改了什么（为什么这必须是一次**版本升级**，而不是"加一个错误码"）：
+ *  - 新增 `-32011 document-dirty`：脏缓冲区的写许可从"调用方传个 `params.allowDirtySave`
+ *    就能过"改成"grant 级显式许可"，**同一份调用在 v1/v2 下会得到不同结果**；
+ *  - `vscode.save` / `vscode.deleteFile` 上"脏缓冲区"的拒绝码从 `-32012` 改为 `-32011`
+ *    （`-32012` 的处置是自动重读重发，而脏缓冲区**不能**自动重发）；
+ *  - 旧参数 `params.allowDirtySave` 在 v2 下**不再有任何效力**。
+ *  这三条都是**语义变更**，不是可选扩展：v1 对端依约传 `allowDirtySave:true` 却能保存，
+ * 接上 v2 之后会被明确拒绝——所以只能升版本 + 混配一律 `-32008`，不许拿 `[1, 2]` 装兼容。
  */
-export const PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 2
 
 /**
  * 协议兼容区间 `[min, max]`（契约 §4.1 ①：形状必须是**区间**，不是单值）。
  *
- * 今天等于 `[1, 1]`——只认 v1。值由 `PROTOCOL_VERSION` 派生，避免「版本号升了、
+ * 今天等于 `[2, 2]`——**只认 v2**。值由 `PROTOCOL_VERSION` 派生，避免「版本号升了、
  * 区间忘了改」这种静默不兼容；真要放宽到同时兼容多版，必须在这里显式写区间。
+ *
+ * ★ 明确**不写** `[1, 2]`：v1 ↔ v2 的差异落在**写许可**上（见 `PROTOCOL_VERSION` 的说明），
+ * 说"兼容"等于让 v1 对端以为传 `allowDirtySave:true` 还算数。混配只能拒（`-32008`），
+ * 且拒绝点在 hello 协商：hello 本身仍可被读到（对端能拿到明确的 incompat 诊断，
+ * 而不是连接被静默掐断）。
  */
 export const SUPPORTED_PROTOCOL = Object.freeze([PROTOCOL_VERSION, PROTOCOL_VERSION])
 

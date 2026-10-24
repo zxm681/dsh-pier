@@ -62,7 +62,7 @@ function recordHello(onRequest) {
           seenAt: Date.now(),
         }
       }
-      return { ok: true, protocolVersion: 1 }
+      return { ok: true, protocolVersion: PROTOCOL_VERSION }
     }
     return onRequest?.(method, params, msgCtx)
   }
@@ -165,7 +165,7 @@ test('启动后写发现文件，字段齐全且 0600', async () => {
     assert.equal(info.pid, process.pid)
     assert.equal(info.dshVersion, '0.2.1-rc.2')
     assert.deepEqual(info.capabilities, ['vscode'])
-    assert.equal(info.protocolVersion, 1)
+    assert.equal(info.protocolVersion, PROTOCOL_VERSION)
     assert.ok(info.startedAt > 0)
     if (process.platform !== 'win32') {
       const { statSync } = await import('node:fs')
@@ -180,7 +180,7 @@ test('连接后立刻收到 bridge.hello，带协议版本与能力', async () =
     const hello = await c.next()
     assert.equal(hello.method, 'bridge.hello')
     assert.equal(hello.params.client, 'dsh-vscode-kit')
-    assert.equal(hello.params.protocolVersion, 1)
+    assert.equal(hello.params.protocolVersion, PROTOCOL_VERSION)
     assert.equal(hello.params.dshVersion, '9.9.9')
     assert.deepEqual(hello.params.capabilities, ['vscode.openFile'])
     await c.close()
@@ -299,7 +299,7 @@ test('★ 回归 N1：版本事实缺失的连接不收广播，零兼容时抛 
       () => server.broadcast('vscode.selectionChanged', { text: 'secret' }),
       (e) => {
         assert.equal(e.code, ERR.PROTOCOL_INCOMPATIBLE, `应为 -32008，实际 ${e.code}`)
-        assert.deepEqual(e.data.required, { min: 1, max: 1 }, 'data.required 是兼容区间')
+        assert.deepEqual(e.data.required, { min: 2, max: 2 }, 'data.required 是兼容区间')
         assert.equal(e.data.peer, null, '版本缺失时 peer 归一为 null')
         assert.equal(e.data.reason, 'missing', '判定表：缺失 ≠ v1')
         assert.equal(e.data.method, 'vscode.selectionChanged')

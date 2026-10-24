@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { PROTOCOL_VERSION } from '../../dsh-vscode-kit/src/protocol.js'
 import { startBridgeServer } from '../../dsh-vscode-kit/src/server.js'
 import { createCapabilities } from '../src/capabilities.js'
 import { createConnector, CLIENT_ID, EXTENSION_VERSION } from '../src/connector.js'
@@ -31,6 +32,10 @@ function fakeHost() {
     fileExists: () => true,
     resolvePath: (p) => (p.startsWith('/') ? p : `/ws/${p}`),
     workspaceRoots: () => ['/ws'],
+    // A2（T62）：本桥接**没有同源变更观察器就不许写**（observation-gap）。这些用假宿主
+    // 的用例关心的是别的东西（编辑语义 / 锚点 / 删除），所以给一个"什么都不发生"的真实
+    // 观察器：宿主确实实现了这个口，只是这个假宿主永远不报变更。
+    observeTextChanges: () => ({ dispose() {} }),
     isTrusted: () => true,
     openTextDocument: async () => {},
     openExternalFile: async () => {},
@@ -53,7 +58,7 @@ async function startServer(home) {
     onRequest: (method, params) => {
       requests.push({ method, params })
       if (method === 'bridge.ping') return { pong: true }
-      if (method === 'bridge.hello') return { ok: true, protocolVersion: 1 }
+      if (method === 'bridge.hello') return { ok: true, protocolVersion: PROTOCOL_VERSION }
       throw new Error(`unexpected ${method}`)
     },
   })
@@ -96,7 +101,7 @@ test('★ W3 ①：hello 带 window 块，字段原样透传（扩展侧不加�
     // 既有字段一个字都没变 —— W3 只加一块，不改协议。
     assert.equal(hello.params.client, CLIENT_ID)
     assert.equal(hello.params.extensionVersion, EXTENSION_VERSION)
-    assert.equal(hello.params.protocolVersion, 1)
+    assert.equal(hello.params.protocolVersion, PROTOCOL_VERSION)
     assert.ok(Array.isArray(hello.params.capabilities))
     assert.equal(conn.connected, true)
   } finally {

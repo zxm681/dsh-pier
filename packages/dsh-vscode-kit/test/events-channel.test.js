@@ -19,7 +19,7 @@ function terminal(extra = {}) {
   })
   function hello(patch = {}) {
     link.handleMessage({ jsonrpc: '2.0', method: 'bridge.hello', token: TOKEN,
-      params: { protocolVersion: 1, eventChannel: EVENT_CHANNEL_HELLO, ...patch } })
+      params: { protocolVersion: PROTOCOL_VERSION, eventChannel: EVENT_CHANNEL_HELLO, ...patch } })
   }
   hello()
   return { link, frames, delivered, states, requests, hello, allow: (v) => { allowed = v } }
@@ -37,9 +37,9 @@ function receiver(extra) {
   return t
 }
 
-test('E1 shared schema and limits; runtime remains v1', () => {
-  assert.equal(PROTOCOL_VERSION, 1)
-  assert.deepEqual(SUPPORTED_PROTOCOL, [1, 1])
+test('E1 shared schema and limits; runtime is v2 (A2)', () => {
+  assert.equal(PROTOCOL_VERSION, 2, 'A2 升到 v2：脏态门的语义变更跟着整版走')
+  assert.deepEqual(SUPPORTED_PROTOCOL, [2, 2])
   assert.deepEqual([SELECTION_COALESCE_MS, EVENT_QUEUE_MAX_COUNT, EVENT_QUEUE_MAX_BYTES, EVENT_MAX_BYTES],
     [50, 256, 1048576, 262144])
   assert.deepEqual(Object.keys(EVENT_ENVELOPE_FIELDS),
@@ -53,7 +53,7 @@ test('E1 default disabled preserves ordinary notifications and hello has no chan
   assert.equal(t.link.events.ready, false)
   assert.equal(t.link.events.openStream('sub'), null)
   assert.equal(t.link.events.acceptStream({ subscriptionId: 's', streamEpoch: 'e', startSeq: 1 }), false)
-  t.link.notify('bridge.hello', { protocolVersion: 1 })
+  t.link.notify('bridge.hello', { protocolVersion: PROTOCOL_VERSION })
   assert.equal(t.frames.at(-1).token, undefined)
   t.link.notify('ordinary.notification', { a: 1 })
   assert.equal(t.frames.at(-1).method, 'ordinary.notification')
@@ -62,7 +62,7 @@ test('E1 default disabled preserves ordinary notifications and hello has no chan
 
 test('E1 negotiation requires both channel version and compatible protocol, never infers missing v1', () => {
   for (const patch of [{ eventChannel: undefined }, { eventChannel: { version: 2 } },
-    { protocolVersion: 2 }, { protocolVersion: undefined }, { protocolVersion: '1' }]) {
+    { protocolVersion: 3 }, { protocolVersion: undefined }, { protocolVersion: '1' }]) {
     const t = terminal()
     t.hello(patch)
     assert.equal(t.link.events.ready, false)

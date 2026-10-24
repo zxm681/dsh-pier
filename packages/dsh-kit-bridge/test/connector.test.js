@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { startBridgeServer } from '../../dsh-vscode-kit/src/server.js'
-import { ERR } from '../../dsh-vscode-kit/src/protocol.js'
+import { ERR, PROTOCOL_VERSION } from '../../dsh-vscode-kit/src/protocol.js'
 import { createCapabilities, CAPABILITIES } from '../src/capabilities.js'
 import { createConnector, CLIENT_ID, EXTENSION_VERSION } from '../src/connector.js'
 
@@ -29,6 +29,10 @@ function fakeHost() {
     fileExists: () => true,
     resolvePath: (p) => (p.startsWith('/') ? p : `/ws/${p}`),
     workspaceRoots: () => ['/ws'],
+    // A2（T62）：本桥接**没有同源变更观察器就不许写**（observation-gap）。这些用假宿主
+    // 的用例关心的是别的东西（编辑语义 / 锚点 / 删除），所以给一个"什么都不发生"的真实
+    // 观察器：宿主确实实现了这个口，只是这个假宿主永远不报变更。
+    observeTextChanges: () => ({ dispose() {} }),
     isTrusted: () => true,
     openTextDocument: async (p, o) => { calls.push(['openTextDocument', p, o]) },
     openExternalFile: async (p) => { calls.push(['openExternalFile', p]) },
@@ -52,7 +56,7 @@ async function startServer(home, { onRequestExtra } = {}) {
       requests.push({ method, params })
       if (onRequestExtra) return onRequestExtra(method, params)
       if (method === 'bridge.ping') return { pong: true }
-      if (method === 'bridge.hello') return { ok: true, protocolVersion: 1 }
+      if (method === 'bridge.hello') return { ok: true, protocolVersion: PROTOCOL_VERSION }
       throw new Error(`unexpected ${method}`)
     },
   })

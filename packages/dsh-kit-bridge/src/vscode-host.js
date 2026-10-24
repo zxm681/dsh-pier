@@ -315,6 +315,9 @@ export function createHost(output) {
       // A1（T61）：账本的 before 基准回调，事务在**同步区间**里调它一次。
       // 能力层（capabilities.js）不 import vscode，所以只透传一个普通回调。
       ...(typeof observation?.observe === 'function' ? { observe: observation.observe } : {}),
+      // A2（T62）：写许可的**第二道**判定（同步区间内、构造 builder 之前）。
+      // 与 `observe` 分开传：前者是证据（抛异常不影响写入），这个是闸（抛异常 = 零写入）。
+      ...(typeof observation?.verify === 'function' ? { verify: observation.verify } : {}),
       // 与 `readDocumentState` **同一个** `incarnationOf`：读侧报的 id 与写侧判的 id
       // 同源，否则"我读到的化身"和"你比对的化身"会是两套。
       readIncarnation: (doc) => incarnationOf(doc),

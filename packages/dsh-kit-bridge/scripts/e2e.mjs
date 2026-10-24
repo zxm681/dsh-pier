@@ -15,6 +15,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+// 协议版本只有一个来源（`PROTOCOL_VERSION`）；E2E 断言发现文件里写的就是它。
+import { PROTOCOL_VERSION } from '../../dsh-vscode-kit/src/protocol.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pkgRoot = dirname(here)
@@ -117,6 +119,10 @@ const host = {
   fileExists: () => true,
   resolvePath: (p) => (p.startsWith('/') ? p : j(WS, p)),
   workspaceRoots: () => [WS],
+  // A2（T62）：本桥接**没有同源变更观察器就不许写**（observation-gap）。这些用假宿主
+  // 的用例关心的是别的东西（编辑语义 / 锚点 / 删除），所以给一个"什么都不发生"的真实
+  // 观察器：宿主确实实现了这个口，只是这个假宿主永远不报变更。
+  observeTextChanges: () => ({ dispose() {} }),
   isTrusted: () => true,
   openTextDocument: async (p, o) => console.log('OPENED ' + JSON.stringify({ path: p, ...o })),
   openExternalFile: async (p) => console.log('EXTERNAL ' + p),
@@ -209,7 +215,7 @@ try {
   // 4) 发现文件确实是 0600 且字段齐全
   const [file] = (await import('node:fs')).readdirSync(join(home, 'dsh-vscode-kit'))
   const info = JSON.parse(readFileSync(join(home, 'dsh-vscode-kit', file), 'utf8'))
-  check('发现文件字段齐全', !!(info.port && info.token && info.pid && info.protocolVersion === 1),
+  check('发现文件字段齐全', !!(info.port && info.token && info.pid && info.protocolVersion === PROTOCOL_VERSION),
     `port=${info.port} proto=${info.protocolVersion}`)
   check('token 是 64 位 hex', /^[0-9a-f]{64}$/.test(info.token))
 

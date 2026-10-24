@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { ERR, createLineSplitter } from '../../dsh-vscode-kit/src/protocol.js'
+import { ERR, PROTOCOL_VERSION, createLineSplitter } from '../../dsh-vscode-kit/src/protocol.js'
 import { discoveryDir, writeDiscoveryFile } from '../../dsh-vscode-kit/src/discovery.js'
 import { createCapabilities } from '../src/capabilities.js'
 import { createConnector } from '../src/connector.js'
@@ -32,6 +32,10 @@ function fakeHost() {
     fileExists: () => true,
     resolvePath: (p) => (p.startsWith('/') ? p : `/ws/${p}`),
     workspaceRoots: () => ['/ws'],
+    // A2（T62）：本桥接**没有同源变更观察器就不许写**（observation-gap）。这些用假宿主
+    // 的用例关心的是别的东西（编辑语义 / 锚点 / 删除），所以给一个"什么都不发生"的真实
+    // 观察器：宿主确实实现了这个口，只是这个假宿主永远不报变更。
+    observeTextChanges: () => ({ dispose() {} }),
     isTrusted: () => true,
     openTextDocument: async (p, o) => { calls.push(['openTextDocument', p, o]) },
     openExternalFile: async (p) => { calls.push(['openExternalFile', p]) },
@@ -48,7 +52,7 @@ function fakeHost() {
  *
  * `methods` 记下它**实际收到**的每个方法名 —— 业务方法有没有漏过来就看它。
  */
-async function fakeDsh({ token = 'x'.repeat(64), ptv = 1, includePtv = true, helloDelayMs = 0 } = {}) {
+async function fakeDsh({ token = 'x'.repeat(64), ptv = PROTOCOL_VERSION, includePtv = true, helloDelayMs = 0 } = {}) {
   const methods = []
   const responses = []
   let connections = 0
@@ -140,12 +144,12 @@ async function setup(opts = {}) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. 兼容：对端声明 v1 → 一切照旧
 // ─────────────────────────────────────────────────────────────────────────────
-test('对端 hello 声明 ptv=1 → 判定兼容，业务能力正常执行', async () => {
-  const { conn, dsh, host, cleanup } = await setup({ ptv: 1 })
+test('对端 hello 声明 ptv=2 → 判定兼容，业务能力正常执行', async () => {
+  const { conn, dsh, host, cleanup } = await setup({ ptv: PROTOCOL_VERSION })
   try {
     await waitFor(() => conn.peer.status === 'compatible', { label: 'compatible' })
     assert.equal(conn.connected, true, '兼容时仍是可用状态')
-    assert.equal(conn.peer.protocolVersion, 1)
+    assert.equal(conn.peer.protocolVersion, PROTOCOL_VERSION)
     assert.equal(conn.state.state, 'ready')
 
     // 出站：协议层方法（自证通道可用）
@@ -167,8 +171,8 @@ test('对端 hello 声明 ptv=1 → 判定兼容，业务能力正常执行', as
 // ─────────────────────────────────────────────────────────────────────────────
 // 2. 不兼容：整数越界 → 状态不得呈现为可用，业务能力 fail-closed
 // ─────────────────────────────────────────────────────────────────────────────
-test('对端 hello 声明 ptv=2 → 状态降为 incompatible，业务请求回 -32008 且不执行', async () => {
-  const { conn, states, logs, cleanup } = await setup({ ptv: 2 })
+test('对端 hello 声明 ptv=3（越界）→ 状态降为 incompatible，业务请求回 -32008 且不执行', async () => {
+  const { conn, states, logs, cleanup } = await setup({ ptv: 3 })
   try {
     await waitFor(() => conn.peer.status === 'incompatible', { label: 'incompatible' })
     assert.equal(conn.connected, false, '不兼容时绝不能还报「可用」')
@@ -178,8 +182,8 @@ test('对端 hello 声明 ptv=2 → 状态降为 incompatible，业务请求回 
 
     // 状态里带着结构化的 -32008（扩展侧上报口径）
     assert.equal(conn.state.error.code, ERR.PROTOCOL_INCOMPATIBLE)
-    assert.deepEqual(conn.state.error.data.required, { min: 1, max: 1 })
-    assert.equal(conn.state.error.data.peer, 2)
+    assert.deepEqual(conn.state.error.data.required, { min: 2, max: 2 })
+    assert.equal(conn.state.error.data.peer, 3)
     assert.equal(conn.state.error.data.reason, 'out-of-range')
     assert.equal(conn.state.error.data.side, 'extension')
     assert.ok(logs.some((l) => l.includes('protocol-incompatible')), '必须留下可检索的日志')
@@ -232,7 +236,7 @@ test('对端 hello 的 ptv 非法（字符串）→ 按不兼容处理，且带�
 // 4. hello 尚未到达：未知版本，业务能力先关门（协商通道留开）
 // ─────────────────────────────────────────────────────────────────────────────
 test('hello 还没到 → 业务请求拒 -32008，bridge.* 仍可发（先把版本问出来）', async () => {
-  const { conn, dsh, cleanup } = await setup({ ptv: 1, helloDelayMs: 400 })
+  const { conn, dsh, cleanup } = await setup({ ptv: PROTOCOL_VERSION, helloDelayMs: 400 })
   try {
     // 此刻链路已通但没有版本信息
     assert.equal(conn.state.state, 'ready')
@@ -261,7 +265,7 @@ test('hello 还没到 → 业务请求拒 -32008，bridge.* 仍可发（先把�
 // 5. 入站业务能力：协议端口上真发过来时，不得执行宿主能力
 // ─────────────────────────────────────────────────────────────────────────────
 test('不兼容时 DSH 直接请求业务能力 → 回 -32008，宿主 dispatch 一次都没跑', async () => {
-  const { conn, dsh, host, cleanup } = await setup({ ptv: 2 })
+  const { conn, dsh, host, cleanup } = await setup({ ptv: 3 })
   try {
     await waitFor(() => conn.peer.status === 'incompatible', { label: 'incompatible' })
     // ★ token 必须给对：给错就变成「被鉴权挡掉」，测出来的 -32001 会替版本门背锅
@@ -285,8 +289,8 @@ test('不兼容时 DSH 直接请求业务能力 → 回 -32008，宿主 dispatch
 // ─────────────────────────────────────────────────────────────────────────────
 // 6. 重连 = 新一轮协商：上一轮的判定不得沿用
 // ─────────────────────────────────────────────────────────────────────────────
-test('重连后重新协商：对端换成 v1 就恢复可用（旧判定不沿用）', async () => {
-  const { conn, dsh, cleanup } = await setup({ ptv: (n) => (n === 1 ? 2 : 1) })
+test('重连后重新协商：对端换成兼容版本就恢复可用（旧判定不沿用）', async () => {
+  const { conn, dsh, cleanup } = await setup({ ptv: (n) => (n === 1 ? 3 : PROTOCOL_VERSION) })
   try {
     await waitFor(() => conn.peer.status === 'incompatible', { label: 'first negotiation' })
     assert.equal(conn.connected, false)
@@ -295,7 +299,7 @@ test('重连后重新协商：对端换成 v1 就恢复可用（旧判定不沿�
     await waitFor(() => dsh.connections >= 2, { label: 'second connection' })
     await waitFor(() => conn.peer.status === 'compatible', { label: 'renotiated' })
     assert.equal(conn.connected, true, '对端升级后重连应恢复可用')
-    assert.equal(conn.peer.protocolVersion, 1)
+    assert.equal(conn.peer.protocolVersion, PROTOCOL_VERSION)
   } finally {
     await cleanup()
   }
@@ -310,7 +314,7 @@ test('重连后重新协商：对端换成 v1 就恢复可用（旧判定不沿�
 test('★ F3 回归：不兼容时 onRequest 注入点接不走业务方法（门在前面，仍回 -32008）', async () => {
   const hijacked = []
   const { conn, dsh, cleanup } = await setup({
-    ptv: 2,
+    ptv: 3,
     onRequest: (method) => { hijacked.push(method); return { hijacked: method } },
   })
   try {
@@ -331,7 +335,7 @@ test('★ F3 回归：不兼容时 onRequest 注入点接不走业务方法（�
 
 test('★ F3 回归：兼容时 onRequest 注入点照常工作（只是顺序在门之后，没被废掉）', async () => {
   const { conn, dsh, cleanup } = await setup({
-    ptv: 1,
+    ptv: PROTOCOL_VERSION,
     onRequest: (method) => (method === 'vscode.custom' ? { custom: true } : undefined),
   })
   try {

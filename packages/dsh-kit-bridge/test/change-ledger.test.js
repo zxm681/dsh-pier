@@ -636,15 +636,23 @@ test('T61/A1 ★ 能力层：回执带归属字段，applied / saved:false 语�
   }
 })
 
-test('T61/A1 能力层：老宿主（没有观察器）→ 归属 unknown，回执字段仍在', async () => {
+test('T62/A2 能力层：老宿主（没有观察器）→ **拒写** -32011 observation-gap，宿主零调用', async () => {
   const ws = tempWorkspace()
   try {
-    const { caps, link } = grantedEnv(ws.root, { withObserver: false })
-    const res = await caps.dispatch('vscode.applyEdit', editParams(join(ws.root, 'a.js')), { link })
-    assert.equal(res.applied, true)
-    assert.equal(res.attribution, ATTRIBUTION.UNKNOWN)
-    assert.equal(res.attributionReason, 'observer-unavailable')
-    assert.equal(res.after.version, 6, 'after 仍然实测')
+    const { host, caps, link } = grantedEnv(ws.root, { withObserver: false })
+    let err = null
+    try {
+      await caps.dispatch('vscode.applyEdit', editParams(join(ws.root, 'a.js')), { link })
+    } catch (e) { err = e }
+    assert.equal(err?.code, ERR.DOCUMENT_DIRTY,
+      '没有同源观察器 ⇒ 连"干净基线"都建立不起来 ⇒ 失败闭合（默认放行是绝不能有的）')
+    assert.equal(err?.data?.reason, 'observation-gap')
+    assert.equal(err?.data?.attribution, 'unknown')
+    assert.equal(err?.data?.mayHaveApplied, false)
+    assert.equal(host.calls.length, 0, '拒绝路径上宿主一次都不许被调用')
+    // 读路径不受影响：没有观察器照样能读（老宿主只是不能写）。
+    const state = await caps.dispatch('vscode.getDocumentState', { file: join(ws.root, 'a.js') }, { link })
+    assert.equal(state.version, 5)
   } finally {
     ws.dispose()
   }
@@ -695,30 +703,46 @@ test('T61/A1 能力层：事件晚于 Promise → self-only（而且不是 bridg
   }
 })
 
-test('T61/A1 能力层：预先 dirty 的缓冲区 → unknown pre-dirty', async () => {
+test('T62/A2 能力层：预先 dirty 的缓冲区（基线之前就有别人的字）→ 拒写 -32011', async () => {
   const ws = tempWorkspace()
   try {
-    const { caps, link } = grantedEnv(ws.root, { dirty: true })
-    const res = await caps.dispatch('vscode.applyEdit', editParams(join(ws.root, 'a.js')), { link })
-    assert.equal(res.attribution, ATTRIBUTION.UNKNOWN)
-    assert.equal(res.attributionReason, 'pre-dirty')
+    const { host, caps, link } = grantedEnv(ws.root, { dirty: true })
+    let err = null
+    try {
+      await caps.dispatch('vscode.applyEdit', editParams(join(ws.root, 'a.js')), { link })
+    } catch (e) { err = e }
+    // 账本会说 `pre-dirty`（证据层的判断没变）；写许可层的结论是"来源不明 ⇒ 拒"，
+    // 因为这份脏**早于**我的基线，我拿不出任何证据说它是我写的。
+    assert.ok(err, '脏且不可归属必须拒写，不许沿用"照写"的旧行为')
+    assert.equal(err.code, ERR.DOCUMENT_DIRTY)
+    assert.equal(err.data.reason, 'dirty-quarantine')
+    assert.equal(err.data.isDirty, true)
+    assert.equal(err.data.retryable, false)
+    assert.equal(host.calls.length, 0, '宿主零调用')
+    assert.equal(host.buffer.text.includes('hello world'), true, '缓冲区原样不动')
   } finally {
     ws.dispose()
   }
 })
 
-test('T61/A1 能力层：`opts.changeLedger === false` 时回执保持 T61 之前的形状', async () => {
+test('T62/A2 能力层：`opts.changeLedger === false` ⇒ 没有证据源 ⇒ 一起拒写', async () => {
   const ws = tempWorkspace()
   try {
     const grants = new GrantStore()
     const link = { name: 'link-a' }
-    grants.adopt({ id: ID_A, epoch: EPOCH_A, link })
+    grants.adopt({ id: ID_A, epoch: EPOCH_A, link, allowDirtySave: true })
     const host = makeBufferHost(ws.root)
     const caps = createCapabilities(host, { grants, changeLedger: false })
-    const res = await caps.dispatch('vscode.applyEdit', editParams(join(ws.root, 'a.js')), { link })
-    assert.deepEqual(Object.keys(res).sort(),
-      ['applied', 'file', 'saved', 'textLength'],
-      '关掉账本 ⇒ 回执与旧版逐字同形（老消费者的兼容出口）')
+    let err = null
+    try {
+      await caps.dispatch('vscode.applyEdit', editParams(join(ws.root, 'a.js')), { link })
+    } catch (e) { err = e }
+    // ★ 语义变更（v1→v2）：`changeLedger:false` 在 A1 里只是"回执少几个字段"，
+    //   A2 之后它等于"这个桥接没有归属证据源" ⇒ 和"老宿主没有观察器"同一条结论：
+    //   拒写（observation-gap）。这个开关现在是**只读桥接**的开关，不再是兼容出口。
+    assert.equal(err?.code, ERR.DOCUMENT_DIRTY, '关掉账本 = 没有证据源 ⇒ 失败闭合')
+    assert.equal(err?.data?.reason, 'observation-gap')
+    assert.equal(host.calls.length, 0)
   } finally {
     ws.dispose()
   }

@@ -17,8 +17,8 @@ function capture() {
   return { lines, write }
 }
 
-test('协议版本是 1', () => {
-  assert.equal(PROTOCOL_VERSION, 1)
+test('协议版本是 2（A2 整版升版）', () => {
+  assert.equal(PROTOCOL_VERSION, 2)
 })
 
 test('请求-响应配对：并发 100 个请求按 id 正确路由', async () => {

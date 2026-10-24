@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply } from '../src/index.js'
-import { connect, createLineSplitter } from '../src/protocol.js'
+import { connect, createLineSplitter, PROTOCOL_VERSION } from '../src/protocol.js'
 
 /** 测试消费者身份（写类调用必须来自已绑定身份的入口；口径同 t5）。 */
 export const TEST_CONSUMER = 'dsh-kit-test'
@@ -135,7 +135,7 @@ export async function windowClient(server, opts = {}) {
      * 报到。第三个参数是 W3 的 `window` 块 —— **不给就整块不出现**，
      * 这正是"老扩展 / 编辑期删掉 window 块"的形状（守门测试靠它）。
      */
-    hello(ptv = 1, capabilities = WINDOW_CAPS, window = undefined) {
+    hello(ptv = PROTOCOL_VERSION, capabilities = WINDOW_CAPS, window = undefined) {
       return link.request('bridge.hello', {
         client: `win-${label}`,
         extensionVersion: '0.3.1',
@@ -185,7 +185,7 @@ export async function withKit(opts = {}) {
   /** 开一个窗口并让它报到。`opts.window` 决定 hello 里有没有 W3 的块。 */
   const open = async (o = {}) => {
     const c = await windowClient(server, o)
-    await c.hello(1, o.capabilities ?? WINDOW_CAPS, o.window)
+    await c.hello(o.ptv ?? PROTOCOL_VERSION, o.capabilities ?? WINDOW_CAPS, o.window)
     clients.push(c)
     return c
   }

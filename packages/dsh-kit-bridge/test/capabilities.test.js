@@ -19,6 +19,10 @@ function fakeHost(overrides = {}) {
     fileExists: (p) => { calls.push(['fileExists', p]); return /\.(txt|js)$/.test(p) },
     resolvePath: (p) => { calls.push(['resolvePath', p]); return p.startsWith('/') ? p : `/ws/${p}` },
     workspaceRoots: () => ['/ws'],
+    // A2（T62）：本桥接**没有同源变更观察器就不许写**（observation-gap）。这些用假宿主
+    // 的用例关心的是别的东西（编辑语义 / 锚点 / 删除），所以给一个"什么都不发生"的真实
+    // 观察器：宿主确实实现了这个口，只是这个假宿主永远不报变更。
+    observeTextChanges: () => ({ dispose() {} }),
     isTrusted: () => true,
     openTextDocument: async (p, o) => { calls.push(['openTextDocument', p, o]) },
     openExternalFile: async (p) => { calls.push(['openExternalFile', p]) },

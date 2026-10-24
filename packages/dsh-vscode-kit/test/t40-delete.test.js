@@ -23,7 +23,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { DELETE_REQUEST_TIMEOUT_MS, apply } from '../src/index.js'
-import { ERR, ERR_NAME, connect, createLineSplitter } from '../src/protocol.js'
+import { ERR, ERR_NAME, PROTOCOL_VERSION, connect, createLineSplitter } from '../src/protocol.js'
 import { validateResponse } from '../src/response-contract.js'
 import { METHOD_TIERS, judgeCall, tierOf } from '../src/whitelist.js'
 
@@ -119,7 +119,7 @@ async function withKit({ consumers, deleteResult, silent } = {}) {
   const shared = ctx.provided.get('dshVscodeKit').v
   const editor = await fakeEditor(handle.kit.server, { deleteResult, silent })
   await editor.link.request('bridge.hello', {
-    client: 'fake-editor', extensionVersion: '0.1.0', protocolVersion: 1, capabilities: DELETE_CAPS,
+    client: 'fake-editor', extensionVersion: '0.1.0', protocolVersion: PROTOCOL_VERSION, capabilities: DELETE_CAPS,
   })
   const cleanup = async () => {
     if (!editor.socket.destroyed) await editor.close().catch(() => {})
@@ -147,7 +147,11 @@ test('T40 码表：-32002 declined 有名字（不是空号），且不新增任
   // T40 是 `-32002` 在**本仓第一次真正被抛出**：先确认它在名字表里有个像样的名字，
   // 否则日志/指标里会是一条 "code -32002" 的无名词条。
   assert.equal(ERR_NAME[ERR.DECLINED], 'declined')
-  assert.equal(ERR_NAME[-32011], undefined, '-32011 仍然保持空号（不许往这里塞确认超时）')
+  // ★ T62：-32011 已经是 document-dirty。原意是「不许往这里塞确认超时」——这条断言改成守“它叫什么”，
+  //   确认超时仍然用 -32004 + reason。
+  assert.equal(ERR_NAME[-32011], 'document-dirty')
+  assert.equal(ERR_NAME[ERR.DOCUMENT_DIRTY], 'document-dirty')
+  assert.notEqual(ERR.DOCUMENT_DIRTY, ERR.TIMEOUT, '确认超时不许借用脏态码')
   assert.equal(ERR.TIMEOUT, -32004, '确认超时复用 -32004，靠 reason 区分')
   assert.equal(ERR.DISK_STATE_CONFLICT, -32013, '磁盘锚点复用 T39 的 -32013')
 })
