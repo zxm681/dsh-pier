@@ -39,3 +39,4 @@ work/t68-*.snapshot
 work/t68-extension.cjs
 work/t68-createFile-close-probe.txt
 work/t68-readme.diff
+work/t7[0-9]-mutation/
