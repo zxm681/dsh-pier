@@ -1,0 +1,10 @@
+SAVE false first=-32603/host-save-failed rebase=true endWrite=1 inflight=0 dirtyOwned=false beforeEvent=attribution-unknown foreignV2=foreign-change inflightEventDelta=0 retry=-32011 hostCalls=1 postPathThrows=0
+SAVE nonboolean first=-32009/saved rebase=true endWrite=1 inflight=0 dirtyOwned=false beforeEvent=attribution-unknown foreignV2=foreign-change inflightEventDelta=0 retry=-32011 hostCalls=1 postPathThrows=0
+SAVE identity first=-32603/document-identity-unavailable rebase=true endWrite=1 inflight=0 dirtyOwned=false beforeEvent=attribution-unknown foreignV2=foreign-change inflightEventDelta=0 retry=-32011 hostCalls=1 postPathThrows=0
+SAVE path first=-32603/path-changed-after-write rebase=true endWrite=1 inflight=0 dirtyOwned=false beforeEvent=attribution-unknown foreignV2=foreign-change inflightEventDelta=0 retry=-32011 hostCalls=1 postPathThrows=1
+SAVE null first=-32009/saved rebase=true endWrite=1 inflight=0 dirtyOwned=false beforeEvent=attribution-unknown foreignV2=foreign-change inflightEventDelta=0 retry=-32011 hostCalls=1 postPathThrows=0
+SAVE missing first=-32009/saved rebase=true endWrite=1 inflight=0 dirtyOwned=false beforeEvent=attribution-unknown foreignV2=foreign-change inflightEventDelta=0 retry=-32011 hostCalls=1 postPathThrows=0
+LRU default=512 taint pressure=600 evicted=89 allowed=false reason=foreign-change
+LRU default=512 inflight pressure=600 evicted=89 holders=2->1->0 v2=inflight v3=foreign allowed=false
+LRU default=512 allProtected=600/600 newHolder=1->0 evicted=0
+PASS independent save cases=6 LRU cases=3; no real document/disk writes
