@@ -22,6 +22,7 @@ import {
   resolveWorkspaceFile, revalidateWriteTarget, assertTargetUnchanged,
   assertWrittenDocumentIdentity,
 } from './workspace-paths.js'
+import { createEventBroker } from '../../dsh-vscode-kit/src/event-subscriptions.js'
 
 /** 本扩展声明支持的能力清单（写进发现文件 / hello 的 capabilities）。 */
 export const CAPABILITIES = [
@@ -50,6 +51,15 @@ export const CAPABILITIES = [
   // ★ T44：动作从"删"改成"rename 进 `<root>/.dsh-quarantine/`，永不删"。名字与门槛
   //   全部保留（外部合同不变：grant/确认/整份备份都要），但代码里**没有**删除调用。
   'vscode.deleteFile',
+  // 事件订阅（E3）：**观察**能力，不是写能力 —— 不进 `WRITE_METHODS`、不要求 grant，
+  // 白名单档位是 `read`（`whitelist.js` 的 `METHOD_TIERS`）。
+  //
+  // 为什么它就够、不需要第二条"推事件"能力：事件是**通知**（`vscode.events.event`），
+  // 协议层只接收、不可被调用（`protocol.js` 对带 id 的那条回 `-32600 events must be
+  // notifications`）。所以要"开一条推流"的只有订阅这一件事 —— 开流、登记消费者、
+  // 冻结 `{subscriptionId, streamEpoch, startSeq}` 初态屏障，全在 subscribe 的回执里。
+  'vscode.events.subscribe',
+  'vscode.events.unsubscribe',
 ]
 
 /**
@@ -1021,6 +1031,39 @@ export function createCapabilities(host, opts = {}) {
   }
 
   /**
+   * 事件订阅 broker（E3）—— **推流侧的登记簿与策略中心**。
+   *
+   * 它只做三件事，都不碰编辑器状态：
+   *  ① **登记**：每个订阅记 `{id, link, filter, consumer}`；消费者名字是分区键。
+   *  ② **开流**：一条连接一条流（`link.events.openStream`），回执冻结
+   *     `{subscriptionId, streamEpoch, startSeq}` —— 这是消费方"只看这之后"的初态屏障。
+   *  ③ **推策略**：`policyFor()` 把**所有**消费者合起来算一份联合策略
+   *     （roots 取工作区根、types 取并集、files 取 delta 派生的白名单并集、
+   *     `textMode = 任何人有 delta 才是 delta`），通过 `configure` 灌给 E2 生产者。
+   *
+   * 为什么联合而**不是**每条订阅一份生产者：E1 的传输层是"每条连接一条流"
+   * （`protocol.js` 的 `eventChannel`，`openStream` 已有 outgoing 就返回 null），
+   * 消费者级隔离在**接收侧**做（DSH 的 `createEventSubscriptions` 逐分区过滤+队列）。
+   * 推侧只负责"别把不该发的正文发出去"：联合策略是**最宽的合法并集**，
+   * 真正的逐消费者裁剪在接收侧 —— 两端都不许悄悄放宽。
+   *
+   * `roots` 传函数（不是快照）：工作区根会变（加/删文件夹），快照会让正文闸停在开局那一刻。
+   */
+  const eventBroker = createEventBroker({
+    log: (level, msg, extra) => log(level, msg, extra),
+    roots: () => (typeof host.workspaceRoots === 'function' ? host.workspaceRoots() : []),
+    // 会话归属只认 grant 表（DSH 侧的授权事实），**不**采信订阅参数里自称的东西。
+    sessionLinkOf: (sessionId) => {
+      if (!grants || typeof grants.active !== 'function') return null
+      let found = null
+      for (const record of grants.active()) {
+        if (record?.sessionId === sessionId) found = record
+      }
+      return found?.link ?? null
+    },
+  })
+
+  /**
    * vscode.openFile
    * params: { path: string, line?: number(1-based), column?: number(1-based), preview?: boolean }
    * result: { opened: true, path: string, mode: 'text'|'external' }
@@ -1180,7 +1223,7 @@ export function createCapabilities(host, opts = {}) {
    *     改回 `textUnavailable:true`。截断后当全文是最坏的形态（见 MAX_TEXT_BYTES 注释）。
    *  3. **不写、不保存、不开新窗口**：纯读，因此**不要求** grant（写入才要求）。
    */
-  async function getDocumentState(params) {
+  async function getDocumentState(params, ctx) {
     const method = 'vscode.getDocumentState'
     assertTrusted(method)
 
@@ -1202,7 +1245,10 @@ export function createCapabilities(host, opts = {}) {
     const { abs, real } = resolveWorkspaceFile(file, host.workspaceRoots(), { method })
 
     const state = await readDocumentState(host, real, { includeText }, method)
+    // 可选的流位置与订阅回执共用同一 cursor 结构；不自动开流。
+    const cursor = eventBroker.cursorFor(ctx?.link)
     const out = {
+      ...(cursor ? { cursor } : {}),
       // 与其它能力同一口径：回规范化绝对路径，不回调用方写的那一串。
       file: canonicalPath(abs),
       version: state.version,
@@ -2091,6 +2137,34 @@ export function createCapabilities(host, opts = {}) {
   }
 
 
+  /**
+   * vscode.events.subscribe（E3）
+   * params: { type?|types?, files?, textMode?, windowId?, sessionId?, consumer? }
+   * result: { ok, subscriptionId, streamEpoch, startSeq, cursor{...}, subscription{...} }
+   *
+   * 这里再判一次 `assertTrusted` 不是多余：工作区不受信任时，连"哪个文件在什么时刻变了"
+   * 都不该说 —— 事件带文件名与正文，比一次显式读取更容易被当成"背景噪音"放过。
+   * 它是**观察**能力（不进 `WRITE_METHODS`），所以没有 grant 要求、不走 grantGate。
+   */
+  async function subscribeEvents(params, ctx) {
+    assertTrusted('vscode.events.subscribe')
+    return eventBroker.subscribe(params, ctx)
+  }
+
+  /**
+   * vscode.events.unsubscribe（E3）
+   * params: { id: string }
+   * result: { ok, unsubscribed:boolean, subscriptionId:string|null, streamClosed:boolean }
+   *
+   * `unsubscribed:false` 是合法结果（幂等），不是错误：重复退订、或流已经因为缺口被
+   * 对端关掉时，再退一次本来就该是"没有可退的"。
+   */
+  async function unsubscribeEvents(params, ctx) {
+    // 只豁免本连接已存在订阅的清理；未知/越权/畸形请求仍走原有 trust 门。
+    if (!eventBroker.canRelease(params, ctx)) assertTrusted('vscode.events.unsubscribe')
+    return eventBroker.unsubscribe(params, ctx)
+  }
+
   const handlers = {
     'vscode.openFile': openFile,
     'vscode.getSelection': getSelection,
@@ -2100,6 +2174,8 @@ export function createCapabilities(host, opts = {}) {
     'vscode.getDocumentState': getDocumentState,
     'vscode.save': save,
     'vscode.deleteFile': deleteFile,
+    'vscode.events.subscribe': subscribeEvents,
+    'vscode.events.unsubscribe': unsubscribeEvents,
   }
 
   /**
@@ -2117,10 +2193,17 @@ export function createCapabilities(host, opts = {}) {
     if (!handler) {
       throw new BridgeError(ERR.UNSUPPORTED, `capability not implemented: ${method}`, { method })
     }
-    assertTrusted(method)
+    // unsubscribe 仅撤销本连接的观察；不能因 trust 丢失而阻止资源释放。
+    if (method !== 'vscode.events.unsubscribe' || !eventBroker.canRelease(params, ctx)) assertTrusted(method)
     grantGate(method, params, ctx)
     return handler(params, ctx)
   }
 
-  return { dispatch, handlers, CAPABILITIES }
+  // 事件 broker 的出口（E3）：`vscode` 宿主的 `createDispatcher` 不归本卡改，
+  // 所以经 `dispatch` **函数对象**这个既有出口交出去，connector 用
+  // `deps.dispatch?.eventBroker` 取。这是唯一既能不动禁区文件、又保持
+  // "登记簿只有一本"的通道 —— 另建一个 broker 等于两份判据，迟早漂移。
+  dispatch.eventBroker = eventBroker
+
+  return { dispatch, handlers, CAPABILITIES, eventBroker }
 }

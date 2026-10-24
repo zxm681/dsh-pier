@@ -86,6 +86,16 @@ export function createConnector(deps) {
   const linkState = injectedLinkState ?? { link: null }
 
   /**
+   * 事件订阅登记簿（E3）。由能力层建好，经 `dispatch` 函数对象带过来 ——
+   * `vscode` 宿主的 `createDispatcher` 不在本卡改动范围，这是唯一既不动它、
+   * 又不至于出现"两份登记簿"的通道（另建一份 = 两套判据，迟早漂移）。
+   *
+   * 没有它（单测 / 老宿主）⇒ 事件生产者保持关闭：不登记就不推，这正是
+   * "未订阅一律关闭"的默认口径。
+   */
+  const eventBroker = deps.dispatch?.eventBroker ?? null
+
+  /**
    * 绑定门（契约 §6.1.1 ②A：`handleInbound` 交给 `dispatch` 之前）。
    * 与能力层那道门是**同一个函数**（`extensionWriteGate`）：两道门位置不同、
    * 判定同源，改一处不会让另一处偷偷失效。
@@ -126,6 +136,8 @@ export function createConnector(deps) {
    */
   function forgetLink(gone) {
     editorEvents?.dispose()
+    // 事件订阅跟着连接一起死：流没了，登记也得没（否则重连后会用旧 descriptor 投递）。
+    eventBroker?.dropLink(gone)
     if (linkState.link === gone) linkState.link = null
     if (!gone) return 0
     if (deps.events === true) gone.close('connector link forgotten')
@@ -206,12 +218,41 @@ export function createConnector(deps) {
   let started = false
   let generation = 0
   let abortConnect = null
-  // Internal E2 producer, not E3 consumer subscription API. Default metadata-only,
-  // empty roots; NO stream installation, so no unsolicited event/body is sent.
+  /**
+   * 编辑器事件生产者（E2 的 `createEditorEvents`，E3 在这里接上授权与策略）。
+   *
+   * 两道**必须**同时存在的东西，缺一个就会"未订阅也照发"：
+   *  ① `emit` 先过 `eventBroker.allowsPublish()`（没有任何活订阅 ⇒ 一个字节都不发）。
+   *     这一句是变异②的守门点：删掉它，事件就会在没人订阅时继续上线。
+   *  ② broker 通过 `attach` 把联合策略/生命周期灌进来（`configure` / `activate` / `release`）：
+   *     roots 与 `textMode` 由**订阅**决定，不是由扩展自己猜。
+   *
+   * 默认 `textMode: 'metadata'`，`roots` 为空 ⇒ `bodyAllowed` 恒 false ⇒ 永不发正文，
+   * 直到有人**显式**订阅 delta 并给出 `files` 白名单（决策 2）。
+   */
   const editorEvents = deps.events === true && deps.editorEventHost
-    ? createEditorEvents({ host: deps.editorEventHost, filter: deps.editorEventFilter,
-      emit: (type, payload, at) => link?.events.publish(type, payload, at) ?? false })
+    ? createEditorEvents({
+      host: deps.editorEventHost,
+      filter: deps.editorEventFilter,
+      emit: (type, payload, at) => {
+        if (!eventBroker || eventBroker.allowsPublish() !== true) return false
+        const published = link?.events.publish(type, payload, at) ?? false
+        if (published) eventBroker.published(link)
+        return published
+      },
+    })
     : null
+
+  // broker 与生产者的唯一接线：策略从订阅来，生命周期由登记簿驱动。
+  // 没有登记簿（单测/老宿主）⇒ 不接，生产者保持"零订阅零推送"的默认态。
+  eventBroker?.attach({
+    configure: (policy) => editorEvents?.configure(policy),
+    // 第一批订阅进来才装监听：没人看就不该有监听器（也避免 dispose 后又要 activate）。
+    activate: () => editorEvents?.activate(),
+    // 最后一个订阅退掉 ⇒ 撤掉全部监听，回到"零订阅零推送"。
+    release: () => editorEvents?.dispose(),
+  })
+
   /** 已自动重连的次数（诊断用） */
   let attempts = 0
 
@@ -398,7 +439,7 @@ export function createConnector(deps) {
     if (deps.events === true) s.on('drain', () => attached.events.drain())
     // 这是"当前活连接"的**唯一**写入口；绑定门读的就是它（对象身份，不是序号）。
     linkState.link = link
-    editorEvents?.activate()
+    // 连接与协商不是订阅；监听器只由 broker 的 activate 安装。
 
     const feed = createLineSplitter((line) => attached.handleLine(line))
     s.on('data', (chunk) => {

@@ -58,7 +58,8 @@ export function createEditorEvents({ host, emit, filter = {}, timers = {}, now =
   function setPolicy(value) {
     policy = {
       roots: Array.isArray(value.roots) ? value.roots.filter((r) => typeof r === 'string').slice(0, EVENT_QUEUE_MAX_COUNT) : [],
-      files: Array.isArray(value.files) ? value.files.filter((r) => typeof r === 'string').slice(0, EVENT_QUEUE_MAX_COUNT) : null,
+      files: Array.isArray(value.files) ? value.files.filter((r) => typeof r === 'string') : null,
+      bodyFiles: Array.isArray(value.bodyFiles) ? value.bodyFiles.filter((r) => typeof r === 'string') : null,
       types: Array.isArray(value.types) ? value.types.filter((t) => EVENT_TYPES.includes(t)) : null,
       textMode: value.textMode === 'delta' ? 'delta' : 'metadata',
     }
@@ -70,6 +71,7 @@ export function createEditorEvents({ host, emit, filter = {}, timers = {}, now =
     return host.isTrusted() === true && doc?.uri?.scheme === 'file'
       && typeof file === 'string' && policy.roots.some((root) => contains(root, file))
       && (!policy.files || policy.files.includes(file))
+      && (!policy.bodyFiles || policy.bodyFiles.includes(file))
   }
   function selected(type, payload) {
     return (!policy.types || policy.types.includes(type))

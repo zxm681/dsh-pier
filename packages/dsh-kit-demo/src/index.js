@@ -73,8 +73,50 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /**
+   * 事件订阅的示范（E3）：**显式订阅 + 显式释放**。
+   *
+   * 三条刻意的做法，都是为了"别让事件偷偷变成命令"：
+   *  ① 只有调用方**显式**调用它才会订阅 —— `apply()` 里没有任何自动订阅，
+   *     也没人替用户决定"哪些事件值得看"；
+   *  ② 事件只交给调用方给的 `listener`。本插件**不**把事件写进模型上下文、
+   *     **不**唤醒 agent、**不**触发任何写动作（事件是观察，不是指令；正文也不是许可证）；
+   *  ③ 返回的 handle 自带 `dispose()`，退订是**同步**的（拿到句柄的下一行就能退），
+   *     退掉之后一条回调都不会再来。
+   *
+   * 默认 `textMode` 是 `metadata`（只有文件名/版本/脏标记这类元数据）；想要带正文的
+   * delta 必须显式写 `textMode: 'delta'` **并且**给 `files` 白名单 —— 没有"全窗全文"这条路。
+   *
+   * @param {{types?: string[], files?: string[], textMode?: 'metadata'|'delta',
+   *          windowId?: string, sessionId?: string}} filter 订阅过滤（至少给一个窗口/会话）
+   * @param {(event: object) => void} listener 每来一条事件调一次（同步或异步都行）
+   * @returns {{ok: boolean, subscriptionId: string|null, dispose: () => void}}
+   */
+  function subscribeEvents(filter, listener) {
+    const events = kit?.vscode?.events
+    if (!events || typeof events.subscribe !== 'function') {
+      // 稳定形状：没有事件面时给结构化失败，不是抛裸 TypeError（旧 kit / 未就绪同理）。
+      return {
+        ok: false,
+        subscriptionId: null,
+        error: { code: null, reason: 'events-unavailable', message: 'this kit build has no vscode.events surface' },
+        dispose() {},
+      }
+    }
+    return events.subscribe(filter, listener)
+  }
+
+  /** 退订：与 `subscribeEvents` 成对使用；`unsubscribed:false` 表示这个 id 本来就不存在（幂等）。 */
+  async function unsubscribeEvents(subscriptionId) {
+    const events = kit?.vscode?.events
+    if (!events || typeof events.unsubscribe !== 'function') {
+      return { ok: true, unsubscribed: false, subscriptionId: subscriptionId ?? null, streamClosed: false, reason: 'events-unavailable' }
+    }
+    return events.unsubscribe(subscriptionId)
+  }
+
   // 对外暴露成服务，便于别的插件/测试调用（也演示了「不耦合」的接法）。
-  const demo = { readSelection, openFile }
+  const demo = { readSelection, openFile, subscribeEvents, unsubscribeEvents }
   ctx.provide?.('dshKitDemo', demo)
 
   /**

@@ -84,6 +84,13 @@ export const METHOD_TIERS = Object.freeze({
   // 所以它是最纯的读 —— 未声明的消费者（unbound）也按 read 档放行。
   'vscode.windows.list': TIER_READ,
 
+  // 事件订阅（E3）：订的是**观察**，不是写；退订更只是撤掉一条观察。
+  // 档位定在 `read` 是有意的：插件不需要任何写权限就能拿到"我关心的窗口里发生了什么"，
+  // 而"能不能拿到正文"不由白名单决定（那是 `textMode` + `files` 白名单的独立门槛，
+  // 见 `event-subscriptions.js` 的 `normalizeEventFilter`）。档位放宽不会放宽正文。
+  'vscode.events.subscribe': TIER_READ,
+  'vscode.events.unsubscribe': TIER_READ,
+
   // ── Tier 2：缓冲区编辑（已实现；**本层收口的正是这笔债**，契约 §6.2.5）──
   'vscode.applyEdit': 'buffer-edit',
 

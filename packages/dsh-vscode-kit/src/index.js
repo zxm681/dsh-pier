@@ -28,6 +28,10 @@ import {
   assertWritableNotNotified,
 } from './grant.js'
 import { Whitelist, UNBOUND_CONSUMER, HOST_CONSUMER } from './whitelist.js'
+import { EVENT_SUBSCRIBE_METHOD } from './event-contract.js'
+import {
+  createEventSubscriptions, eventPartitionKey, notReadyEventHandle,
+} from './event-subscriptions.js'
 
 /** cordis 插件名，必须与 package.json 的 name 一致。 */
 export const name = 'dsh-vscode-kit'
@@ -402,6 +406,121 @@ function isBridgeMethod(method) {
 }
 
 /**
+ * `vscode.events` 子面（E3）—— **按消费者隔离、可取消**的事件订阅入口。
+ *
+ * 三处 facade（类实例的糖衣、`forPlugin()` 绑定的 facade、`ctx.provide` 出去的 facade）
+ * 各自持有**自己的**一份：身份由 `consumer` 决定，分区由 `eventPartitionKey(consumer)`
+ * 决定（没有名字的消费者固定落 `unbound` 分区）。
+ *
+ * 两条必须成立的形状约束：
+ *  - **未 ready 时方法照样存在**，返回结构化失败句柄（`{ok:false, error:{code:-32007,
+ *    reason:'server-not-ready'}}`），不是抛裸 TypeError（铁律 2）；
+ *  - `forPlugin` 不能再套一层（身份已定），`facade.forPlugin` 返回自己那一份。
+ *
+ * @param {() => any} getKit
+ * @param {{name: string|null, declared: string, source: string}} consumer
+ */
+function eventsSurfaceFor(getKit, consumer) {
+  const surface = {
+    /** 这个事件面绑的是谁（=`unbound` 或插件名；**就是分区键**，不是装饰）。 */
+    get consumer() { return eventPartitionKey(consumer) },
+    subscribe: (filter, listener, opts) => {
+      const kit = getKit()
+      if (!kit) return notReadyEventHandle(consumer)
+      return kit.eventsFor(consumer).subscribe(filter, listener, opts)
+    },
+    unsubscribe: (subscriptionId) => {
+      const kit = getKit()
+      if (!kit) {
+        return Promise.resolve({
+          ok: true, unsubscribed: false, subscriptionId: null, streamClosed: false, reason: 'server-not-ready',
+        })
+      }
+      return kit.eventsFor(consumer).unsubscribe(subscriptionId)
+    },
+    snapshot: () => {
+      const kit = getKit()
+      if (!kit) return { consumer: eventPartitionKey(consumer), count: 0, subscriptions: [] }
+      return kit.eventsFor(consumer).snapshot()
+    },
+  }
+  return surface
+}
+
+/**
+ * **未绑定** facade 的 `vscode.events`（E3）——把一条订阅铺到**每个**已就绪的 kit 上。
+ *
+ * 为什么不挑一个"活跃窗口"：读路径的 `_activeLink()` 挑的是「谁最后连上」，那是**读**的
+ * 口径；事件用它等于默认消费者静默订阅了一个随机窗口，还拿不到"这事件属于哪个窗口"的
+ * 正确归属。所以未绑定面的语义是：每个已就绪实例各订一份（每个窗口一条流），
+ * 事件各自带自己链路的 `windowId`；`dispose()` 一次退掉全部。
+ *
+ * 身份仍是固定的 `unbound` 分区 —— 不是"因为没名字所以通行"，而是"没有名字的消费者
+ * 只能待在 `unbound` 这间屋里"，拿不到别人的队列，也拿不到 delta（除非显式要并给 files）。
+ *
+ * @param {() => Iterable<any>} getKits
+ */
+function unboundEventsSurface(getKits) {
+  const targets = () => [...getKits()]
+  return {
+    get consumer() { return eventPartitionKey(UNBOUND_CONSUMER) },
+    subscribe: (filter, listener, opts) => {
+      const handles = targets().map((kit) => {
+        try {
+          return kit.eventsFor(UNBOUND_CONSUMER).subscribe(filter, listener, opts)
+        } catch (err) {
+          return {
+            ok: false,
+            subscriptionId: null,
+            consumer: eventPartitionKey(UNBOUND_CONSUMER),
+            filter: null,
+            cursor: null,
+            error: { code: ERR.INTERNAL, reason: 'subscribe-threw', message: String(err?.message ?? err) },
+            ready: Promise.resolve(),
+            dispose() {},
+          }
+        }
+      })
+      if (handles.length === 0) return notReadyEventHandle(UNBOUND_CONSUMER)
+      const first = () => handles.find((h) => h.ok === true) ?? handles[0]
+      const ready = Promise.all(handles.map((h) => h.ready)).then(() => {})
+      ready.catch(() => {})
+      return {
+        get ok() { return handles.some((h) => h.ok === true) },
+        get error() { return first().error },
+        get cursor() { return first().cursor },
+        get subscriptionId() { return first().subscriptionId },
+        get filter() { return first().filter },
+        consumer: eventPartitionKey(UNBOUND_CONSUMER),
+        // 部分成功也回 ok：**有的窗口订上了**就是订上了；哪个窗口失败看 `handles`。
+        // 一个都没成功时 `first` 是那条失败句柄（结构化失败，不是抛裸 TypeError）。
+        handles,
+        ready,
+        dispose: () => Promise.all(handles.map((h) => h.dispose())),
+      }
+    },
+    /**
+     * 退订：逐实例退一遍。未绑定面不知道 id 属于哪个窗口，所以**都问一次**；
+     * 只要有一个说退了就算退（`unsubscribed:true`）。全都说不存在就是 `false`（幂等，不抛）。
+     */
+    unsubscribe: (subscriptionId) => Promise.all(
+      targets().map((kit) => kit.eventsFor(UNBOUND_CONSUMER).unsubscribe(subscriptionId)
+        .catch(() => ({ ok: true, unsubscribed: false, subscriptionId: subscriptionId ?? null, streamClosed: false }))),
+    ).then((rows) => rows.find((r) => r && r.unsubscribed === true)
+      ?? { ok: true, unsubscribed: false, subscriptionId: subscriptionId ?? null, streamClosed: false }),
+    snapshot: () => {
+      const rows = targets().map((kit) => kit.eventsFor(UNBOUND_CONSUMER).snapshot())
+      return {
+        consumer: eventPartitionKey(UNBOUND_CONSUMER),
+        windows: rows.length,
+        count: rows.reduce((n, r) => n + (Number.isInteger(r?.count) ? r.count : 0), 0),
+        subscriptions: rows.flatMap((r) => (Array.isArray(r?.subscriptions) ? r.subscriptions : [])),
+      }
+    },
+  }
+}
+
+/**
  * 造一个**身份已绑定**的 facade（`kit.forPlugin(name, { declared })` 的返回值）。
  *
  * 形状与 `ctx.provide` 出去的那个 facade 完全一致（铁律 2：方法必须稳定存在），
@@ -413,8 +532,7 @@ function isBridgeMethod(method) {
  * @param {{name: string, declared: string, source: string}} consumer
  * @param {any} host 宿主 facade（提供 ready / waitReady / snapshot / editing）
  */
-function boundFacade(getKit, consumer, host) {
-  const readyErr = (method) => new BridgeError(ERR.DISCONNECTED,
+function boundFacade(getKit, consumer, host) {  const readyErr = (method) => new BridgeError(ERR.DISCONNECTED,
     'dsh-vscode-kit is not listening yet', { method, reason: 'server-not-ready' })
   const request = (method, params, opts) => {
     const kit = getKit()
@@ -467,6 +585,9 @@ function boundFacade(getKit, consumer, host) {
           const kit = getKit()
           return kit ? kit.deleteFileAs(consumer, args) : Promise.reject(readyErr('vscode.deleteFile'))
         },
+        // 事件订阅（E3）：**读**档能力，按消费者分区。返回的是 handle，不是 Promise ——
+        // 取消是同步动作，消费者要能在拿到句柄的下一行就 dispose()。
+        events: eventsSurfaceFor(getKit, consumer),
       }
     },
     request,
@@ -545,6 +666,52 @@ class VscodeKit {
     this._anchorSources = new Map()
 
     /**
+     * **事件里见过的 `incarnation`**（E3）—— 与 `_anchorSources` 刻意分开的一张表。
+     *
+     * 事件流会带 `payload.incarnation`，而写锚点门认的是"这一份锚点是我从哪条连接读出来的"。
+     * 两件事必须分开：
+     *  - 事件**不**登记进 `_anchorSources`：能发 delta 的正文事件不是一次读取，
+     *    它连"谁在读、读了哪一份"都没有；把它当锚点等于让"看见过"变成"可以写"。
+     *  - 但事件来源的化身要被**认出来并拒掉**：有人拿事件 payload 拼一个 applyEdit，
+     *    那不是"本端查不到来源"（免责放行），而是"来源已知且不合格"。
+     *    所以 `_assertAnchorSource` 见到本表里的化身会明确报 `source:'event'`。
+     *
+     * 上限 256 条（FIFO）：与 `_anchorSources` 同一种小缓存，不是事实源。
+     * @type {Set<string>}
+     */
+    this._eventIncarnations = new Set()
+    this._eventIncarnationsOverflow = false
+
+    /**
+     * 事件订阅宿主（E3）：一个 kit 实例一份，**按消费者分区**。
+     *
+     * 三件事交给它：把订阅读写送到对端（`request`）、把事件分发给各分区（`onEvent`）、
+     * 把传输层 stale 通知落到对应分区（`onEventState`）。分区键就是消费者的名字 ——
+     * 过滤、队列、正文门槛都是逐 key 的，插件 A 的慢 listener 不会饿死插件 B。
+     */
+    this.eventSubscriptions = createEventSubscriptions({
+      request: (method, params, opts, consumer) => this.request(method, params, opts, consumer),
+      resolve: (ctx) => this._resolveEventTarget(ctx),
+      // 来源只认**链路事实**：windowId 来自窗口注册表里那条连接的号，
+      // **绝不**读事件 payload 里自称的 windowId / sessionId。
+      attribute: (link) => {
+        try {
+          return { windowId: this._windowIdOf(link) ?? null, sessionId: null }
+        } catch {
+          return { windowId: null, sessionId: null }
+        }
+      },
+      accept: (link, descriptor) => {
+        try {
+          return link?.events?.acceptStream(descriptor) === true
+        } catch {
+          return false
+        }
+      },
+      log: (level, msg, extra) => this.onLog?.(level, msg, extra),
+    })
+
+    /**
      * 窗口注册表（W1）：`windowId` 的签发与持久化，落在
      * `~/.dsh/dsh-vscode-kit/windows.json`（`dshHome` 由 `apply()` 传进来；类直构时用默认值）。
      *
@@ -613,6 +780,10 @@ class VscodeKit {
       //   deleteFile({ file, expectedVersion, expectedIncarnation, expectedDisk, grant? }, opts?)
       // 不可逆：不保证进回收站、不提供撤销、不支持目录/递归。
       deleteFile: (...args) => this.deleteFileAs(HOST_CONSUMER, args),
+      // 事件订阅（E3）：**基础 facade 的固定身份 = `unbound` 分区**。
+      // 它不是特权消费者：默认 `textMode:'metadata'`（拿不到正文），要 delta 就得
+      // 自己显式要、并给出 files 白名单 —— 与插件走同一套判据。
+      events: eventsSurfaceFor(() => this, UNBOUND_CONSUMER),
     }
 
     /**
@@ -1312,7 +1483,26 @@ class VscodeKit {
     const incarnation = params?.expectedIncarnation
     if (typeof incarnation !== 'string' || incarnation === '') return
     const source = this._anchorSources.get(incarnation)
-    if (!source) return
+    if (!source) {
+      // ★ E3：事件 payload 里的化身**不是**锚点来源。它没被记进 `_anchorSources`
+      //   （那才是"我读过"的自证），所以这里不能像"查不到"那样免责放行 ——
+      //   来源是**已知且不合格**：拿事件内容拼一个请求，绕不过 stateFor 的来源核验。
+      if (this._eventIncarnations.has(incarnation) || this._eventIncarnationsOverflow) {
+        throw new BridgeError(ERR.INVALID_PARAMS,
+          'anchor-source-mismatch: this incarnation arrived on the event stream, not from a '
+          + 'bound read. An event is not a read: re-read the anchor with '
+          + 'kit.editing.stateFor(sessionId, file) before writing.',
+          {
+            method,
+            reason: 'anchor-source-mismatch',
+            stage: 'local',
+            source: this._eventIncarnations.has(incarnation) ? 'event' : 'event-history-overflow',
+            anchor: { boundTo: 'event', sessionId: null, file: null },
+            target: { sessionId: sessionId ?? null },
+          })
+      }
+      return
+    }
     if (!link) return
     if (source.link === link) return
     throw new BridgeError(ERR.INVALID_PARAMS,
@@ -1332,6 +1522,120 @@ class VscodeKit {
         },
         target: { sessionId: sessionId ?? null },
       })
+  }
+
+  /**
+   * 事件面（E3）：**按消费者分区**的事件订阅入口。
+   *
+   * 分区键 = 消费者名字（未绑定 = `unbound`）。同一 kit 实例里不同插件的过滤、队列、
+   * 慢消费者状态彼此不相干 —— 一个插件的 listener 抛错或堵住，不会让另一个插件掉事件。
+   * @param {{name: string|null, declared: string, source: string}} consumer
+   */
+  eventsFor(consumer) {
+    return this.eventSubscriptions.eventsFor(consumer)
+  }
+
+  /**
+   * 把一次订阅解析到**具体的一条连接**（E3 §4.3：先钉目标，再装流）。
+   *
+   * 口径与读路径完全一致，多一层"至少给一个目标"的显式要求（决策 2）：
+   *  - `windowId`（filter 里）或 `opts.target`：走 `_resolveWindowTarget`，解析不到就是 -32014；
+   *  - `sessionId`（filter 里）或 `opts.sessionId`：走**绑定读**口径，没有 grant 记录 → -32010；
+   *  - 两个都给且指向不同连接 → -32014 `target-unauthorized`（不回退"活跃窗口"）。
+   *
+   * 事件是**读**：它不需要写门、不需要 token 语义变更，但**必须**有确定的目标连接 ——
+   * 事件的 `windowId` 归属就是从这条连接来的，选错连接等于把 A 窗口的正文发给了 B 窗口的订阅者。
+   *
+   * @returns {{link: any, transport: {target?: string, sessionId?: string}}}
+   */
+  _resolveEventTarget({ filter, opts = {} } = {}) {
+    const method = EVENT_SUBSCRIBE_METHOD
+    const explicit = readWindowTarget(opts)
+    const windowId = (typeof filter?.windowId === 'string' && filter.windowId !== '')
+      ? filter.windowId
+      : (explicit?.text || null)
+    const sessionId = readSessionId(filter) ?? readSessionId(opts)
+
+    if (!windowId && !sessionId) {
+      throw new BridgeError(ERR.INVALID_PARAMS,
+        'target-required: an event subscription must name a window (windowId/target) or a bound '
+        + 'session (sessionId); there is no "all windows" default.',
+        { method, reason: 'target-required', field: 'windowId', stage: 'local' })
+    }
+
+    let byWindow = null
+    if (windowId) byWindow = this._resolveWindowTarget(readWindowTarget({ target: windowId }), method)
+
+    let bySession = null
+    if (sessionId) {
+      const found = this._grantForSession(sessionId)
+      const record = found?.record ?? null
+      bySession = record ? this._liveTargetOrNull(record) : null
+      if (!bySession) {
+        throw editNotBoundError(method, record ? 'target-gone' : 'no-grant', record ? 3 : 1)
+      }
+    }
+
+    if (byWindow && bySession && byWindow !== bySession) {
+      throw windowTargetError(method, windowId, 'target-unauthorized', {
+        reason: 'target-unauthorized', boundSessionId: sessionId ?? null,
+      })
+    }
+
+    const link = byWindow ?? bySession
+    if (!link) {
+      throw windowTargetError(method, windowId ?? sessionId, 'target-not-routable', {
+        reason: 'target-not-routable',
+      })
+    }
+    return {
+      link,
+      transport: {
+        // subscribe 不是锚点绑定读；request 的普通读回退不可重新挑 active。
+        target: this._windowIdOf(link),
+        ...(sessionId ? { sessionId } : {}),
+      },
+    }
+  }
+
+  /**
+   * 入站事件（E3）—— 由 `server.js` 的 `onEvent(envelope, {link})` 调进来。
+   *
+   * 两件事，顺序不能反：
+   *  1. **认化身**：`payload.incarnation` 记进 `_eventIncarnations`（不是 `_anchorSources`）。
+   *     这样后来有人拿事件里的化身去当写锚点，`_assertAnchorSource` 会明确拒（来源不合格），
+   *     而不是像"查不到"那样免责放行。事件**不**登记进 `_anchorSources` —— 那才叫"读过"。
+   *  2. **分发**：交给按消费者分区的分发器。窗口归属只由 `attribute(link)`（链路事实）决定，
+   *     payload 里自称的 windowId/sessionId 一个字都不采信。
+   */
+  onEventEnvelope(envelope, link) {
+    try {
+      const incarnation = envelope?.payload?.incarnation
+      if (typeof incarnation === 'string' && incarnation !== '') this._noteEventIncarnation(incarnation)
+    } catch {
+      /* 诊断用，不影响投递 */
+    }
+    return this.eventSubscriptions.onEvent(envelope, link ?? null)
+  }
+
+  /** 手写小 FIFO：事件里见过的化身，上限 256（与 `_anchorSources` 同量级）。 */
+  _noteEventIncarnation(incarnation) {
+    this._eventIncarnations.add(incarnation)
+    while (this._eventIncarnations.size > 256) {
+      // 淘汰不等于洗白来源：历史满后，未知锚点一律要求重新读取。
+      this._eventIncarnationsOverflow = true
+      const oldest = this._eventIncarnations.values().next()
+      if (oldest.done) break
+      this._eventIncarnations.delete(oldest.value)
+    }
+  }
+
+  /**
+   * 传输层事件态（E3）：`{subscriptionId, streamEpoch, stale:true, reason}` → 对应分区。
+   * 有界队列堵了、seq 断了、对端关了流，都从这里进来；分区自己决定怎么告知消费者。
+   */
+  onEventState(state) {
+    return this.eventSubscriptions.onEventState(state)
   }
 
   /**
@@ -1760,6 +2064,15 @@ class VscodeKit {
     // 但仍在 `link.request` **之前** ⇒ 抛在这里 = 一个字节都没发出去（与 expectedVersion 同族）。
     if (write) assertLocalExpectedIncarnation(method, wireParams)
 
+    // ★ E3：**观察钩子**（只读、只告知）。事件订阅要在"最终选中的这条连接"上装流，
+    //   而这个事实只有这里知道。它**不参与选路**：拿到的是已经选完的 link，
+    //   不许改、不许因此重选，也不改变任何错误面 —— 抛错当没抛（观察不该影响业务）。
+    try {
+      opts?.onLink?.(link)
+    } catch {
+      /* 观察钩子不参与判定 */
+    }
+
     // 断线不清任何「版本槽」：版本事实挂在连接上，连接没了自然失效。
     // （旧实现这里清全局 lastEditor，会导致下一条连接继承/丢失判定，见 F1。）
     const result = await link.request(
@@ -1839,6 +2152,12 @@ class VscodeKit {
        * 在真机上就只剩重试。
        */
       consumerPolicy: this.whitelist.snapshot(),
+      /**
+       * 事件订阅的**可观测面**（E3）。同理不是稳定 API：
+       * 每个分区一条 `{consumer, count, subscriptions:[…]}`，慢消费者/断流原因都在里面，
+       * 排"为什么我收不到事件"时不用猜。
+       */
+      eventSubscriptions: this.eventSubscriptions.snapshot(),
     }
   }
 }
@@ -1942,6 +2261,15 @@ export function apply(ctx, config = {}) {
     ? kit.request(method, params, opts, UNBOUND_CONSUMER)
     : notReady(method))
 
+  /**
+   * 本服务注册过的每个 kit 实例（E3）。
+   *
+   * 正常路径只有一个；但 `server.js` 的 `startBridgeServer()` 会扫端口区间、可能同时
+   * 挂多个监听（多实例/测试），所以这里按集合管理：未绑定事件面要铺到**每一个**上。
+   * @type {Set<any>}
+   */
+  const kits = new Set()
+
   const vscode = {
     // 只读四能力（契约 §6.2.1 Tier 1）：未声明身份也**必须**继续可用 —— 这是
     // 白名单落地的兼容底线，不因为"没报名字"就把读也一起关了。
@@ -1979,6 +2307,15 @@ export function apply(ctx, config = {}) {
     windows: {
       list: () => (kit ? kit.listWindows(UNBOUND_CONSUMER) : []),
     },
+    /**
+     * 事件订阅（E3）：未绑定 facade 的**固定身份 = `unbound` 分区**（写进契约 §6.4）。
+     *
+     * 它不是特权面：默认 `textMode:'metadata'`（拿不到正文），要 delta 必须显式要并给
+     * `files` 白名单；队列、过滤、慢消费者状态与任何插件同一条判据。唯一的区别是
+     * **铺到每个已就绪实例上**（多窗口各一份流），而不是替调用方挑一个"活跃窗口"——
+     * 挑窗口是读路径 `_activeLink()` 的口径，事件用它等于静默订阅了一个随机窗口。
+     */
+    events: unboundEventsSurface(() => kits),
   }
 
   /**
@@ -2133,6 +2470,23 @@ export function apply(ctx, config = {}) {
           // 只在**判定**里用，不参与放行 —— 墓碑只会让错误更准，不会让门更松。
           kit?._noteWindowClosed(link)
         },
+        /**
+         * 入站事件（E3）：协议层已经把信封校验、seq 连续性、字节上限、token 全判完了
+         * （`protocol.js` 的 `receiveEvent`），到这里的每一条都是**合法信封**。
+         * 这里只做两件本层的事：认化身（不进可写锚点表）、按消费者分区投递。
+         * 连接是唯一可信的归属来源（`ctx.link`），payload 自报的 windowId/sessionId 不采信。
+         */
+        onEvent: (envelope, ctx) => {
+          kit?.onEventEnvelope(envelope, ctx?.link ?? null)
+        },
+        /**
+         * 传输层事件态（E3）：有界队列堵了 / seq 断了 / 对端关了流。
+         * 它**不是**业务事件，只落到对应分区让慢消费者知道"你落后了"，
+         * 绝不伪造一条业务事件出来（决策 5：不重放、不恰好一次）。
+         */
+        onEventState: (state) => {
+          kit?.onEventState(state)
+        },
       })
 
       kit = new VscodeKit({
@@ -2152,6 +2506,10 @@ export function apply(ctx, config = {}) {
 
       // 服务端反向收到的编辑器身份存在 lastEditor（能力降级的判据）。
       // 编辑器连上后也会主动发 bridge.hello 请求，handleInbound 里记录。
+
+      // 未绑定事件面要铺到每个实例上（多监听/多窗口），所以实例进集合，
+      // 不是只留"最后一个"这一个裸变量。
+      kits.add(kit)
 
       // 补通知空窗期内已准入的连接（它们可能比 kit 装配更早到）。
       // 这个窗口是真的：startBridgeServer 内部 await 期间端口已在监听，

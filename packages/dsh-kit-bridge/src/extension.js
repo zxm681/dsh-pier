@@ -497,15 +497,41 @@ export function activate(context) {
   const { dispatch, capabilities, grants, linkState, host } = createDispatcher(output, { deleteConfirmTimeoutMs: cfg.deleteConfirmTimeoutMs })
   log(`capabilities: ${capabilities.join(', ')}`)
 
+  /**
+   * 事件正文闸的初始策略（E3）。
+   *
+   * 之前这一行是**缺的** —— `createConnector` 拿不到 `editorEventFilter`，
+   * `createEditorEvents` 的 `setPolicy(undefined)` 就落成 `roots: []`，于是
+   * `bodyAllowed()` 恒为 false：E2 的 delta 在真机上**永远不跑**（不是"跑得少"，是一次都不跑）。
+   *
+   * 现在它显式给出三件事，全部按决策 2 的默认口径：
+   *  - `roots`：工作区根（正文只在工作区内允许）；
+   *  - `textMode: 'metadata'`：**默认不带正文**；
+   *  - `files: null`：没有文件白名单 = 不做文件级筛选，但 delta 另有"必须给 files"的门。
+   *
+   * 这不是"最终策略"：订阅进来后 broker 会用 `policyFor()` 的联合策略覆盖它
+   * （`attach({ configure })` → `editorEvents.configure(policy)`），所以真正决定
+   * "发不发正文"的是**订阅**，不是这里。这里只保证"没人订阅时也是最小面"。
+   */
+  const initialEventFilter = {
+    roots: Array.isArray(vscode.workspace?.workspaceFolders)
+      ? vscode.workspace.workspaceFolders.map((f) => f?.uri?.fsPath).filter((p) => typeof p === 'string' && p !== '')
+      : [],
+    files: null,
+    types: null,
+    textMode: 'metadata',
+  }
+
   const connector = createConnector({
     dispatch,
     grants,
     linkState,
     events: true,
     editorEventHost: host.editorEvents,
-    // E3 must explicitly install/authorize a stream and configure its roots/mode.
-    // Negotiating E1 alone does not subscribe anyone or expose document bodies.
-    // 评审 F7：连接层的绑定门也要先问信任 —— 否则「未信任工作区」这个事实
+    editorEventFilter: initialEventFilter,
+    // E3：**谁想看**由订阅决定（`vscode.events.subscribe`），不是由扩展自己开一条流。
+    // 这里只是把生产者接上；没有订阅 ⇒ `eventBroker.allowsPublish()` 为 false ⇒ 一个字节都不发。
+    // 审阅 F7：连接层的绑定门也要先问信任 —— 否则「未信任工作区」这个事实
     // 会随「带不带 grant」变成两种回答（-32010 / -32006），调用方分不清该做什么。
     isTrusted: () => vscode.workspace.isTrusted,
     // ★ W3（多窗口寻址 §6）：**身份候选**，只随 hello 上报，DSH 侧拿它签发 / 匹配 windowId。

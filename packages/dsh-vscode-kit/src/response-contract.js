@@ -40,6 +40,7 @@
  */
 
 import { BridgeError, ERR } from './protocol.js'
+import { eventCursorError, subscriptionReceiptError } from './event-subscriptions.js'
 
 /** 能力命名空间：只有这个前缀的方法在形状校验管辖内。 */
 export const CAPABILITY_NAMESPACE = 'vscode.'
@@ -371,6 +372,7 @@ const RESPONSE_CONTRACTS = Object.freeze({
       ['textLength', isIntegerAtLeast(0), 'textLength:int>=0'],
     ],
     optional: [
+      ['cursor', (v) => eventCursorError(v) === null, 'cursor:{subscriptionId,streamEpoch,nextSeq}'],
       ['textUnavailable', (v) => v === true, 'textUnavailable===true'],
       // 空文本是合法值（空文件 `includeText:true` 回 `text:''`），所以用 isString 而不是非空。
       ['text', isString, 'text:string'],
@@ -386,6 +388,59 @@ const RESPONSE_CONTRACTS = Object.freeze({
         (r) => (typeof r.text !== 'string' ? true : r.text.length === r.textLength),
         'text.length must equal textLength',
       ],
+    ],
+  },
+
+  /**
+   * 事件订阅回执（E3）。**这张表是"订阅成功但初态屏障不存在"的第一道门**：
+   *
+   * 订阅回执不只是一个 ok —— 它同时钉住了这条流的位置（`subscriptionId` +
+   * `streamEpoch` + `startSeq`）。消费者要先装观察、再取快照、只消费 `startSeq` 之后
+   * 的事件（规划 §4.3）。回执里少一个字段，初态屏障就没了，之后所有"漏了一条"
+   * 都无从解释。`cursor` 不是冗余：它把同一份位置用**消费方视角**再表达一次
+   * （`nextSeq` = 下一条要消费的），两侧是否自洽在这里用 `consistency` 硬校验。
+   */
+  'vscode.events.subscribe': {
+    expected: 'object with ok===true, subscriptionId:string(non-empty), streamEpoch:string(non-empty), '
+      + 'startSeq:int>=1, cursor:{subscriptionId,streamEpoch,nextSeq:int>=1}, '
+      + 'subscription:{id,consumer,types?,files?,textMode}',
+    fields: [
+      ['ok', (v) => v === true, 'ok===true'],
+      ['subscriptionId', isNonEmptyString, 'subscriptionId:string(non-empty)'],
+      ['streamEpoch', isNonEmptyString, 'streamEpoch:string(non-empty)'],
+      ['startSeq', isIntegerAtLeast(1), 'startSeq:int>=1'],
+      ['cursor.subscriptionId', isNonEmptyString, 'cursor.subscriptionId:string(non-empty)'],
+      ['cursor.streamEpoch', isNonEmptyString, 'cursor.streamEpoch:string(non-empty)'],
+      ['cursor.nextSeq', isIntegerAtLeast(1), 'cursor.nextSeq:int>=1'],
+      ['subscription.id', isNonEmptyString, 'subscription.id:string(non-empty)'],
+      ['subscription.consumer', isNonEmptyString, 'subscription.consumer:string(non-empty)'],
+      ['subscription.textMode', oneOf('metadata', 'delta'), 'subscription.textMode:in{metadata,delta}'],
+    ],
+    optional: [
+      ['subscription.files', (v) => v === null || Array.isArray(v), 'subscription.files:array|null'],
+      ['subscription.types', (v) => v === null || Array.isArray(v), 'subscription.types:array|null'],
+    ],
+    consistency: [
+      [(r) => r.cursor.subscriptionId === r.subscriptionId, 'cursor.subscriptionId must equal subscriptionId'],
+      [(r) => r.cursor.streamEpoch === r.streamEpoch, 'cursor.streamEpoch must equal streamEpoch'],
+      [(r) => r.cursor.nextSeq === r.startSeq, 'cursor.nextSeq must equal startSeq'],
+      [(r) => subscriptionReceiptError(r) === null, 'subscription receipt and cursor must be structurally valid'],
+    ],
+  },
+
+  /**
+   * 退订回执（E3）。`unsubscribed:false` 是**合法结果**（幂等：这个 id 本来就不存在，
+   * 比如重复退订、或流已经因为缺口语义被对端关掉）—— 与"退订失败"不是一回事。
+   */
+  'vscode.events.unsubscribe': {
+    expected: 'object with ok===true, unsubscribed:boolean, subscriptionId?:string|null, streamClosed:boolean',
+    fields: [
+      ['ok', (v) => v === true, 'ok===true'],
+      ['unsubscribed', isBoolean, 'unsubscribed:boolean'],
+      ['streamClosed', isBoolean, 'streamClosed:boolean'],
+    ],
+    optional: [
+      ['subscriptionId', (v) => v === null || isNonEmptyString(v), 'subscriptionId:string|null'],
     ],
   },
 })
