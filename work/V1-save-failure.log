@@ -1,0 +1,5 @@
+FIRST_SAVE -32603 host-save-failed
+POLICY_LEAK {"fileKey":"d:/code-workspace/projects/dsh-vscode-dev/agents.md","lastVersion":1,"incarnation":"i","taint":null,"inflight":1,"windowEvents":0,"dirtyOwned":true,"baselineVersion":1,"baselineIncarnation":"i","baselineContentHash":"2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"}
+AFTER_FOREIGN {"fileKey":"d:/code-workspace/projects/dsh-vscode-dev/agents.md","lastVersion":2,"incarnation":"i","taint":null,"inflight":1,"windowEvents":1,"dirtyOwned":true,"baselineVersion":1,"baselineIncarnation":"i","baselineContentHash":"2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"}
+SECOND_SAVE {"saved":true,"file":"D:\\code-workspace\\projects\\dsh-vscode-dev\\AGENTS.md","disk":{"mtime":1,"size":1},"dirtyBefore":true,"dirtyAfter":false} hostCalls=2
+No real document or disk write: saveDocument is a memory-only stub.

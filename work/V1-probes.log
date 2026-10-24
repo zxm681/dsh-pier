@@ -1,0 +1,7 @@
+TAINT_BEFORE {"allowed":false,"reason":"foreign-change","attribution":"unknown"}
+TAINT_AFTER_512 {"allowed":true,"attribution":"unknown","reason":null,"phase":"queue"} evicted=2
+SAVE_FALSE -32603 host-save-failed
+SAVE_POLICY_AFTER_FALSE {"fileKey":"d:/code-workspace/projects/dsh-vscode-dev/agents.md","lastVersion":1,"incarnation":"i","taint":null,"inflight":1,"windowEvents":0,"dirtyOwned":false}
+FOREIGN_EVENT_AFTER_FALSE undefined
+SAVE_POLICY_AFTER_FOREIGN {"fileKey":"d:/code-workspace/projects/dsh-vscode-dev/agents.md","lastVersion":2,"incarnation":"i","taint":null,"inflight":1,"windowEvents":1,"dirtyOwned":false}
+CLEANUP_RACE {"removed":true} removedInode=2
