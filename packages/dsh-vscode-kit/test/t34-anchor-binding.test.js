@@ -129,6 +129,8 @@ async function windowClient(server, { label, docVersion, docIncarnation, feature
     extensionVersion: '0.3.0',
     protocolVersion: PROTOCOL_VERSION,
     capabilities: ['vscode.applyEdit', 'vscode.getDocumentState', 'vscode.getSelection'],
+    // T64：windowId 必须是这条连接的**真实**身份，所以窗口块要真报（否则只有 tmp-<connSeq>）。
+    window: { sessionId: `sess-${label}`, workspace: { name: `ws-${label}`, folders: [] }, uiKind: 1, remoteName: null },
     ...(features === undefined ? {} : { features }),
   })
   return {
@@ -156,6 +158,19 @@ async function withKit() {
     rmSync(home, { recursive: true, force: true })
   }
   return { svc, server, clients, cleanup }
+}
+
+/**
+ * 某个假窗口的**真实** `windowId`（按 hello 窗口块里的 `workspace.name` 反查）。
+ *
+ * T64 起 grant 的 `windowId` 必须解析到承载那条 grant 的连接，编一个 `win-A` 会直接
+ * 拒 `-32014 target-not-routable` —— 用例要么给真值，要么就是在测那条拒绝。
+ */
+async function windowIdOf(svc, name) {
+  const rows = await svc.vscode.windows.list()
+  const row = rows.find((w) => typeof w.label === 'string' && w.label.startsWith(`ws-${name} · `))
+  assert.ok(row, `window ws-${name} must be listed by windows.list()`)
+  return row.windowId
 }
 
 /** 写入参数（1-based 坐标）。锚点由用例自己填 —— 这正是被测的东西。 */
@@ -191,7 +206,7 @@ test('★ T34 跨窗口锚点错配 → 本地拒/不写入：A 读到的锚点�
       features: [PEER_FEATURE_DOCUMENT_INCARNATION],
     })
     kit.clients.push(A)
-    await kit.svc.editing.grant({ sessionId: S1, windowId: 'win-A' })
+    await kit.svc.editing.grant({ sessionId: S1, windowId: await windowIdOf(kit.svc, 'A') })
 
     // B 后连（connSeq 更大 = 更"活跃"），拿自己的 grant。
     const B = await windowClient(kit.server, {
@@ -199,7 +214,7 @@ test('★ T34 跨窗口锚点错配 → 本地拒/不写入：A 读到的锚点�
       features: [PEER_FEATURE_DOCUMENT_INCARNATION],
     })
     kit.clients.push(B)
-    await kit.svc.editing.grant({ sessionId: S2, windowId: 'win-B' })
+    await kit.svc.editing.grant({ sessionId: S2, windowId: await windowIdOf(kit.svc, 'B') })
 
     // ── 绑定读：锚点必须来自 **S1 的 grant 连接**（A），不是活跃连接（B）──
     const anchor = await kit.svc.editing.stateFor(S1, FILE)
@@ -265,7 +280,7 @@ test('★ T34 绑定读：会话没有有效 grant → -32010，不回退活跃�
     assert.equal(A.count('vscode.getDocumentState'), 0, '没有有效 grant 就不该去问任何一个窗口')
 
     // ② 有记录但承载连接已死：行 3（target-gone）；此时另一条连接还活着（活跃）
-    await kit.svc.editing.grant({ sessionId: S1, windowId: 'win-A' })
+    await kit.svc.editing.grant({ sessionId: S1, windowId: await windowIdOf(kit.svc, 'A') })
     const B = await windowClient(kit.server, {
       label: 'B', docVersion: B_VERSION, docIncarnation: B_INC,
     })
@@ -302,7 +317,7 @@ test('★ T34 同一会话正常路径仍成功：stateFor + applyEdit 一条龙
       features: [PEER_FEATURE_DOCUMENT_INCARNATION],
     })
     kit.clients.push(A)
-    await kit.svc.editing.grant({ sessionId: S1, windowId: 'win-A' })
+    await kit.svc.editing.grant({ sessionId: S1, windowId: await windowIdOf(kit.svc, 'A') })
 
     const anchor = await kit.svc.editing.stateFor(S1, FILE)
     assert.equal(anchor.boundTo, 'session')
@@ -336,7 +351,7 @@ test('★ T35 无条件必填：对端声明与不声明都一样拒（旧版扩
       features: [PEER_FEATURE_DOCUMENT_INCARNATION],
     })
     kit.clients.push(A)
-    await kit.svc.editing.grant({ sessionId: S1, windowId: 'win-A' })
+    await kit.svc.editing.grant({ sessionId: S1, windowId: await windowIdOf(kit.svc, 'A') })
     const err = await expectCode(
       kit.svc.vscode.applyEdit(writeParams({ expectedVersion: 1 }), { sessionId: S1 }),
       ERR.INVALID_PARAMS, '声明支持却缺化身')
@@ -351,7 +366,7 @@ test('★ T35 无条件必填：对端声明与不声明都一样拒（旧版扩
     await A.close()
     const C = await windowClient(kit.server, { label: 'C', docVersion: 1, docIncarnation: 'inc-c' })
     kit.clients.push(C)
-    await kit.svc.editing.grant({ sessionId: 'sess-old', windowId: 'win-C' })
+    await kit.svc.editing.grant({ sessionId: 'sess-old', windowId: await windowIdOf(kit.svc, 'C') })
     const legacy = await expectCode(
       kit.svc.vscode.applyEdit(writeParams({ expectedVersion: 1 }), { sessionId: 'sess-old' }),
       ERR.INVALID_PARAMS, '未声明支持也照样缺化身')
@@ -383,7 +398,7 @@ test('★ T35 raw request 省略化身 → 本地 -32602、宿主零写入（绕
       features: [PEER_FEATURE_DOCUMENT_INCARNATION],
     })
     kit.clients.push(A)
-    await kit.svc.editing.grant({ sessionId: S1, windowId: 'win-A' })
+    await kit.svc.editing.grant({ sessionId: S1, windowId: await windowIdOf(kit.svc, 'A') })
 
     const body = {
       file: FILE,

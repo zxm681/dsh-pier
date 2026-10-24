@@ -406,10 +406,12 @@ test('★ T5 Q4 删除/改名/写文件能力仍不存在：deleteFile/renameFil
     //   kit 的 `test/response-contract.test.js` 又要求 `CAPABILITIES` 与
     //   `REGISTERED_METHODS` 双向相等 —— 也就是"能被处理的业务方法"必须
     //   同时被声明、被登记形状、被对端看见。三条既有契约合起来只允许这一种加法。
+    // ★ T65：**追加** `vscode.rebaseBaseline`（`-32011` 的唯一解除通道）。它同样是
+    //   声明/handler/响应契约三处同源的那一种加法（见上一条注释的三条契约）。
     assert.deepEqual([...CAPABILITIES], [
       'vscode.openFile', 'vscode.getSelection', 'vscode.getDiagnostics',
       'vscode.listOpenEditors', 'vscode.applyEdit', 'vscode.getDocumentState',
-      'vscode.save', 'vscode.deleteFile',
+      'vscode.save', 'vscode.deleteFile', 'vscode.rebaseBaseline',
       'vscode.events.subscribe', 'vscode.events.unsubscribe',
     ])
     const own = Object.keys(e.caps.handlers)

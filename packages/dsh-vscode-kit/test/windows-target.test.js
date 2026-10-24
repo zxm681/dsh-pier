@@ -150,7 +150,9 @@ for (const withWindow of [true, false]) {
       // 只有 A 在的时候发 grant → 记录里承载连接是 A（与 t5 同一手法）。
       await A.close()
       const A2 = await kit.open({ label: 'A2', window: withWindow ? ALPHA : undefined })
-      await kit.svc.editing.grant({ sessionId: S1, windowId: 'win-A' })
+      // T64：grant 的 windowId 必须解析到承载连接；A2 是最新连上的那条（两种变体都成立：
+      // 有 window 块时它与 A 同号，没 window 块时是 tmp-<connSeq>）。
+      await kit.svc.editing.grant({ sessionId: S1, windowId: kit.list().at(-1).windowId })
       // B 后连 ⇒ 活跃视图是 B。绑定读却必须去 A2。
       const boundOk = await kit.svc.vscode.getDocumentState(FILE, { sessionId: S1 })
       assert.equal(A2.count('vscode.getDocumentState'), 1, '绑定读按 grant 记录走，不按活跃')
@@ -174,7 +176,8 @@ for (const withWindow of [true, false]) {
     try {
       // grant 在"只有 A"的时候发 ⇒ 记录承载连接 = A；B 后连成为活跃视图。
       const A = await kit.open({ label: 'A', window: withWindow ? ALPHA : undefined })
-      await kit.svc.editing.grant({ sessionId: S1, windowId: 'win-A' })
+      // T64：此刻只有 A 在线，它的号就是列表里唯一那一行的号。
+      await kit.svc.editing.grant({ sessionId: S1, windowId: kit.list()[0].windowId })
       const B = await kit.open({ label: 'B', window: withWindow ? BETA : undefined })
       const seqA = kit.list()[0].connSeq
 

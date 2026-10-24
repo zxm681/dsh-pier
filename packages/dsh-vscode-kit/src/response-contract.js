@@ -408,6 +408,32 @@ const RESPONSE_CONTRACTS = Object.freeze({
   },
 
   /**
+   * 基线重建（T65）。
+   *
+   * 只回 `{ok, file, version, incarnation}` —— 而且**故意不回** `applied` / `dirty` 之类
+   * 看着像"写成功了"的字段：这个动作一个字节都不写盘，回执里出现写语义的字段会让人
+   * 以为它落了盘。`version` / `incarnation` 回的是**扩展侧实测**的那一份（不是回显入参），
+   * 调用方据此可以确认自己确认的那份就是被采纳的那份。
+   */
+  'vscode.rebaseBaseline': {
+    expected: 'object with ok===true, file:string(non-empty), version:int>=0, '
+      + 'incarnation:string(non-empty)',
+    fields: [
+      ['ok', (v) => v === true, 'ok===true'],
+      ['file', isNonEmptyString, 'file:string(non-empty)'],
+      ['version', isIntegerAtLeast(0), 'version:int>=0'],
+      ['incarnation', isNonEmptyString, 'incarnation:string(non-empty)'],
+    ],
+    consistency: [
+      // 写语义的字段一个都不许出现：rebase 不写盘（铁律 11 的同一条精神）。
+      [
+        (r) => !('applied' in r) && !('quarantined' in r) && !('saved' in r),
+        '不写盘 ⇒ 无 applied/quarantined/saved 字段',
+      ],
+    ],
+  },
+
+  /**
    * 文档状态（T30：写入锚点的读侧）。
    *
    * `version` 是**写入前置条件**的唯一凭据，所以它必须是非负整数：对端回 `"12"`、

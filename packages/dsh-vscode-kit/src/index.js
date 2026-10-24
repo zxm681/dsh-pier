@@ -25,7 +25,7 @@ import { validateResponse } from './response-contract.js'
 import {
   GrantStore, GRANT_REASONS, GRANT_TOMBSTONE_LIMIT, WRITE_METHODS, isWriteMethod,
   judgeGrant, judgeSession, dshWriteGate, editNotBoundError, rejectParamsSessionId,
-  assertWritableNotNotified,
+  assertWritableNotNotified, BINDING_MISSING, documentContentHash,
 } from './grant.js'
 import { Whitelist, UNBOUND_CONSUMER, HOST_CONSUMER } from './whitelist.js'
 import { EVENT_SUBSCRIBE_METHOD } from './event-contract.js'
@@ -937,6 +937,8 @@ class VscodeKit {
       // `{version, incarnation}`。`kit.vscode.getDocumentState(file)` 是**活跃视角**，
       // 在它上面derive 出的锚点可能来自另一个窗口 —— 这个方法是唯一正确的读法。
       stateFor: (sessionId, file, opts) => this.readStateFor(sessionId, file, opts),
+      // 基线的**人工重建**（T65）：`document-dirty` 唯一的解除通道。见 `rebaseEditing`。
+      rebase: (sessionId, confirmation, opts) => this.rebaseEditing(sessionId, confirmation, opts),
     }
   }
 
@@ -1572,7 +1574,10 @@ class VscodeKit {
       const record = found?.record ?? null
       bySession = record ? this._liveTargetOrNull(record) : null
       if (!bySession) {
-        throw editNotBoundError(method, record ? 'target-gone' : 'no-grant', record ? 3 : 1)
+        // `missing:'grant'` 只在"这个会话根本没有有效凭证"时给（T66-1）：连接断开
+        // （`target-gone`）不是调用方缺了什么输入，别用诊断字段指错下一步。
+        throw editNotBoundError(method, record ? 'target-gone' : 'no-grant', record ? 3 : 1,
+          record ? null : BINDING_MISSING.GRANT)
       }
     }
 
@@ -1683,6 +1688,97 @@ class VscodeKit {
   }
 
   /**
+   * 基线的**人工重建**（T65）：`kit.editing.rebase(sessionId, confirmation, opts?)`。
+   *
+   * 为什么必须存在：`document-dirty`（`ERR.DOCUMENT_DIRTY`）的 taint 一旦落下，「人工交接」这条路
+   * 在 v2 里只有一张嘴、没有接口 —— `establishBaseline()` 全仓零调用点，于是脏缓冲
+   * 永远是 `document-dirty`，不可解除。人交接完了却没有解除通道，等于把文档永久冻结。
+   *
+   * 判据是**四元逐字确认**（缺一不可，全部必须与扩展侧**此刻实测**的一致）：
+   *  - `file`：目标文档（工作区相对或绝对，由扩展侧解析成真实路径）
+   *  - `version`：`TextDocument.version`（单调计数器）
+   *  - `incarnation`：文档化身（关重开/换文件会变）
+   *  - `contentHash`：`documentContentHash(text)` —— 文本按 CRLF→LF 归一后的 sha256。
+   *    ★ 这一条是"人工交接"的真正凭据：版本号相同但内容被换成别的东西时，只有它拦得住。
+   *
+   * 门槛与写路径**完全同一条**（不给它开第二条路）：
+   *  - 绑 grant：`vscode.rebaseBaseline` 登记在 `WRITE_METHODS` 里，所以 `request()`
+   *    会走 `_bindWriteTarget`（写目标=grant 记录的 link）+ `_writeGate`（`-32010`）。
+   *    没有有效凭证 → `-32010`，与 applyEdit 一字不差（含 `data.missing`）。
+   *  - 会话：`sessionId` 必须是那条 grant 的会话（`judgeSession`，`-32010`）。
+   *  - 白名单：`delete` 档（授权控制面动作，见 `whitelist.js`）。
+   *
+   * **不写盘**：扩展侧只把 `writePolicy` 的基线挪到确认的这一份内容上，缓冲区/磁盘
+   * 一个字节都不动（`applied` 这类字段在返回体里根本不存在）。
+   *
+   * 失败面：`-32602 reason:'rebase-anchor-mismatch'`（四元任一不符，taint **原样保留**）；
+   * `-32010`（凭证/会话，同写门）；`document-dirty`（证据源缺失等情况仍按原判序拒）。
+   *
+   * @param {string} sessionId 调用方自己的 DSH 会话标识（不来自线路）
+   * @param {{file: string, version: number, incarnation: string, contentHash: string,
+   *          grant?: {id: string, epoch: string}}} confirmation 四元确认
+   * @param {{timeoutMs?: number, grant?: {id: string, epoch: string}}} [opts]
+   * @returns {Promise<{ok: true, file: string, version: number, incarnation: string}>}
+   * @throws {BridgeError} -32602 / -32010 / -32007 / -32009
+   */
+  async rebaseEditing(sessionId, confirmation, opts = {}) {
+    const method = 'vscode.rebaseBaseline'
+    const fail = (reason, message, extra = {}) => new BridgeError(ERR.INVALID_PARAMS, message, {
+      method, reason, stage: 'local', ...extra,
+    })
+    if (typeof sessionId !== 'string' || sessionId === '') {
+      throw fail('session-id-required',
+        'kit.editing.rebase(sessionId, confirmation) requires a non-empty sessionId — '
+        + 'the baseline is rebuilt through the grant record of that session',
+        { got: { type: typeof sessionId } })
+    }
+    const given = isPlainObject(confirmation) ? confirmation : {}
+    if (typeof given.file !== 'string' || given.file.trim() === '') {
+      throw fail('file-required',
+        'kit.editing.rebase(...) requires confirmation.file (the document to rebase)',
+        { got: { type: typeof given.file } })
+    }
+    // 判序：`file` → `version` → `incarnation` → `contentHash`。四元都要在**本端**先验形状：
+    // 让形状问题在零发送时就报出来，而不是发到扩展侧再折成一句 anchor-mismatch。
+    if (!Number.isInteger(given.version) || given.version < 0) {
+      throw fail('version-required',
+        'kit.editing.rebase(...) requires confirmation.version as a non-negative integer '
+        + '(the TextDocument.version you actually read)',
+        { field: 'version', got: { type: typeof given.version } })
+    }
+    if (typeof given.incarnation !== 'string' || given.incarnation === '') {
+      throw fail('incarnation-required',
+        'kit.editing.rebase(...) requires confirmation.incarnation as a non-empty string '
+        + '(the incarnation you actually read: closing and reopening the editor changes it)',
+        { field: 'incarnation', got: { type: typeof given.incarnation } })
+    }
+    if (typeof given.contentHash !== 'string' || !/^[0-9a-f]{64}$/.test(given.contentHash)) {
+      throw fail('content-hash-required',
+        'kit.editing.rebase(...) requires confirmation.contentHash as 64 lowercase hex '
+        + '(shares: documentContentHash(text) from this package — the two sides must agree)',
+        { field: 'contentHash', got: { type: typeof given.contentHash } })
+    }
+
+    // 线上参数用 `expectedVersion` / `expectedIncarnation` 命名：`request()` 对写入类
+    // 必带 `expectedIncarnation`（T35），同一个锚点不该在线上出现两个名字。
+    const params = {
+      file: given.file,
+      expectedVersion: given.version,
+      expectedIncarnation: given.incarnation,
+      contentHash: given.contentHash,
+    }
+    const explicitGrant = isPlainObject(confirmation) && confirmation.grant !== undefined
+      ? confirmation.grant
+      : (isPlainObject(opts) && opts.grant !== undefined ? opts.grant : undefined)
+    if (explicitGrant !== undefined) params.grant = explicitGrant
+
+    const transport = isPlainObject(opts) ? { ...opts } : {}
+    delete transport.grant
+    delete transport.sessionId
+    return this.request(method, params, { ...transport, sessionId })
+  }
+
+  /**
    * 发放编辑授权（契约 §6.1 / §6.1.1 ①）。
    *
    * v1 最小形态（本卡定的申请流程，契约把"申请"留给协作编辑）：
@@ -1701,7 +1797,9 @@ class VscodeKit {
    * 异步（返回 Promise）：v1 起投递语义从"写进 socket 就算送达"改成了"等到回执"。
    *
    * @param {{sessionId?: string|null, windowId?: string|null, timeoutMs?: number,
-   *          allowDirtySave?: boolean}} [opts] `allowDirtySave`（T39 / 契约 §6.2.2 结论）：
+   *          allowDirtySave?: boolean}} [opts] `windowId`（T64）：**不是元数据，是约束** ——
+   *   给了就必须与承载连接（`_activeLink()` 对应那条）一致，否则 `-32014`
+   *   `reason:'target-not-routable'`，宿主零调用零帧。`allowDirtySave`（T39 / 契约 §6.2.2 结论）：
    *   允许 `vscode.save` 把**脏缓冲区**写进磁盘。★ **只属于授权方**——它在这里发放、
    *   落到 grant 记录上、随 `bridge.grant` 投递给执行端，**不许**由调用方在
    *   `params` 里自填（那等于自己给自己授权）。缺省 = 不允许（脏 = 拒）。
@@ -1709,6 +1807,7 @@ class VscodeKit {
    *                    delivered: true, ack: {ok: true, id: string}}>}
    * @throws {BridgeError} -32007 没有目标连接 / -32008 目标协议不兼容
    *   / -32004 等不到回执 / -32010 `sessionId` 缺失或形状不对（凭证无法参与会话绑定）
+   *   / -32014 `windowId` 指的不是本次授权的承载连接（`reason:'target-not-routable'`）
    *   / -32602 `allowDirtySave` 不是布尔（放宽安全门的位不收"看起来像 true"的值）
    */
   async grantEditing({ sessionId = null, windowId = null, timeoutMs, allowDirtySave } = {}) {
@@ -1757,9 +1856,44 @@ class VscodeKit {
     }
     const dirtySaveAllowed = allowDirtySave === true
 
-    const { id, epoch } = this.grants.stage({ link, sessionId, windowId, allowDirtySave: dirtySaveAllowed })
+    // ── T64：`windowId` 不是元数据，是**约束**（fail closed）───────────────
+    // 第一版把 `windowId` 原样记进记录就发出去，于是"挑对窗口 ≠ 绑对连接"：调用方
+    // 以为授权给了 A 窗口，凭证却落在 `_activeLink()`（connSeq 最大的那条）上 ——
+    // 随后 `stateFor(sessionId, file)` 才报 -32602 outside-workspace。错得太晚，
+    // 而且错在另一个模块里，排障时看不到"发凭证那一步就已经错了"。
+    // 现在在这里当场拒：**宿主零调用、零帧**（`_activeLink()` 只算本地对象，不发包）。
+    const boundWindow = this._windowIdOf(link)
+    if (windowId !== null && windowId !== undefined) {
+      // 解析复用读路径那张表（`#connSeq` / `win-NN` / `tmp-NN` / label），但拒绝的
+      // 理由必须落在 -32014：这不是"窗口不存在"，而是"你指的那条不是本次授权的
+      // 承载连接"。解析失败（不存在/有歧义）也走同一个 reason —— 对调用方而言
+      // 处置完全一样（重新挑窗口），但 `resolveReason` 保留了排障细节。
+      let targetLink = null
+      let resolveReason = null
+      try {
+        targetLink = this._resolveWindowTarget(readWindowTarget({ target: windowId }), 'bridge.grant')
+      } catch (err) {
+        resolveReason = err?.data?.reason ?? 'window-not-found'
+      }
+      if (!targetLink || targetLink !== link) {
+        throw windowTargetError('bridge.grant', windowId, 'target-not-routable', {
+          reason: 'target-not-routable',
+          granted: false,
+          boundWindow,
+          targetWindow: targetLink ? this._windowIdOf(targetLink)
+            : (typeof windowId === 'string' ? windowId : null),
+          ...(resolveReason ? { resolveReason } : {}),
+        })
+      }
+    }
+
+    // 记录里的 `windowId` 用**解析出来的规范号**（`win-NN` / `tmp-<connSeq>`），不是
+    // 调用方给的原文：铁律 12 要求 windowId 是 DSH 签发的身份，label 只是人读的别名。
+    const { id, epoch } = this.grants.stage({
+      link, sessionId, windowId: boundWindow, allowDirtySave: dirtySaveAllowed,
+    })
     const grant = {
-      id, epoch, sessionId, windowId, ...(dirtySaveAllowed ? { allowDirtySave: true } : {}),
+      id, epoch, sessionId, windowId: boundWindow, ...(dirtySaveAllowed ? { allowDirtySave: true } : {}),
     }
     const waitMs = Number.isInteger(timeoutMs) && timeoutMs > 0 ? timeoutMs : this.grantAckTimeoutMs
     let ack
@@ -1802,8 +1936,8 @@ class VscodeKit {
         `bridge.grant delivery failed: ${err?.message ?? err}`,
         { method: 'bridge.grant', reason: 'delivery-failed', granted: false })
     }
-    this.onLog?.('info', `edit grant issued (id ${id.slice(0, 8)}…, window ${windowId ?? 'n/a'})`)
-    return { id, epoch, windowId, delivered: true, ack: { ok: true, id } }
+    this.onLog?.('info', `edit grant issued (id ${id.slice(0, 8)}…, window ${boundWindow})`)
+    return { id, epoch, windowId: boundWindow, delivered: true, ack: { ok: true, id } }
   }
 
   /** @param {object} link 这条连接此刻还能承载凭证吗（活连接 + 仍被准入）。 */
@@ -1994,7 +2128,9 @@ class VscodeKit {
       link = record ? this._liveTargetOrNull(record) : null
       if (!link) {
         // 行 1（没有该会话的记录）/ 行 3（记录里的连接已死）—— 与判定表同一套 reason。
-        throw editNotBoundError(method, record ? 'target-gone' : 'no-grant', record ? 3 : 1)
+        // `missing` 同 `_resolveEventTarget`：只有真的没有有效凭证时才说缺 grant（T66-1）。
+        throw editNotBoundError(method, record ? 'target-gone' : 'no-grant', record ? 3 : 1,
+          record ? null : BINDING_MISSING.GRANT)
       }
       if (targetLink && targetLink !== link) {
         // 同一趟里"绑定的窗口"和"你指名的窗口"不是同一条连接 ⇒ 视角冲突，拒。
@@ -2351,6 +2487,17 @@ export function apply(ctx, config = {}) {
           { method: 'vscode.getDocumentState', reason: 'server-not-ready' })
       }
       return kit.editing.stateFor(sessionId, file, opts)
+    },
+    /**
+     * 基线的**人工重建**（T65）：`document-dirty` 唯一的解除通道。
+     * 同样是命令而非诊断视图 —— 未就绪抛 -32007，不返回假成功。
+     */
+    rebase: (sessionId, confirmation, opts) => {
+      if (!kit) {
+        throw new BridgeError(ERR.DISCONNECTED, 'dsh-vscode-kit is not listening yet',
+          { method: 'vscode.rebaseBaseline', reason: 'server-not-ready' })
+      }
+      return kit.editing.rebase(sessionId, confirmation, opts)
     },
   }
 

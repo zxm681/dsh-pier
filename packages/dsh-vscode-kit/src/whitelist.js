@@ -97,6 +97,11 @@ export const METHOD_TIERS = Object.freeze({
   // ── Tier 3 / 4：落盘与删除（均已实现：T39 / T40）──
   'vscode.save': 'disk-write',
   'vscode.deleteFile': TIER_DELETE,
+
+  // 基线重建（T65）：**不写盘**，但它清掉的是 `document-dirty`（`ERR.DOCUMENT_DIRTY`）那把锁 —— 谁能让一份被冻结的
+  // 缓冲区重新可写，谁就间接握住了写权限。所以档位定在**删除档**（授权控制面动作），
+  // 不是 `disk-write`：这是"能不能改动这套授权状态"的问题，不是"能不能落一次盘"。
+  'vscode.rebaseBaseline': TIER_DELETE,
 })
 
 /**

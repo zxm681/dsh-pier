@@ -25,7 +25,7 @@
  * 它**不参与放行**（墓碑命中的包一律拒绝，淘汰掉了也只是换一句 reason）。
  */
 
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { BridgeError, ERR } from './protocol.js'
 
 /**
@@ -102,11 +102,18 @@ export function assertRetireCause(cause, where = 'grant') {
  *    白名单/绑定门这一层顺带守住的，不是删除自己另加的规矩。
  *    ★ 但绑定门**不等于** tiers 白名单（`whitelist.js` 的 `delete` 档）：前者管"发给谁"，
  *    后者管"消费者被允许做多重的事"，两道都要有（契约 §6.2.5）。
+ *  - `vscode.rebaseBaseline`（T65）：**不写盘**，但它清的是 `document-dirty`（`ERR.DOCUMENT_DIRTY`）那把锁
+ *    （`document-write-policy.js` 的 taint = "这份缓冲区现在轮到别人说话"）。如果它能被
+ *    无凭证地调用，绑定门关于 applyEdit/save 的全部约束都可以用"先 rebase 再写"绕过去 ——
+ *    所以它必须和写入类走同一条门：绑 grant（`-32010`）+ T35 的 `expectedIncarnation`。
+ *    ★ 它的白名单档位是 `delete` 档（`whitelist.js`），不是 `disk-write`：这是**授权控制面**
+ *    动作，只有被授到最高档的消费者才配动它。
  */
 export const WRITE_METHODS = Object.freeze([
   'vscode.applyEdit',
   'vscode.save',
   'vscode.deleteFile',
+  'vscode.rebaseBaseline',
 ])
 
 /** @param {string} method @returns {boolean} 该方法是否属于写入类（需要绑定门） */
@@ -699,19 +706,78 @@ export function assertWritableNotNotified(method, entry = 'notify') {
 }
 
 /**
- * 造 `-32010`（data 形状对齐契约 §6.1.1：`{reason, method}` + 行号供排障）。
+ * `-32010` 的 `data.missing` 取值（T66-1）：**只补诊断，不参与判定**。
+ *
+ * 2026-10-24 真机踩过：调用方拿到 `-32010 no-grant` 时分不出"我没带 grant"还是
+ * "我没带 sessionId" —— 前者去 `kit.editing.grant()` 要凭证，后者去自己的 DSH 上下文
+ * 取会话标识，两条完全不同的下一步，却共用一句 reason。
+ *
+ * ★ **不许**让这个字段改变七行判序的先后与优先级：它只回答"按当时的判定顺序，
+ * 第一个卡住的是哪一种输入缺失"。先到先报 —— 缺 sessionId 而 grant 有效时，
+ * 卡住的仍然是会话那一关（`row 8`），不是"你反正也没带……"。
+ */
+export const BINDING_MISSING = Object.freeze({
+  GRANT: 'grant',
+  SESSION: 'session',
+  BOTH: 'both',
+})
+
+/**
+ * 从请求形状推出"缺哪一样"（诊断用，**不判**该不该拒）。
+ *
+ * @param {{grant?: any, sessionId?: string|null, checkSession?: boolean}} input
+ *   `checkSession`：这次判定是否真的比了会话（扩展侧不比会话，传 false）
+ * @returns {'grant'|'session'|'both'|null} 两样都在就是 `null`
+ */
+export function missingBinding({ grant, sessionId, checkSession = true } = {}) {
+  const noGrant = !grant || typeof grant !== 'object' || Array.isArray(grant) ||
+    !isGrantId(grant?.id) || !isGrantEpoch(grant?.epoch)
+  const noSession = checkSession &&
+    !(typeof sessionId === 'string' && sessionId !== '')
+  if (noGrant && noSession) return BINDING_MISSING.BOTH
+  if (noGrant) return BINDING_MISSING.GRANT
+  if (noSession) return BINDING_MISSING.SESSION
+  return null
+}
+
+/**
+ * 造 `-32010`（data 形状对齐契约 §6.1.1：`{reason, method, missing}` + 行号供排障）。
  *
  * @param {string} method
  * @param {string} reason
  * @param {number} [row]
+ * @param {'grant'|'session'|'both'|null} [missing] 诊断位（T66-1），`null` 时不写进 data
  * @returns {BridgeError}
  */
-export function editNotBoundError(method, reason, row) {
+export function editNotBoundError(method, reason, row, missing = null) {
   return new BridgeError(ERR.EDIT_NOT_BOUND, `edit-not-bound: ${reason} (${method})`, {
     reason,
     method,
     ...(typeof row === 'number' ? { row } : {}),
+    ...(missing === BINDING_MISSING.GRANT || missing === BINDING_MISSING.SESSION ||
+      missing === BINDING_MISSING.BOTH ? { missing } : {}),
   })
+}
+
+/**
+ * 文档内容的稳定指纹（T65 rebase 的四元之一）。
+ *
+ * 口径（两侧必须逐字一致，所以只有这一份实现）：UTF-8 编码后 **CRLF→LF 归一**，
+ * 再取 sha256 小写 hex。归一放在这里是因为"人交接"这件事跨平台发生：Windows 上人工
+ * 改动存回磁盘常带 CRLF，而 VS Code 缓冲区里是 LF —— 不归一的话，同一份内容在两台
+ * 机器上的指纹不同，四元确认就变成了"你必须在同一台机器上确认"。
+ *
+ * @param {string} text
+ * @returns {string} 64 位小写 hex
+ */
+export function documentContentHash(text) {
+  if (typeof text !== 'string') {
+    throw new BridgeError(ERR.INVALID_PARAMS,
+      'documentContentHash() needs the document text as a string',
+      { field: 'text', received: typeof text })
+  }
+  const normalized = text.replace(/\r\n/g, '\n')
+  return createHash('sha256').update(normalized, 'utf8').digest('hex')
 }
 
 /**
@@ -732,7 +798,11 @@ export function dshWriteGate(store) {
     const verdict = judgeGrant({
       store, grant: params?.grant, link, side: 'dsh', sessionId: caller?.sessionId ?? null,
     })
-    if (!verdict.ok) throw editNotBoundError(method, verdict.reason, verdict.row)
+    if (!verdict.ok) {
+      // `missing` 只按**本次实际缺的输入**填（T66-1）：先到先报，不改变判序。
+      throw editNotBoundError(method, verdict.reason, verdict.row,
+        missingBinding({ grant: params?.grant, sessionId: caller?.sessionId ?? null }))
+    }
     // 放行之后才比会话：先答"凭证/世代/连接对不对"，再答"是不是你"。
     // 记录到这一步必定是 active（上面第 7 行刚放行），查不到按 fail-closed 处理。
     const found = store.lookup(verdict.grant.id)
@@ -741,7 +811,10 @@ export function dshWriteGate(store) {
       sessionId: caller?.sessionId ?? null,
       side: 'dsh',
     })
-    if (!session.ok) throw editNotBoundError(method, session.reason, session.row)
+    if (!session.ok) {
+      throw editNotBoundError(method, session.reason, session.row,
+        missingBinding({ grant: params?.grant, sessionId: caller?.sessionId ?? null }))
+    }
   }
 }
 
@@ -774,7 +847,12 @@ export function extensionWriteGate(store, { isTrusted = null } = {}) {
     // ② 七行判定。连接死了的记录已经被 forgetLink 收成墓碑（cause=disconnected），
     //    第 3 行会给出 target-gone —— 所以这里**不需要也不允许**再比一次"活跃连接"。
     const verdict = judgeGrant({ store, grant: params?.grant, link: arrivedOn, side: 'extension' })
-    if (!verdict.ok) throw editNotBoundError(method, verdict.reason, verdict.row)
+    if (!verdict.ok) {
+      // 扩展侧不比会话（见 ③ 的说明），所以 `missing` 只可能给出 `grant`：这一侧没有
+      // 会话事实源，报 `session` 会是复述而不是诊断。会话缺失由 DSH 侧那道门负责报。
+      throw editNotBoundError(method, verdict.reason, verdict.row,
+        missingBinding({ grant: params?.grant, sessionId: null, checkSession: false }))
+    }
 
     // ③ 会话一致性**不在这一侧判**（评审 F2 的原话：不能只在扩展侧再加一份会话判断）。
     //    扩展没有独立的会话事实源：`link.authorized` 只是"token 被接受"的布尔，

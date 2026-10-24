@@ -213,7 +213,7 @@ test('★ T5 多窗口：写目标按 grant 绑定，B 后连接收不到写入�
   try {
     const A = await kit.open({ label: 'A', docVersion: A_VERSION, docIncarnation: A_INCARNATION })
     // 只有 A 在的时候发 grant → 记录里承载连接就是 A。
-    await kit.svc.editing.grant({ sessionId: S1, windowId: 'win-A' })
+    await kit.svc.editing.grant({ sessionId: S1, windowId: kit.svc.vscode.windows.list().at(-1).windowId })
 
     // B 后连（connSeq 更大 = 更"活跃"）。
     const B = await kit.open({ label: 'B', docVersion: B_VERSION, docIncarnation: B_INCARNATION })
@@ -237,7 +237,7 @@ test('★ T35 跨窗口锚点：读活跃视图 B、写会话 S1 的 A → 本�
   const kit = await withKit()
   try {
     const A = await kit.open({ label: 'A', docVersion: A_VERSION, docIncarnation: A_INCARNATION })
-    await kit.svc.editing.grant({ sessionId: S1, windowId: 'win-A' })
+    await kit.svc.editing.grant({ sessionId: S1, windowId: kit.svc.vscode.windows.list().at(-1).windowId })
     const B = await kit.open({ label: 'B', docVersion: B_VERSION, docIncarnation: B_INCARNATION })
 
     // 读路径：`request()` 的 else 分支 → `_activeLink()`（connSeq 最大）→ B。
@@ -283,7 +283,7 @@ test('★ T35 正常路径仍成功：同会话 stateFor + applyEdit，saved:fal
   try {
     // A 绑授权；B 后连、更"活跃" —— 正常路径也不许被活跃连接带偏。
     const A = await kit.open({ label: 'A', docVersion: A_VERSION, docIncarnation: A_INCARNATION })
-    await kit.svc.editing.grant({ sessionId: S1, windowId: 'win-A' })
+    await kit.svc.editing.grant({ sessionId: S1, windowId: kit.svc.vscode.windows.list().at(-1).windowId })
     const B = await kit.open({ label: 'B', docVersion: B_VERSION, docIncarnation: B_INCARNATION })
 
     const state = await kit.svc.editing.stateFor(S1, FILE)

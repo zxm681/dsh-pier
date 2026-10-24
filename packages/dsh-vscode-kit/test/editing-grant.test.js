@@ -56,6 +56,19 @@ const S2 = 'sess-beta'
 /** 某会话发放一条 grant（sessionId 走 opts，模拟消费者从自己的 DSH 上下文取）。 */
 const grantAs = (svc, sessionId = S1, opts = {}) => svc.editing.grant({ sessionId, ...opts })
 
+/**
+ * 某条连接（按连接先后，0-based）的**真实** `windowId`。
+ *
+ * T64 起 `windowId` 不再是"随便贴的标签"：它必须能解析到**承载这条 grant 的连接**，
+ * 解析不到或不一致就拒 `-32014 target-not-routable`（宿主零调用、零帧）。所以用例要给
+ * 真实值 —— 去 `windows.list()` 取，别把 `tmp-1` 这种实现推导值抄进断言。
+ */
+async function windowIdAt(svc, index = 0) {
+  const rows = await svc.vscode.windows.list()
+  assert.ok(rows[index], `window #${index} must be listed by windows.list()`)
+  return rows[index].windowId
+}
+
 /** 某会话发起一次写入（同样走 opts）。 */
 const writeAs = (svc, params, sessionId = S1, opts = {}) =>
   svc.vscode.applyEdit(params, { sessionId, ...opts })
@@ -333,7 +346,9 @@ test('写入类清单：只有登记进 WRITE_METHODS 的方法过门（读操�
   // ★ T40：`vscode.deleteFile` 是第三件，也是第一件**不可逆**的。它进这张表的后果要看清：
   //   绑定门 + `request()` 里"写入类必带 expectedIncarnation"（T35）两条同时继承，
   //   所以删除的双锚点是这张表**顺带**守住的，不是删除自己另加的规矩。
-  assert.deepEqual([...WRITE_METHODS], ['vscode.applyEdit', 'vscode.save', 'vscode.deleteFile'])
+  // T65：`vscode.rebaseBaseline` 也在表里 —— 它能清掉「脏缓冲禁写」那把锁，必须与写同门。
+  assert.deepEqual([...WRITE_METHODS],
+    ['vscode.applyEdit', 'vscode.save', 'vscode.deleteFile', 'vscode.rebaseBaseline'])
   assert.equal(isWriteMethod('vscode.applyEdit'), true)
   assert.equal(isWriteMethod('vscode.save'), true)
   assert.equal(isWriteMethod('vscode.deleteFile'), true)
@@ -429,7 +444,9 @@ test('grant：发放生成 32 hex 的 id/epoch，并以 bridge.grant 显式带 t
   const [editor] = editors
   try {
     const before = editor.count('bridge.grant')
-    const grant = await grantAs(svc, S1, { windowId: 'w-1' })
+    // T64: windowId 必须是这条连接的真实身份（挑错窗口会被拒），所以从注册表取。
+    const wid = await windowIdAt(svc, 0)
+    const grant = await grantAs(svc, S1, { windowId: wid })
     assert.match(grant.id, HEX_32, 'id 必须是 randomBytes(16) 的 32 hex')
     assert.match(grant.epoch, HEX_32, 'epoch 必须与 id 同批生成，形状一致')
     assert.equal(grant.delivered, true)
@@ -440,7 +457,7 @@ test('grant：发放生成 32 hex 的 id/epoch，并以 bridge.grant 显式带 t
     assert.equal(frame.token, server.token, 'bridge.grant 必须走 {withToken:true}')
     assert.deepEqual(frame.params.grant, {
       // 评审 F2 起 grant 必须有会话：发放时就没有会话的凭证永远不能授权写入
-      id: grant.id, epoch: grant.epoch, sessionId: S1, windowId: 'w-1',
+      id: grant.id, epoch: grant.epoch, sessionId: S1, windowId: wid,
     })
 
     assert.equal(handle.kit.grants.size, 1)
@@ -882,7 +899,7 @@ test('★ F9 没回执 = 没生效：扩展侧不回 {ok:true,id} → grant() �
 test('★ F9 回执带上 ack 形状：delivered 不再自称"发出即成功"', async () => {
   const { svc, cleanup } = await withKit(1)
   try {
-    const grant = await grantAs(svc, S1, { windowId: 'w-ack' })
+    const grant = await grantAs(svc, S1, { windowId: await windowIdAt(svc, 0) })
     assert.equal(grant.delivered, true)
     assert.deepEqual(grant.ack, { ok: true, id: grant.id },
       'delivered 的语义是"扩展侧已存档并回执"，所以 ack 必须随结果一起给出')

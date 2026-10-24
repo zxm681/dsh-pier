@@ -163,6 +163,11 @@ export function createWritePolicy(opts = {}) {
       /** 干净基线：最近一次被判为干净/自己写的版本，`undefined` 表示还没建立。 */
       baselineVersion: undefined,
       baselineIncarnation: undefined,
+      /**
+       * 基线当时那份内容的指纹（T65）。**只是证据**：`judge()` 从不读它，
+       * 它存在是为了让"人工确认的到底是哪一份内容"这件事可回溯。
+       */
+      baselineContentHash: undefined,
     }
     files.set(key, st)
     while (files.size > maxFiles) {
@@ -336,17 +341,41 @@ export function createWritePolicy(opts = {}) {
     return { settled: true, attribution, dirtyOwned: st.dirtyOwned, windowEvents }
   }
 
-  /** 干净基线（新建 grant 时由授权控制面建立）。**唯一**能清 taint 的入口。 */
+  /**
+   * 基线重建（人工交接）。**唯一**能清 taint 的入口。
+   *
+   * 两个历史阶段（别把 T65 的修订当成"顺手放宽"）：
+   *  - T62 以前：只有"新建 grant"这条路径会调它，实际零调用点 → 脏缓冲永远 `-32011`；
+   *  - T65：`vscode.rebaseBaseline`（`kit.editing.rebase`）成为**受控调用点** ——
+   *    调用方必须交出四元逐字确认（`file` + `version` + `incarnation` + `contentHash`），
+   *    扩展侧实测比对通过后才走到这里。
+   *
+   * ★ `info.dirtyOwned === true` 是**只有那条控制面**才许传的收养位：人工交接的意思是
+   *   "现在缓冲区里这份脏内容是**人确认过的**那一条基线"，所以它从此算"已知来源"，
+   *   写路径的第 ⑥ 步（`dirtyOwned !== true` → `attribution-unknown`）不再把它当成
+   *   来源不明。别处调用一律不传（缺省 `false`），保证"没人确认过的脏"永远进不来。
+   *   注意它**不越过**第 ⑤ 步：grant 上没 `allowDirtySave:true` 时，脏缓冲照样拒。
+   *
+   * 它**不写盘**，也不改 `isDirty`：基线只是"拿哪一份当起点"的记号。
+   */
   function establishBaseline(fileKey, info = {}) {
     const st = stateFor(fileKey)
     st.taint = null
-    st.dirtyOwned = false
+    st.dirtyOwned = info.dirtyOwned === true
     st.windowEvents = 0
     st.baselineVersion = info.version ?? st.lastVersion
     st.baselineIncarnation = info.incarnation ?? st.incarnation
     if (info.incarnation) st.incarnation = info.incarnation
     if (Number.isInteger(info.version)) st.lastVersion = info.version
-    return { fileKey: st.fileKey, baselineVersion: st.baselineVersion }
+    // 内容指纹只是**证据**（诊断/复核用），不参与判定：`judge()` 一个字节都不读它。
+    if (typeof info.contentHash === 'string' && info.contentHash !== '') {
+      st.baselineContentHash = info.contentHash
+    }
+    return {
+      fileKey: st.fileKey,
+      baselineVersion: st.baselineVersion,
+      baselineIncarnation: st.baselineIncarnation,
+    }
   }
 
   /**
@@ -480,6 +509,8 @@ export function createWritePolicy(opts = {}) {
       windowEvents: st.windowEvents,
       dirtyOwned: st.dirtyOwned,
       baselineVersion: st.baselineVersion,
+      baselineIncarnation: st.baselineIncarnation,
+      baselineContentHash: st.baselineContentHash,
     }
   }
 

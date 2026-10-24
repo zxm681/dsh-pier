@@ -16,7 +16,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { BridgeError, ERR } from '../../dsh-vscode-kit/src/protocol.js'
 import {
   GRANT_REASONS, editNotBoundError, extensionWriteGate, isWriteMethod,
-  grantAllowsDirtySave,
+  grantAllowsDirtySave, documentContentHash,
 } from '../../dsh-vscode-kit/src/grant.js'
 import {
   resolveWorkspaceFile, revalidateWriteTarget, assertTargetUnchanged,
@@ -56,6 +56,13 @@ export const CAPABILITIES = [
   // ★ T44：动作从"删"改成"rename 进 `<root>/.dsh-quarantine/`，永不删"。名字与门槛
   //   全部保留（外部合同不变：grant/确认/整份备份都要），但代码里**没有**删除调用。
   'vscode.deleteFile',
+  // 基线重建（T65）：**不写盘**，但它是 `-32011 document-dirty` 的唯一解除通道 ——
+  // 没有它，「人工交接后重建基线」在 v2 里只有说法没有接口，脏缓冲永远不可解除。
+  //
+  // ★ 它仍然在 `WRITE_METHODS` 里（`grant.js`）：能清 taint 等于"让一份被冻结的缓冲区
+  //   重新可写"，凭证门槛必须与 applyEdit/save 完全一样（`-32010` + T35 双锚点）。
+  // ★ 白名单档位 `delete`（授权控制面动作，见 `whitelist.js`）。
+  'vscode.rebaseBaseline',
   // 事件订阅（E3）：**观察**能力，不是写能力 —— 不进 `WRITE_METHODS`、不要求 grant，
   // 白名单档位是 `read`（`whitelist.js` 的 `METHOD_TIERS`）。
   //
@@ -2503,6 +2510,143 @@ export function createCapabilities(host, opts = {}) {
 
 
   /**
+   * vscode.rebaseBaseline（T65）—— `-32011 document-dirty` 的**唯一**解除通道。
+   *
+   * params: { file, expectedVersion, expectedIncarnation, contentHash, grant }
+   * result: { ok, file, version, incarnation }
+   *
+   * 它存在的理由：`writePolicy` 的 taint 一旦落下（有人在我们不知道的情况下改过这份
+   * 缓冲区），所有脏写都被 `-32011` 挡住，而 v2 只写了「人工交接后重建基线」这句话 ——
+   * `establishBaseline()` 全仓零调用点，于是**不可解除**。这个能力就是那句话的接口。
+   *
+   * 判序（与写路径同构，不另开一条路）：
+   *  ① 信任（dispatch 已判，这里再判一次：不受信任时连"这文件冻没冻"都不该说）；
+   *  ② 参数形状（纯同步、零宿主调用）：`file` / `expectedVersion` / `expectedIncarnation`
+   *     / `contentHash` 四元缺一即 `-32602`；
+   *  ③ 路径守卫（与 applyEdit/save 同一套：单根、工作区内、真路径、链上无链接）；
+   *  ④ 同文件排队（与写共用一条链 —— 否则"读状态 → 确认"之间能插进一次写）；
+   *  ⑤ 实测：`version` / `incarnation` / `contentHash` 必须与**此刻**的事实逐字一致，
+   *     任一不符 → `-32602 reason:'rebase-anchor-mismatch'`，**taint 原样保留**；
+   *  ⑥ 执行前复核凭证（`grantGate`，与 save/applyEdit 同一位置、同一理由）；
+   *  ⑦ `establishBaseline(...)`：只挪基线，**一个字节都不写盘**。
+   *
+   * ★ `contentHash` 用 `documentContentHash(text)`（kit `grant.js` 唯一实现，CRLF→LF 归一
+   *   后取 sha256）—— 两侧各算一份必然漂移，那正是"人工确认"变成"大概确认"的入口。
+   * ★ 文本超限（> 8 MiB）或宿主没给正文 → **拒**（`reason:'content-hash-unavailable'`）：
+   *   证不出内容就别清 taint，宁可让人先缩小文件或另想办法，也不许"版本号对了就放行"。
+   */
+  async function rebaseBaseline(params, ctx) {
+    const method = 'vscode.rebaseBaseline'
+    assertTrusted(method)
+
+    // ── ② 参数形状（纯同步，零宿主调用）──
+    const file = params?.file
+    if (typeof file !== 'string' || file.trim() === '') {
+      throw new BridgeError(ERR.INVALID_PARAMS, 'params.file must be a non-empty string', { method })
+    }
+    const expectedVersion = readExpectedVersion(params, method)
+    const expectedIncarnation = readExpectedIncarnation(params, method)
+    const claimedHash = params?.contentHash
+    if (typeof claimedHash !== 'string' || !/^[0-9a-f]{64}$/.test(claimedHash)) {
+      throw new BridgeError(ERR.INVALID_PARAMS,
+        'params.contentHash must be 64 lowercase hex (sha256 of the document text, CRLF→LF '
+        + 'normalised; see documentContentHash in dsh-vscode-kit)',
+        { method, field: 'contentHash', got: { type: typeof claimedHash } })
+    }
+
+    // ── ③ 路径守卫（与写路径同一套证明）──
+    const { abs, real } = resolveWorkspaceFile(file, host.workspaceRoots(), { method })
+
+    // ── ④ 同文件排队（与 applyEdit/save 共用一条链）──
+    return serializeByPath(serializeKeyFor(real), async () => {
+      const policyKey = serializeKeyFor(real)
+
+      // ── ⑤ 实测（**只信宿主此刻给的事实**，不采信入参）──
+      const state = await readDocumentState(host, real, { includeText: true }, method)
+      if (typeof state.text !== 'string') {
+        throw new BridgeError(ERR.INVALID_PARAMS,
+          `cannot confirm the content of ${canonicalPath(abs)}: the host did not return its `
+          + 'text, so the content hash cannot be verified; the baseline is not rebuilt',
+          {
+            method,
+            file: canonicalPath(abs),
+            reason: 'content-hash-unavailable',
+            byteLength: Number.isInteger(state.byteLength) ? state.byteLength : null,
+            taintKept: true,
+          })
+      }
+      if (Number.isInteger(state.byteLength) && state.byteLength > MAX_TEXT_BYTES) {
+        throw new BridgeError(ERR.INVALID_PARAMS,
+          `cannot confirm the content of ${canonicalPath(abs)}: it is ${state.byteLength} bytes, `
+          + `over the ${MAX_TEXT_BYTES}-byte text limit, so the content hash cannot be verified; `
+          + 'the baseline is not rebuilt',
+          {
+            method,
+            file: canonicalPath(abs),
+            reason: 'content-hash-unavailable',
+            byteLength: state.byteLength,
+            maxTextBytes: MAX_TEXT_BYTES,
+            taintKept: true,
+          })
+      }
+
+      const actualHash = documentContentHash(state.text)
+      const actualIncarnation = typeof state.incarnation === 'string' ? state.incarnation : null
+      const mismatch = []
+      if (state.version !== expectedVersion) mismatch.push('version')
+      if (actualIncarnation === null || actualIncarnation !== expectedIncarnation) {
+        mismatch.push('incarnation')
+      }
+      if (actualHash !== claimedHash) mismatch.push('contentHash')
+      if (mismatch.length > 0) {
+        // 四元确认失败 = 调用方手里的那份"我以为的现状"已经过期：**这不是可以重试的
+        // 版本冲突，也不能自动重发**（重发只会把同一组过期锚点再送一次）。taint 不动。
+        throw new BridgeError(ERR.INVALID_PARAMS,
+          `rebase confirmation does not match the document (${mismatch.join(', ')}); `
+          + 'read the state again and confirm the fresh anchors — the dirty baseline was not '
+          + 'rebuilt',
+          {
+            method,
+            file: canonicalPath(abs),
+            reason: 'rebase-anchor-mismatch',
+            mismatch,
+            actual: {
+              version: state.version,
+              incarnation: actualIncarnation,
+              contentHash: actualHash,
+            },
+            isDirty: state.isDirty === true,
+            taintKept: true,
+            retryable: false,
+          })
+      }
+
+      // ── ⑥ 执行前复核凭证（与 save ⑦ / applyEdit 同一位置）──
+      grantGate(method, params, ctx)
+
+      // ── ⑦ 只挪基线，不写盘 ──
+      // `dirtyOwned:true`：人工交接的意思是"这份脏内容就是人确认过的那一条基线"，
+      // 所以它从此算已知来源（见 `establishBaseline` 的说明）。第 ⑤ 步（grant 的
+      // `allowDirtySave`）仍然独立成立 —— 没那个位，脏缓冲照样写不动。
+      const baseline = writePolicy.establishBaseline(policyKey, {
+        version: state.version,
+        incarnation: actualIncarnation,
+        contentHash: actualHash,
+        dirtyOwned: true,
+      })
+      log(`rebaseBaseline: ${abs} v${state.version} baseline rebuilt `
+        + `(was v${baseline.baselineVersion ?? 'n/a'}, dirty=${state.isDirty === true})`)
+      return {
+        ok: true,
+        file: canonicalPath(abs),
+        version: state.version,
+        incarnation: actualIncarnation,
+      }
+    })
+  }
+
+
+  /**
    * vscode.events.subscribe（E3）
    * params: { type?|types?, files?, textMode?, windowId?, sessionId?, consumer? }
    * result: { ok, subscriptionId, streamEpoch, startSeq, cursor{...}, subscription{...} }
@@ -2539,6 +2683,7 @@ export function createCapabilities(host, opts = {}) {
     'vscode.getDocumentState': getDocumentState,
     'vscode.save': save,
     'vscode.deleteFile': deleteFile,
+    'vscode.rebaseBaseline': rebaseBaseline,
     'vscode.events.subscribe': subscribeEvents,
     'vscode.events.unsubscribe': unsubscribeEvents,
   }

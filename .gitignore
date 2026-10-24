@@ -26,3 +26,9 @@ work/t4[0-9]-source-before.sha256
 
 # T57 变异证据（备份副本/tap 日志，不入库）
 work/t5*-mutation/
+
+# T62/T63/T66 临时产物（变异备份、兼容补丁、冷启动探针输出，不入库）
+work/t6[0-9]-backup/
+work/t6[0-9]-mutation/
+work/t6[0-9]-coldstart/
+work/t6[0-9]-patch-*.py
