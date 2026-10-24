@@ -32,3 +32,10 @@ work/t6[0-9]-backup/
 work/t6[0-9]-mutation/
 work/t6[0-9]-coldstart/
 work/t6[0-9]-patch-*.py
+
+# T68 测试夹具（测试在 work/ 下建 mkdtemp 目录）与临时产物
+work/t6[0-9]-fixtures/
+work/t68-*.snapshot
+work/t68-extension.cjs
+work/t68-createFile-close-probe.txt
+work/t68-readme.diff

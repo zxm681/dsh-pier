@@ -307,6 +307,22 @@ const RESPONSE_CONTRACTS = Object.freeze({
    *   `backup.delivered===true` 显式声明"我交出来了"。做不到就该是一次失败
    *   （`-32603 reason:'backup-undeliverable'`），而不是一次"归档了但没材料"的成功。
    */
+  'vscode.createFile': {
+    expected: 'object with created===true, file:string(non-empty), bytes:int>=0, disk:{mtime:int>=0,size:int>=0}',
+    fields: [
+      ['created', (v) => v === true, 'created===true'],
+      ['file', isNonEmptyString, 'file:string(non-empty)'],
+      ['bytes', isIntegerAtLeast(0), 'bytes:int>=0'],
+      ['disk', isObject, 'disk:object'],
+      ['disk.mtime', isIntegerAtLeast(0), 'disk.mtime:int>=0'],
+      ['disk.size', isIntegerAtLeast(0), 'disk.size:int>=0'],
+    ],
+    consistency: [
+      [(r) => r.disk.size === r.bytes, 'disk.size === bytes'],
+      [(r) => !Object.hasOwn(r, 'overwritten') && !Object.hasOwn(r, 'replaced'), 'no overwrite/replacement receipt'],
+    ],
+  },
+
   'vscode.deleteFile': {
     expected: "object with quarantined===true, file:string(non-empty), from:string(non-empty), "
       + 'to:string(non-empty), confirmedSha256:64-hex, confirmedByteLength:int>=0, '

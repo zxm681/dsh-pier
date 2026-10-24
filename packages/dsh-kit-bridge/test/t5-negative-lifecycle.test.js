@@ -411,7 +411,7 @@ test('★ T5 Q4 删除/改名/写文件能力仍不存在：deleteFile/renameFil
     assert.deepEqual([...CAPABILITIES], [
       'vscode.openFile', 'vscode.getSelection', 'vscode.getDiagnostics',
       'vscode.listOpenEditors', 'vscode.applyEdit', 'vscode.getDocumentState',
-      'vscode.save', 'vscode.deleteFile', 'vscode.rebaseBaseline',
+      'vscode.save', 'vscode.createFile', 'vscode.deleteFile', 'vscode.rebaseBaseline',
       'vscode.events.subscribe', 'vscode.events.unsubscribe',
     ])
     const own = Object.keys(e.caps.handlers)

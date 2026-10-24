@@ -110,7 +110,12 @@ test('★ T44 宿主面**没有**删除方法，src/ 里也没有任何删除调
   const files = readdirSync(SRC).filter((f) => f.endsWith('.js')).sort()
   assert.ok(files.length > 3, `src/ 里只扫到 ${files.length} 个文件，检查目录`)
   for (const file of files) {
-    const hit = forbidden.exec(stripComments(readFileSync(join(SRC, file), 'utf8')))
+    let source = stripComments(readFileSync(join(SRC, file), 'utf8'))
+    // T68 唯一窄口由跨 packages 的专用静态门逐点检查，其余禁令不变。
+    if (file === 'vscode-host.js') {
+      source = source.replace(/async function removeCreatedInThisCall\(absPath, identity\) \{[\s\S]*?\n\}/, '')
+    }
+    const hit = forbidden.exec(source)
     assert.equal(hit, null, `${file} 里出现了删除调用：${hit?.[0]}（T44：能力不许删任何字节）`)
   }
 })

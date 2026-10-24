@@ -22,6 +22,7 @@ import {
   windowsFilePath,
 } from './windows.js'
 import { validateResponse } from './response-contract.js'
+import { createFileBytes } from './create-file.js'
 import {
   GrantStore, GRANT_REASONS, GRANT_TOMBSTONE_LIMIT, WRITE_METHODS, isWriteMethod,
   judgeGrant, judgeSession, dshWriteGate, editNotBoundError, rejectParamsSessionId,
@@ -577,6 +578,7 @@ function boundFacade(getKit, consumer, host) {  const readyErr = (method) => new
           const kit = getKit()
           return kit ? kit.saveAs(consumer, args) : Promise.reject(readyErr('vscode.save'))
         },
+        createFile: (params, opts) => request('vscode.createFile', params, opts),
         // 归档（T40 / Tier 4；T44 起语义是**移入隔离区，永不删**）：与 `save` 同一条路。
         // **不可逆的是"移动"，不是"销毁"** —— 所以本端要多做一件事：线路超时垫长到 180s
         // （要盖住人看确认框的时间）。返回体里没有 `deleted`/`trashed`：这条能力不销毁
@@ -774,6 +776,7 @@ class VscodeKit {
       //   save(file, { expectedVersion, expectedIncarnation, expectedDisk, grant?, ... })
       //   save({ file, expectedVersion, expectedIncarnation, expectedDisk, grant? }, opts?)
       save: (...args) => this.saveAs(HOST_CONSUMER, args),
+      createFile: (params, opts) => this.request('vscode.createFile', params, opts),
       // Tier 4 删除（T40）：形态与 `save` 完全一致（同一套本地闸门 + 同一组锚点），
       // 区别只在**执行端多两道闸**（人工确认 + 内容快照）与**请求级超时更宽**。
       //   deleteFile(file, { expectedVersion, expectedIncarnation, expectedDisk, grant?, timeoutMs? })
@@ -2198,7 +2201,9 @@ class VscodeKit {
     // 位置有意排在 `_writeGate` **之后**：授权绑定门（-32010）的判定序是契约 §6.1.1 ①-c
     // 的七行，不能被参数形状门抢到前面去（那会让"没有授权"错报成"参数错"）。
     // 但仍在 `link.request` **之前** ⇒ 抛在这里 = 一个字节都没发出去（与 expectedVersion 同族）。
-    if (write) assertLocalExpectedIncarnation(method, wireParams)
+    // T68：新建对象此前没有文档实例；其锚点是显式 expectedDisk:null，而不是虚构化身。
+    if (method === 'vscode.createFile') createFileBytes(wireParams, { stage: 'local' })
+    else if (write) assertLocalExpectedIncarnation(method, wireParams)
 
     // ★ E3：**观察钩子**（只读、只告知）。事件订阅要在"最终选中的这条连接"上装流，
     //   而这个事实只有这里知道。它**不参与选路**：拿到的是已经选完的 link，
@@ -2431,6 +2436,7 @@ export function apply(ctx, config = {}) {
     save: (...args) => (kit
       ? kit.saveAs(UNBOUND_CONSUMER, args)
       : notReady('vscode.save')),
+    createFile: (params, opts) => requestUnbound('vscode.createFile', params, opts),
     // 删除（T40 / Tier 4）：两处都加。未绑定身份 ⇒ 白名单最高档 `delete` 先拒
     // （`consumer-unbound`），**连确认框都不会弹** —— 这是有意的：不可逆动作不接受
     // "先试一下看看"。

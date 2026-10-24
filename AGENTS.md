@@ -37,6 +37,11 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
     `unlink`/`rm`/`copyFile` 调用（`test/t40-host-surface.test.js` 有静态守门）。
     要改删除语义（真删、走回收站、加 `restore`）**必须在 commit message 里写明改了什么、为什么**，
     否则下一轮评审会把它当成偷偷加回来的 `unlink`。
+    **唯一例外（T68）**：`vscode-host.js` 的 `removeCreatedInThisCall(absPath, identity)`
+    允许一处 `unlink`，因为它只回收**本次调用自己刚创建、此前不存在的对象**，不是用户数据。
+    三个前提缺一不可：仅在本调用 createFile 的失败路径（先 close）；删前 lstat 的 `(dev,ino)`
+    与创建时 fstat 的 `(dev,ino)` 完全一致（不一致不删，返回 `identity-changed`）；全仓源码
+    单调用点，并由 `test/t68-unlink-surface.test.js` 静态守门。除此之外任何删除限制均不放宽。
 
 12. **连接序不是身份**。`windowId` 与 `connSeq` 必须分字段、禁止互相比；前者由 DSH 按指纹签发/复用，后者仅表示本进程连接先后。
     `target` **只影响读路径**：写路径带 target 一律 `-32014 target-not-routable`，在 `_bindWriteTarget` 前拒绝；写目标永远由 grant 记录的 link 决定。
@@ -66,13 +71,13 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
 ## 验证门槛（声称完成前必须全绿）
 
 ```bash
-cd packages/dsh-vscode-kit && node --test --test-concurrency=1 "test/*.test.js"   # 290（或 npm test）
-cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 271
+cd packages/dsh-vscode-kit && node --test --test-concurrency=1 "test/*.test.js"   # 299（或 npm test）
+cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 295
 cd packages/dsh-kit-demo   && node --test "test/*.test.js"   # 9
 cd packages/dsh-kit-bridge && node scripts/e2e.mjs           # 22
 ```
 
-条数是**实跑的 `pass` 计数**（协调者复跑 2026-10-25（含 T66 收尾）：kit 290 / bridge 271 / demo 9 / E2E 22，原始输出见 `work/t67-收尾文档.md`），加测试就得回来改这几行。
+条数是**实跑的 `pass` 计数**（T68 本轮：kit 299 / bridge 295 / demo 9 / E2E 22；相对 T67 的 290 / 271 / 9 / 22 新增 33 条，原始输出与变异证据见 `work/t68-createFile.md`），加测试就得回来改这几行。
 （T54 那轮的同一门槛是 kit 213 / bridge 156 / demo 9 / E2E 22；那些数字只对当时的用例集成立，别拿它判断今天。）
 
 **kit 必须串行执行**（包内 `npm test` 同样使用 `node --test --test-concurrency=1 "test/*.test.js"`）。

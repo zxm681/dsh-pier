@@ -112,6 +112,7 @@ export function assertRetireCause(cause, where = 'grant') {
 export const WRITE_METHODS = Object.freeze([
   'vscode.applyEdit',
   'vscode.save',
+  'vscode.createFile', // T68：不存在文档，仍须 grant 绑定；不要求文档版本/化身锚点。
   'vscode.deleteFile',
   'vscode.rebaseBaseline',
 ])

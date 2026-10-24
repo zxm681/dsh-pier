@@ -23,7 +23,7 @@
  *     本函数的 `root` 返回值就是**字面根**（已证明链上无链接），不是 realpath 的产物。
  *  4. 证明不了根安全就**失败闭合**：任何拒绝路径都不得触碰写宿主（由调用方保证
  *     「先 resolve 再 applyEdit」，本函数绝不 `stat` 之外的副作用）。
- *  5. 文件必须存在（不新建 —— 新建是 T4 的活）。
+ *  5. 默认文件必须存在；T68 `forCreate:true` 仅允许末段缺失，父目录仍须存在。
  *
  * ⚠️ **本模块能证明什么、不能证明什么**（评审 R2-1 ③——照实写，别当成已解决）：
  *
@@ -120,7 +120,7 @@ function splitAtVolume(target) {
  */
 function firstLinkInChain(fs, from, segments, { method, abs, onMissing }) {
   let cursor = from
-  for (const seg of segments) {
+  for (const [index, seg] of segments.entries()) {
     cursor = path.join(cursor, seg)
     let st
     try {
@@ -128,6 +128,11 @@ function firstLinkInChain(fs, from, segments, { method, abs, onMissing }) {
     } catch (err) {
       if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
         if (onMissing === 'ignore') return null
+        if (onMissing === 'create' && err.code === 'ENOENT' && index === segments.length - 1) return null
+        if (onMissing === 'create' || onMissing === 'parent') {
+          throw new BridgeError(ERR.INVALID_PARAMS, `parent directory does not exist: ${abs}`,
+            { method, path: abs, reason: 'parent-missing' })
+        }
         throw new BridgeError(ERR.NOT_FOUND, `file not found: ${abs}`, { method, path: abs })
       }
       throw new BridgeError(ERR.INTERNAL, `cannot stat ${cursor}: ${err?.message ?? err}`,
@@ -169,6 +174,7 @@ function stripLongPrefix(p) {
  * @param {object} [opts]
  * @param {typeof fsSync} [opts.fs] 注入 fs（测试用；默认真 fs）
  * @param {string} [opts.method]    报错里带的方法名
+ * @param {boolean} [opts.forCreate] 仅 createFile 使用：允许末段缺失，不创建任何目录。
  * @param {string} [opts.nonFileReason] 目标存在但**不是普通文件**时 `data.reason` 的取值
  *   （默认 `'not-a-file'`）。`vscode.deleteFile` 传 `'recursive-delete-unsupported'`：
  *   契约 §6.2.4 ③ 要求删除对目录给专用理由 —— 处置不同（`not-a-file` = "这里只能写文件"，
@@ -210,13 +216,15 @@ export function resolveWorkspaceFile(file, roots, opts = {}) {
   //    这里不用 realpath 判：realpath 会把 junction 的目标当成新根，正好把漏洞放行。
   //    链上有任何链接 → 根不安全 → 拒（不得退化成「解析后仍在内就放行」）。
   const rootChain = splitAtVolume(root)
-  if (firstLinkInChain(fs, rootChain.vol, rootChain.segments, { method, abs }) !== null) {
+  if (firstLinkInChain(fs, rootChain.vol, rootChain.segments,
+    { method, abs, onMissing: opts.forCreate ? 'parent' : undefined }) !== null) {
     throw outsideError(method, abs, 'link-root')
   }
 
   // ── ③ 根之下的每一段：任何一段是链接就拒 ──
   const relSegs = path.relative(root, abs) === '' ? [] : path.relative(root, abs).split(path.sep)
-  if (firstLinkInChain(fs, root, relSegs, { method, abs }) !== null) {
+  if (firstLinkInChain(fs, root, relSegs,
+    { method, abs, onMissing: opts.forCreate ? 'create' : undefined }) !== null) {
     throw outsideError(method, abs, 'symlink')
   }
 
@@ -230,7 +238,21 @@ export function resolveWorkspaceFile(file, roots, opts = {}) {
   //      ② 符号链接 / junction：③ 的逐段 lstat 已经抛 `reason:'symlink'`，到不了这里；
   //      ③ 卷别名 `\\localhost\C$\…` 不是同一条根链，判 `outside-workspace`。
   //    所以本段只回答一件事：realpath 之后的段名与调用方写法对不上 = 别名 → 拒。
-  const real = stripLongPrefix(realpathOf(fs, abs, method, abs))
+  // createFile 只允许末段缺失；父目录仍走同一根链、别名和 realpath 校验。
+  let candidate = abs
+  let missingLeaf = false
+  if (opts.forCreate) {
+    try { fs.lstatSync(abs) } catch (err) {
+      if (err?.code !== 'ENOENT') {
+        if (err?.code === 'ENOTDIR') throw outsideError(method, abs, 'parent-missing')
+        throw new BridgeError(ERR.INTERNAL, `cannot stat ${abs}: ${err?.message ?? err}`, { method, path: abs })
+      }
+      missingLeaf = true
+      candidate = path.dirname(abs)
+    }
+  }
+  const resolved = stripLongPrefix(realpathOf(fs, candidate, method, abs))
+  const real = missingLeaf ? path.join(resolved, path.basename(abs)) : resolved
   const realChain = splitAtVolume(real)
   const absChain = splitAtVolume(abs)
   if (realChain.vol !== absChain.vol
@@ -250,6 +272,8 @@ export function resolveWorkspaceFile(file, roots, opts = {}) {
   if (!isInside(real, root)) {
     throw outsideError(method, abs, 'realpath-escaped')
   }
+
+  if (opts.forCreate) return { abs, real, root }
 
   let st
   try {

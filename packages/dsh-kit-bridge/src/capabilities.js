@@ -12,11 +12,12 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto'
+import { createFileBytes } from '../../dsh-vscode-kit/src/create-file.js'
 
 import { BridgeError, ERR } from '../../dsh-vscode-kit/src/protocol.js'
 import {
   GRANT_REASONS, editNotBoundError, extensionWriteGate, isWriteMethod,
-  grantAllowsDirtySave, documentContentHash,
+  grantAllowsDirtySave, documentContentHash, missingBinding,
 } from '../../dsh-vscode-kit/src/grant.js'
 import {
   resolveWorkspaceFile, revalidateWriteTarget, assertTargetUnchanged,
@@ -48,6 +49,7 @@ export const CAPABILITIES = [
   //    `expectedDisk` 来自它**自己观察到的那次 stat**（同机文件，读它不需要本通道）；
   //    把它开成能力等于多一条"任何人都能读任意路径元数据"的面，收益为零。
   'vscode.save',
+  'vscode.createFile', // T68：disk-write，排他新建，不覆盖、不建父目录。
   // Tier 4 删除（T40；T44 把语义改成"移入隔离区，永不删"）。写能力，必须走绑定门，
   // 白名单档位是最高档 `delete`（`whitelist.js` 的 `METHOD_TIERS` 早已登记）。
   //
@@ -1206,8 +1208,10 @@ export function createCapabilities(host, opts = {}) {
    */
   const grantGate = opts.grantGate ?? (grants
     ? extensionWriteGate(grants, { isTrusted })
-    : (method) => {
-        if (isWriteMethod(method)) throw editNotBoundError(method, GRANT_REASONS.NO_GRANT, 1)
+    : (method, params) => {
+        if (isWriteMethod(method)) throw editNotBoundError(method, GRANT_REASONS.NO_GRANT, 1,
+          method === 'vscode.createFile'
+            ? missingBinding({ grant: params?.grant, checkSession: false }) : null)
       })
 
   /** 所有能力共用的前置检查：工作区信任。 */
@@ -2646,6 +2650,29 @@ export function createCapabilities(host, opts = {}) {
   }
 
 
+  /** T68：新文件没有缓冲区，不打开文档，也不进入脏态门。 */
+  async function createFile(params, ctx) {
+    const method = 'vscode.createFile'
+    assertTrusted(method)
+    const bytes = createFileBytes(params)
+    const checked = resolveWorkspaceFile(params?.file, host.workspaceRoots(), { method, forCreate: true })
+    return serializeByPath(serializeKeyFor(checked.real), async () => {
+      grantGate(method, params, ctx)
+      // 排队可能让出了时间；紧贴写宿主再复用同一守卫。存在性由 wx 原子判。
+      const { real } = resolveWorkspaceFile(checked.abs, host.workspaceRoots(), { method, forCreate: true })
+      if (typeof host.createFileExclusive !== 'function') {
+        throw new BridgeError(ERR.INTERNAL, 'host does not implement createFileExclusive',
+          { method, hostField: 'createFileExclusive' })
+      }
+      const result = await host.createFileExclusive(real, bytes)
+      if (result?.created !== true || !Number.isInteger(result?.disk?.mtime) || result.disk.mtime < 0
+        || result.disk.size !== bytes.length) {
+        throw new BridgeError(ERR.INVALID_RESPONSE, 'host returned an invalid createFile receipt', { method })
+      }
+      return { created: true, file: canonicalPath(checked.abs), bytes: bytes.length, disk: result.disk }
+    })
+  }
+
   /**
    * vscode.events.subscribe（E3）
    * params: { type?|types?, files?, textMode?, windowId?, sessionId?, consumer? }
@@ -2682,6 +2709,7 @@ export function createCapabilities(host, opts = {}) {
     'vscode.applyEdit': applyEdit,
     'vscode.getDocumentState': getDocumentState,
     'vscode.save': save,
+    'vscode.createFile': createFile,
     'vscode.deleteFile': deleteFile,
     'vscode.rebaseBaseline': rebaseBaseline,
     'vscode.events.subscribe': subscribeEvents,

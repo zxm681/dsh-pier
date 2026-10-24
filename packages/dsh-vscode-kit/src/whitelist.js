@@ -96,6 +96,7 @@ export const METHOD_TIERS = Object.freeze({
 
   // ── Tier 3 / 4：落盘与删除（均已实现：T39 / T40）──
   'vscode.save': 'disk-write',
+  'vscode.createFile': 'disk-write',
   'vscode.deleteFile': TIER_DELETE,
 
   // 基线重建（T65）：**不写盘**，但它清掉的是 `document-dirty`（`ERR.DOCUMENT_DIRTY`）那把锁 —— 谁能让一份被冻结的

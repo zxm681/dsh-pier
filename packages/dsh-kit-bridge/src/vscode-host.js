@@ -6,7 +6,8 @@
  */
 
 import path from 'node:path'
-import { existsSync, statSync, readFileSync, promises as fsp } from 'node:fs'
+import { existsSync, statSync, readFileSync } from 'node:fs'
+import fsp from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 
 import * as vscode from 'vscode'
@@ -17,6 +18,27 @@ import { createCapabilities } from './capabilities.js'
 import { applyEditAtomically } from './edit-transaction.js'
 import { isInside, samePath } from './workspace-paths.js'
 import { canonicalPath } from '../../dsh-vscode-kit/src/paths.js'
+
+/** T68 唯一删除窄口：仅回收本次 wx 创建的对象；身份不可证明就宁留残件。 */
+async function removeCreatedInThisCall(absPath, identity) {
+  if (!identity) return { removed: false, reason: 'identity-unavailable' }
+  let current
+  try {
+    current = await fsp.lstat(absPath, { bigint: true })
+  } catch (err) {
+    if (err?.code === 'ENOENT') return { removed: false, reason: 'already-absent' }
+    return { removed: false, reason: 'cleanup-failed', hostCode: err?.code ?? 'unknown' }
+  }
+  if (current.dev !== identity.dev || current.ino !== identity.ino) {
+    return { removed: false, reason: 'identity-changed' }
+  }
+  try {
+    await fsp.unlink(absPath)
+    return { removed: true }
+  } catch (err) {
+    return { removed: false, reason: 'cleanup-failed', hostCode: err?.code ?? 'unknown' }
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 文档化身（incarnation，T34）：每个 `TextDocument` **实例**一个不透明身份
@@ -512,6 +534,55 @@ export function createHost(output) {
     return { choice: picked === accept ? 'delete' : 'not-confirmed' }
   }
 
+  /** T68：线性化点是 open(wx) 成功；不用 provider 的覆盖式写入。 */
+  async function createFileExclusive(absPath, bytes) {
+    let handle
+    let identity
+    let closed = false
+    try {
+      handle = await fsp.open(absPath, 'wx')
+      const initial = await handle.stat({ bigint: true })
+      identity = { dev: initial.dev, ino: initial.ino }
+      let offset = 0
+      while (offset < bytes.length) {
+        const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset, offset)
+        if (!Number.isInteger(bytesWritten) || bytesWritten <= 0) {
+          throw Object.assign(new Error('write made no progress'), { code: 'EIO' })
+        }
+        offset += bytesWritten
+      }
+      await handle.sync()
+      await handle.close()
+      closed = true
+      const st = await fsp.lstat(absPath, { bigint: true })
+      if (st.dev !== identity.dev || st.ino !== identity.ino || st.size !== BigInt(bytes.length)) {
+        throw Object.assign(new Error('created file changed before receipt'), { code: 'IDENTITY_CHANGED' })
+      }
+      return { created: true, disk: { mtime: Number(st.mtimeMs), size: Number(st.size) } }
+    } catch (err) {
+      let closeCode
+      let cleanup
+      if (handle) {
+        // open 已成功之后的所有异常：先尝试 close，再进入唯一清理窄口。
+        if (!closed) {
+          try { await handle.close() } catch (closeErr) { closeCode = closeErr?.code ?? 'unknown' }
+        }
+        cleanup = await removeCreatedInThisCall(absPath, identity)
+      }
+      const hostCode = err?.code ?? 'unknown'
+      const reason = !handle && hostCode === 'EEXIST' ? 'exists'
+        : !handle && (hostCode === 'ENOENT' || hostCode === 'ENOTDIR') ? 'parent-missing'
+          : 'create-failed'
+      throw new BridgeError(reason === 'exists' ? ERR.DISK_STATE_CONFLICT
+        : reason === 'parent-missing' ? ERR.INVALID_PARAMS : ERR.INTERNAL,
+      `cannot create ${absPath}: ${err?.message ?? err}`, {
+        method: 'vscode.createFile', file: canonicalPath(absPath), reason, hostCode,
+        ...(cleanup ? { cleanup } : {}), ...(closeCode ? { closeCode } : {}),
+        retryable: false,
+      })
+    }
+  }
+
   /**
    * 建目录（T44）：`workspace.fs.createDirectory`。**幂等** —— 已存在也算成功，
    * 所以归档前无脑调一次，不必先 stat 再决定要不要建。
@@ -761,6 +832,7 @@ export function createHost(output) {
     applyEditText,
     readDiskStat,
     saveDocument,
+    createFileExclusive,
     // T40 / Tier 4：归档三件套（读字节 → 问人 → 移进隔离区）。
     // ★ T44：这里**没有**任何删除方法 —— 宿主面不再暴露"删文件"这件事（
     //   `test/t40-host-surface.test.js` 有静态断言守着，别再把 delete 加回来）。

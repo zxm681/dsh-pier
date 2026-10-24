@@ -348,7 +348,7 @@ test('写入类清单：只有登记进 WRITE_METHODS 的方法过门（读操�
   //   所以删除的双锚点是这张表**顺带**守住的，不是删除自己另加的规矩。
   // T65：`vscode.rebaseBaseline` 也在表里 —— 它能清掉「脏缓冲禁写」那把锁，必须与写同门。
   assert.deepEqual([...WRITE_METHODS],
-    ['vscode.applyEdit', 'vscode.save', 'vscode.deleteFile', 'vscode.rebaseBaseline'])
+    ['vscode.applyEdit', 'vscode.save', 'vscode.createFile', 'vscode.deleteFile', 'vscode.rebaseBaseline'])
   assert.equal(isWriteMethod('vscode.applyEdit'), true)
   assert.equal(isWriteMethod('vscode.save'), true)
   assert.equal(isWriteMethod('vscode.deleteFile'), true)
