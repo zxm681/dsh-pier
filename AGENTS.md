@@ -66,21 +66,24 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
 ## 验证门槛（声称完成前必须全绿）
 
 ```bash
-cd packages/dsh-vscode-kit && node --test --test-concurrency=1 "test/*.test.js"   # 213（或 npm test）
-cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 156
+cd packages/dsh-vscode-kit && node --test --test-concurrency=1 "test/*.test.js"   # 290（或 npm test）
+cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 271
 cd packages/dsh-kit-demo   && node --test "test/*.test.js"   # 9
 cd packages/dsh-kit-bridge && node scripts/e2e.mjs           # 22
 ```
 
-条数是**实跑的 `pass` 计数**（T54：kit 213 / bridge 156 / demo 9 / E2E 22），加测试就得回来改这几行。
+条数是**实跑的 `pass` 计数**（协调者复跑 2026-10-25（含 T66 收尾）：kit 290 / bridge 271 / demo 9 / E2E 22，原始输出见 `work/t67-收尾文档.md`），加测试就得回来改这几行。
+（T54 那轮的同一门槛是 kit 213 / bridge 156 / demo 9 / E2E 22；那些数字只对当时的用例集成立，别拿它判断今天。）
 
 **kit 必须串行执行**（包内 `npm test` 同样使用 `node --test --test-concurrency=1 "test/*.test.js"`）。
-14 个测试文件并行启动多实例，共用默认 7410–7419 的 10 个端口；端口区间争用是 flaky 的根因推断，串行化是测试门缓解，不是产品修复。
+**19 个测试文件**并行启动多实例，共用默认 7410–7419 的 10 个端口（`src/server.js:35` 的 `DEFAULT_PORT_RANGE`；`:67-88` 取不到空口就 throw `no free port in range`，只有 `test/server.test.js:333-350` 显式传别的区间）。
+端口区间争用是 flaky 的根因推断，串行化是测试门缓解，不是产品修复。
 **并行执行会偶发红，别当成产品 bug**（若串行仍红，必须继续排查，不得套用此解释）。用户观测 5 次中两次分别 3 红、11 红；
-T54 在 Node v24.20.0 复现三次并行：`tests/pass/fail = 213/210/3、213/202/11、213/213/0`，串行基线 `213/213/0`。
+并行下的红长这样，两种形态都不是产品缺陷：`TypeError: Cannot read properties of null (reading 'server')` 与 `BridgeError: dsh-vscode-kit is not listening yet`（[并行 1](<work/t54-parallel-1.log>) 的 :227 / :239）。
+T54 在 Node v24.20.0 复现三次并行（用例集 213）：`tests/pass/fail = 213/210/3、213/202/11、213/213/0`，串行基线 `213/213/0`。
 原始输出保存在 [并行 1](<work/t54-parallel-1.log>)、[并行 2](<work/t54-parallel-2.log>)、[并行 3](<work/t54-parallel-3.log>)、[串行基线](<work/t54-serial-baseline.log>)。
-修改脚本后实际运行 `npm test` 三次，均为 `ℹ tests 213 / ℹ pass 213 / ℹ fail 0`：
-[串行 1](<work/t54-serial-final-1.log>)、[串行 2](<work/t54-serial-final-2.log>)、[串行 3](<work/t54-serial-final-3.log>)；bridge 156/156、demo 9/9、E2E 22/22 亦已本轮复跑全绿。
+T54 改脚本后实际运行 `npm test` 三次，均为 `ℹ tests 213 / ℹ pass 213 / ℹ fail 0`：
+[串行 1](<work/t54-serial-final-1.log>)、[串行 2](<work/t54-serial-final-2.log>)、[串行 3](<work/t54-serial-final-3.log>)；bridge 156/156、demo 9/9、E2E 22/22 亦在那一轮复跑全绿（同上，是 T54 的数）。
 
 **多窗口真机已验证的边界**：VS Code 1.143.1，A10 两窗口不同号且 stable:true、A11 DSH 重启复用、A12 getSelection 的 target 各自命中、A13 写+target 拒绝；
 见[设计稿 §7](<docs/多窗口寻址-设计.md#7-验收清单每条都能变红>)。这不代表写路径 target 路由开放，也不覆盖普通安装链路。
@@ -98,6 +101,21 @@ T42 在 bridge 的 `test/t40-delete.test.js` 里加了三条交错回归（B1：
 
 涉及真实宿主语义的改动（服务注册、配置监听、VSCode API 调用）**必须真机验证**，
 单测和 E2E 都用假宿主，证明不了那半边。步骤见 `docs/phase6-验收报告.md` §6。
+
+## 改哪一半，就得让哪一半重来（部署事实）
+
+改**哪个包**决定**怎么让它生效**，两者**不能互替**：
+
+| 改了 | 生效条件 | 不做会怎样 |
+|---|---|---|
+| `packages/dsh-vscode-kit`（DSH 侧协议库） | **重启 DSH** | DSH 进程里跑的还是旧 kit |
+| `packages/dsh-kit-bridge`（VS Code 扩展） | **重载 VS Code 窗口**（命令面板 → `Developer: Reload Window`） | 扩展宿主里跑的还是旧 bundle |
+
+- 只装 vsix 不重载窗口 = **等于没装**：扩展宿主只在窗口重载时重新加载 `main`（`packages/dsh-kit-bridge/package.json:26` → `./out/extension.cjs`）。
+- 重载窗口也不等于装了新包：`out/extension.cjs` 得先 `node scripts/build.mjs` 重新构建再落到扩展目录，否则重载回去的还是旧文件。
+- 两边都动时：先构建 + 装 vsix → 再重载窗口 → 最后重启 DSH。顺序反过来，DSH 起的还是旧 kit。
+
+真机证据（2026-10-24）：22:37 装完新包后只重启了 DSH、没重载窗口，结果扩展进程启动时间是 21:40，**早于**扩展文件写入时间 22:37 —— 时间戳直接证明在线跑的是旧代码，那一轮真机验证判**无效**（记录在 `work/A2-真机验证-状态.md:22`）。本地构建产物时间与之一致：`packages/dsh-kit-bridge/out/extension.cjs` 写入于 2026-10-24 22:36:44，`dsh-kit-bridge-0.3.3.vsix` 打包于 22:37:23。
 
 ## 目录
 

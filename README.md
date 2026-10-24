@@ -48,21 +48,21 @@ VS Code
 
 | 包 | 作用 | 版本 | 测试 |
 |---|---|---|---|
-| `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 213 ✅（串行） |
-| `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.2.0 | 156 ✅ |
+| `packages/dsh-vscode-kit` | DSH 侧协议库 + TCP server + 发现文件 + 插件入口 | 0.1.0 | 290 ✅（串行） |
+| `packages/dsh-kit-bridge` | VS Code 侧薄扩展（VSIX 可装） | 0.3.3 | 271 ✅ |
 | `packages/dsh-kit-demo` | 示例消费者，证明零耦合接入 | 0.1.0 | 9 ✅ |
 
-合计 **378 条单测 + 22 项跨进程 E2E**（T54 验证门槛）。
+合计 **570 条单测 + 22 项跨进程 E2E**（协调者复跑 2026-10-25（含 T66 收尾）：kit 290 / bridge 271 / demo 9 / E2E 22）。
 
 **多窗口 A10–A13 已真机确证（VS Code 1.143.1）**：两窗口 win-08 / win-09 均 stable:true；DSH 重启复用；getSelection 带 opts.target 各自命中，连续 4 轮一致；applyEdit 带 target:'#1' 被 -32014 target-not-routable 拒绝。证据：[探针 JSON](<D:/code-workspace/work/multiwin-probe.json>)（2026-10-23T18:34:27.346Z 起；重启复用采用用户已确证记录及运行态注册表），详见[设计稿 §7](<D:/code-workspace/projects/dsh-vscode-dev/docs/多窗口寻址-设计.md#71-a10a13-当前真机验收结果t54>)。
 
-**边界**：写路径 target 路由未开放，写目标仍只认 grant；普通安装链路、定向 openFile、关窗后的错误矩阵未覆盖。注册表 9 条/2 工作区的历史记录回收仍待验证；源码已有 64 条上限，并非完全无淘汰（设计稿 §9）。
+**边界**：写路径 target 路由未开放，写目标仍只认 grant；普通安装链路、定向 openFile、关窗后的错误矩阵未覆盖。注册表（`~/.dsh/dsh-vscode-kit/windows.json`）2026-10-25 实查 **18 条 / 6 个工作区根**，历史记录回收仍待验证；源码已有 64 条上限（`windows.js:40`）+ 按 `lastSeenAt` 淘汰（`windows.js:286-290`），并非完全无淘汰（设计稿 §9）。
 
 ## 快速开始
 
 ```bash
 # 1. 装 VS Code 扩展
-code --install-extension packages/dsh-kit-bridge/dsh-kit-bridge-0.2.0.vsix --force
+code --install-extension packages/dsh-kit-bridge/dsh-kit-bridge-0.3.3.vsix --force
 
 # 2. 把库放进共享 node_modules（DSH 的 bare import 从 profiles/node_modules 解析）
 cp -r packages/dsh-vscode-kit  ~/.dsh/profiles/node_modules/
@@ -90,8 +90,8 @@ export function apply(ctx) {
 ## 跑测试
 
 ```bash
-cd packages/dsh-vscode-kit   && node --test --test-concurrency=1 "test/*.test.js"   # 213（或 npm test）
-cd packages/dsh-kit-bridge   && node --test "test/*.test.js"   # 156
+cd packages/dsh-vscode-kit   && node --test --test-concurrency=1 "test/*.test.js"   # 290（或 npm test）
+cd packages/dsh-kit-bridge   && node --test "test/*.test.js"   # 271
 cd packages/dsh-kit-demo     && node --test "test/*.test.js"   # 9
 cd packages/dsh-kit-bridge   && node scripts/e2e.mjs           # 22 跨进程
 ```
@@ -145,6 +145,7 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | -32008 | `protocol-incompatible` | 协议版本不兼容（兼容门） |
 | -32009 | `invalid-response` | 对端返回的响应形状不符合契约 |
 | -32010 | `edit-not-bound` | 写入没有有效的 grant 绑定（五种 `reason` 见下） |
+| -32011 | `document-dirty` | 文档**来源不明**（协议 v2 新增）：缓冲区/观察链里有本端证明不出来源的内容，所以不许写。`data = {method, file, reason, isDirty, attribution, version, incarnation, retryable:false, recovery:'human-rebase'}`，`reason` ∈ `foreign-change` / `mixed-origin` / `attribution-unknown` / `observation-gap` / `dirty-quarantine`。**处置是"停在这个文件上"**：重读锚点消除不了它，不许自动重发；`vscode.save` / `vscode.deleteFile` 的脏缓冲拒绝码已从 `-32012` 改为它（[protocol.js:54–78](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/protocol.js#L54-L78>)） |
 | -32012 | `document-version-conflict` | 文档版本或实例（`incarnation`）与调用方锚点不符；重读锚点后重发。`data` 只回长度/版本，不回文本 |
 | -32013 | `disk-state-conflict` | 磁盘真值与 `expectedDisk:{mtime,size}` 不符（或确认后字节已被换）。**处置与 `-32012` 相反：永不允许自动重试** —— 重发就是拿没见过的内容覆盖别人的改动；先读磁盘再决定 |
 | -32014 | `window-target-failed`（`WINDOW_TARGET_FAILED`） | 窗口寻址失败；按下表 `data.reason` 处置（[protocol.js:80–119](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/protocol.js#L80-L119>)） |
@@ -157,7 +158,7 @@ cd packages/dsh-kit-bridge && node scripts/build.mjs && npx --yes @vscode/vsce p
 | `target-unauthorized` | 绑定读的有效 grant link 与 target 解析出的 link 不是同一对象。 |
 | `target-not-routable` | 写路径带非 null/undefined 的 target，在 `_bindWriteTarget` 前一律拒。 |
 
-判据：[index.js:1013–1044](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/index.js#L1013-L1044>)、[index.js:1663–1708](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/index.js#L1663-L1708>)。绑定读没有有效 grant 仍为 `-32010`，不是 `target-unauthorized`。**`-32011` 仍为空号，`SUPPORTED_PROTOCOL` 未动（仍 `[1,1]`）**，见 [protocol.js:13–136](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/protocol.js#L13-L136>)。**broadcast 语义未变**：只遍历 trusted 活连接、拒写方法，业务广播逐连接判版本，零投递 `-32008`；`bridge.*` 豁免版本门且可返回 0，不引入定向广播（[server.js:322–378](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/server.js#L322-L378>)）。
+判据：[index.js:1013–1044](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/index.js#L1013-L1044>)、[index.js:1663–1708](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/index.js#L1663-L1708>)。绑定读没有有效 grant 仍为 `-32010`，不是 `target-unauthorized`。**`-32011` 已启用为 `document-dirty`，协议版本已是 `2`**（`PROTOCOL_VERSION = 2`、`SUPPORTED_PROTOCOL = [2,2]`），见 [protocol.js:13–190](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/protocol.js#L13-L190>)。**broadcast 语义未变**：只遍历 trusted 活连接、拒写方法，业务广播逐连接判版本，零投递 `-32008`；`bridge.*` 豁免版本门且可返回 0，不引入定向广播（[server.js:322–378](<D:/code-workspace/projects/dsh-vscode-dev/packages/dsh-vscode-kit/src/server.js#L322-L378>)）。
 
 `-32005` 与 `-32601` 的区别：前者是"能力协商没通过，你该降级"，
 后者是"方法名根本不存在，是编程错误"。
