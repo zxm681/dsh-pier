@@ -36,6 +36,10 @@ import {
   eventEnvelopeError,
 } from './event-contract.js'
 import { BridgeError, ERR } from './protocol.js'
+// ★ T60：路径形态只有一份规则（见 paths.js 文件头）。过滤比较、正文门、出站 payload
+// 全部过同一个 canon —— 缺陷①（`filter.files` 静默零命中）的根因就是"RPC 出口与事件
+// 管线各写各的盘符大小写，然后拿字符串精确比较"。
+import { canonicalPath, isUsableFilterPath } from './paths.js'
 
 /** API 身份约定：基础 facade 固定为 `unbound`，与 forPlugin(name) 同样按名分区，无特权。 */
 export const EVENT_CONSUMER_UNBOUND = 'unbound'
@@ -128,6 +132,10 @@ export function normalizeEventFilter(raw) {
   }
 
   // ② 文件白名单
+  //
+  // ★ T60：条目在这里就**规范成对外可见形态**（`canonicalPath`），而不是等到比较时再说。
+  // 理由是可观测性：回执里的 `subscription.files` 就是"这条订阅实际拿去过滤的白名单"，
+  // 让它与消费者写下的字节一致（只是盘符大小写被统一），排查时不用在两个字符串之间做心算。
   let files = null
   if (value.files !== undefined && value.files !== null) {
     if (!Array.isArray(value.files) || value.files.length === 0) {
@@ -143,10 +151,10 @@ export function normalizeEventFilter(raw) {
         return fail('invalid-files', 'files', 'filter.files entries must be strings')
       }
       const text = one.trim()
-      if (text === '' || text.length > EVENT_FILE_MAX_CHARS || text.includes('\u0000')) {
+      if (!isUsableFilterPath(text, EVENT_FILE_MAX_CHARS)) {
         return fail('invalid-files', 'files', 'filter.files entries must be non-empty, NUL-free paths')
       }
-      seen.add(text)
+      seen.add(canonicalPath(text))
     }
     files = [...seen]
   }
@@ -285,10 +293,15 @@ function describeError(err) {
  * @param {(level: string, msg: string, extra?: object) => void} [opts.log]
  * @param {() => number} [opts.now]
  * @param {string[]|(() => string[])} [opts.roots] 正文允许的根（工作区根，来自 `editorEventFilter`）
+ * @param {(() => string[]) | null} [opts.openFiles]
+ *   目标窗口里**此刻打开的文件**（规范形态，由宿主给：bridge 侧是 `host.listEditors()`）。
+ *   只用于回执的诊断字段 `filterMatch`（T60 缺陷①）：一条 `files` 白名单可能因为拼写差异
+ *   一个文件都不命中，而消费者拿到的仍是 `ok:true` —— 那是静默零命中。本钩子让"建立过滤那一刻
+ *   到底命中几个"变成回执里的一个数字。**它不参与任何放行判定**，取不到就不报（`null`）。
  * @param {((sessionId: string) => any)|null} [opts.sessionLinkOf] 会话 → 绑定连接（冲突判定用）
  */
 export function createEventBroker({
-  log = () => {}, now = Date.now, roots = [], sessionLinkOf = null,
+  log = () => {}, now = Date.now, roots = [], sessionLinkOf = null, openFiles = null,
 } = {}) {
   const subs = new Map()
   const streams = new Map()
@@ -362,6 +375,48 @@ export function createEventBroker({
       { method, target, rawTarget: target, reason: 'target-unauthorized', side: 'bridge' })
   }
 
+  /**
+   * 建立过滤那一刻的**命中诊断**（T60 缺陷①的可观测化）。
+   *
+   * 语义（回执里的 `filterMatch`，只读、不参与任何放行判定）：
+   *  - `openFiles`：目标窗口里**此刻**打开的文件数（按规范形态去重）；
+   *  - `matched`：其中**能通过本订阅 `filter.files` 白名单**的文件数。`filterFiles === null`
+   *    （没有文件白名单）时等于 `openFiles` —— 那时不存在"零命中"这回事；
+   *  - `filterFiles`：白名单条目数；`null` = 不限文件；
+   *  - `notOpen`：白名单里**当时没在这个窗口打开**的前几个条目（最多 3 个，按白名单顺序）。
+   *
+   * 为什么必须放在回执里而不是只写日志：缺陷①的形态是"`ok:true` + 一条事件都不来"。
+   * 消费者唯一能据以判断"我这串字节写错了"的地方就是回执；把它做成字段，调用方
+   * 一次 `assert.equal(receipt.filterMatch.matched, 1)` 就能在 CI 里守住协议兼容性。
+   * 拿不到宿主文件列表（或宿主没接这个钩子）时整块为 `null`，**不猜**。
+   *
+   * @param {Readonly<{files: readonly string[]|null}>} filter 已归一化的过滤器
+   * @returns {{openFiles: number, matched: number, filterFiles: number|null, notOpen: string[]|null}|null}
+   */
+  function filterMatchFor(filter) {
+    if (typeof openFiles !== 'function') return null
+    let list = []
+    try {
+      const raw = openFiles()
+      if (Array.isArray(raw)) list = raw.filter((one) => typeof one === 'string' && one !== '')
+    } catch (err) {
+      log('warn', 'open file list unavailable for filter diagnostics', { message: err?.message })
+      return null
+    }
+    const open = new Set(list.map((one) => canonicalPath(one)))
+    const whitelist = Array.isArray(filter.files) ? filter.files : null
+    let matched = 0
+    for (const file of open) {
+      if (whitelist === null || whitelist.includes(file)) matched += 1
+    }
+    return {
+      openFiles: open.size,
+      matched,
+      filterFiles: whitelist === null ? null : whitelist.length,
+      notOpen: whitelist === null ? null : whitelist.filter((one) => !open.has(one)).slice(0, 3),
+    }
+  }
+
   function subscribe(params, ctx) {
     const method = EVENT_SUBSCRIBE_METHOD
     if (closed) throw new BridgeError(ERR.DISCONNECTED, 'event broker is closed', { method })
@@ -406,7 +461,11 @@ export function createEventBroker({
     }
 
     const id = `sub-${++counter}`
-    const record = { id, link, filter, consumer: eventPartitionKey({ name: params.consumer }), at: now() }
+    // ★ T60：诊断要在**登记之前**算好（登记会 sync→推策略，那条链不该被诊断的 I/O 拖慢）。
+    const filterMatch = filterMatchFor(filter)
+    const record = {
+      id, link, filter, filterMatch, consumer: eventPartitionKey({ name: params.consumer }), at: now(),
+    }
     subs.set(id, record)
 
     if (typeof hooks.activate === 'function') {
@@ -425,7 +484,23 @@ export function createEventBroker({
       textMode: filter.textMode,
       types: filter.types ?? 'all',
       files: Array.isArray(filter.files) ? filter.files.length : 'all',
+      filterMatch,
     })
+    // 静默零命中的最后一层防线：即使调用方不看回执，诊断环里也留一条**可读的**记录。
+    if (filterMatch && filterMatch.filterFiles !== null && filterMatch.matched === 0) {
+      note('filter-no-open-file-match', {
+        consumer: record.consumer,
+        filterFiles: filterMatch.filterFiles,
+        openFiles: filterMatch.openFiles,
+      })
+      log('warn', 'event subscription filter matches no open file in this window '
+        + '(the whitelist is compared as-is; paths come from listOpenEditors)', {
+        consumer: record.consumer,
+        filterFiles: filterMatch.filterFiles,
+        openFiles: filterMatch.openFiles,
+        notOpen: filterMatch.notOpen,
+      })
+    }
 
     return {
       ok: true,
@@ -437,6 +512,8 @@ export function createEventBroker({
         streamEpoch: descriptor.streamEpoch,
         nextSeq: descriptor.startSeq,
       },
+      // 诊断字段：不是契约值，缺了也能用（老消费者忽略即可），但它能让"零命中"当场可见。
+      filterMatch,
       subscription: {
         id,
         consumer: record.consumer,
@@ -576,6 +653,8 @@ export function createEventBroker({
         types: record.filter.types,
         files: record.filter.files,
         textMode: record.filter.textMode,
+        // 建立时的命中诊断（T60）随快照一起露出，排查"这条订阅到底看没看见任何文件"。
+        filterMatch: record.filterMatch ?? null,
       })),
       diagnostics: [...diagnostics],
     }),
@@ -592,6 +671,7 @@ export function notReadyEventHandle(consumer, {
     consumer: eventPartitionKey(consumer),
     filter: null,
     cursor: null,
+    filterMatch: null,
     error: { code: ERR.DISCONNECTED, reason: 'server-not-ready', stage: 'local', message },
     ready: Promise.resolve(),
     dispose: () => {},
@@ -669,6 +749,8 @@ export function createEventSubscriptions({
       consumer: partition,
       filter: null,
       cursor: null,
+      // 字段**始终存在**（铁律 2：facade 形状稳定）——未就绪/被拒时是 `null`。
+      filterMatch: null,
       error: null,
       ready: null,
       dispose: () => {},
@@ -801,6 +883,17 @@ export function createEventSubscriptions({
     }
     sub.lastSeq = receipt.startSeq - 1
     handle.cursor = receipt.cursor
+    // T60：对端的命中诊断原样收下（老扩展不给 ⇒ null）。消费者据 `handle.filterMatch`
+    // 就能在"订阅成功但零事件"时立刻分辨"是过滤写错了"还是"真的没变化"。
+    sub.filterMatch = isObject(receipt.filterMatch) ? { ...receipt.filterMatch } : null
+    handle.filterMatch = sub.filterMatch
+    if (sub.filterMatch && sub.filterMatch.filterFiles !== null && sub.filterMatch.matched === 0) {
+      note('filter-no-open-file-match', {
+        consumer: sub.partition,
+        filterFiles: sub.filterMatch.filterFiles,
+        openFiles: sub.filterMatch.openFiles,
+      })
+    }
 
     const previous = sub.link ? streams.get(sub.link) : null
     if (!previous || previous.streamEpoch !== receipt.streamEpoch) {
@@ -886,21 +979,57 @@ export function createEventSubscriptions({
   function accepts(filter, envelope) {
     if (Array.isArray(filter.types) && !filter.types.includes(envelope.type)) return false
     // 与 E2 `selected()` 同口径：带 file 的事件才比白名单；不带 file 的控制/窗口态事件放行。
+    //
+    // ★ T60：两侧都比**规范形态**（`canonicalPath`）。`filter.files` 在归一化时已规范过，
+    // 这里再规范一次入站值 —— 对端可能是还没升级的老扩展（它发小写盘符），也可能是
+    // 未来某个忘了规范的宿主。这一行不改变任何"本来就能对上"的比较结果，只把"盘符大小写
+    // 不同就静默丢事件"这条路堵死。
     if (Array.isArray(filter.files)) {
       const file = envelope.payload?.file
-      if (typeof file === 'string' && !filter.files.includes(file)) return false
+      if (typeof file === 'string' && !filter.files.includes(canonicalPath(file))) return false
     }
     return true
+  }
+
+  /**
+   * 出站 payload 的路径形态统一（T60）：`file` 与 `tabsChanged` 的 `opened[]/closed[]` 里的
+   * `files`。事件是**对外可见面**的一部分，与 RPC 返回值必须同一种写法 —— 否则消费者
+   * 用 `listOpenEditors` 的返回值去比事件里的 `file`（或反过来）就会失配。
+   *
+   * 只在真的需要改的时候新建对象（多数事件本就已是规范形态，避免无谓分配）。
+   */
+  function canonicalPayload(payload) {
+    if (!isObject(payload)) return payload
+    let out = payload
+    if (typeof payload.file === 'string') {
+      const file = canonicalPath(payload.file)
+      if (file !== payload.file) out = { ...out, file }
+    }
+    for (const key of ['opened', 'closed']) {
+      const rows = payload[key]
+      if (!Array.isArray(rows)) continue
+      let touched = false
+      const mapped = rows.map((row) => {
+        if (!isObject(row) || !Array.isArray(row.files)) return row
+        const files = row.files.map((one) => canonicalPath(one))
+        if (files.every((one, i) => one === row.files[i])) return row
+        touched = true
+        return { ...row, files }
+      })
+      if (touched) out = { ...out, [key]: mapped }
+    }
+    return out
   }
 
   function shapeEvent(sub, envelope, link) {
     const source = (typeof attribute === 'function' ? attribute(link) : null) ?? {}
     // ★ 来源只认链路事实（attribute(link)），**绝不**读 payload 自报的 windowId/sessionId。
     // delta 的文件白名单也是正文门；缺失 file 的帧不能借窗口态绕过它。
+    // ★ T60：正文门与过滤门用同一个规范形态比较（见 accepts 上面的说明）。
     const bodyAllowed = sub.filter.textMode === 'delta'
       && typeof envelope.payload.file === 'string'
-      && sub.filter.files?.includes(envelope.payload.file)
-    const payload = bodyAllowed ? envelope.payload : stripEventBodies(envelope.payload)
+      && sub.filter.files?.includes(canonicalPath(envelope.payload.file))
+    const payload = bodyAllowed ? canonicalPayload(envelope.payload) : stripEventBodies(canonicalPayload(envelope.payload))
     return {
       type: envelope.type,
       subscriptionId: envelope.subscriptionId ?? sub.descriptor?.subscriptionId ?? null,

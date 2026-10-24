@@ -29,6 +29,10 @@ import {
   EVENT_MAX_BYTES, EVENT_QUEUE_MAX_BYTES, EVENT_QUEUE_MAX_COUNT,
   SELECTION_COALESCE_MS, EVENT_TYPES,
 } from '../../dsh-vscode-kit/src/event-contract.js'
+// ★ T60：对外可见路径只有一个形态出口。事件 payload 里的 `file` 与过滤白名单
+// 都走它 —— 以前 `fileOf()` 直接用宿主 `doc.uri.fsPath`（Windows 盘符小写），
+// 而 RPC 出口是大写，两串字节精确比较 ⇒ 消费者照 `listOpenEditors` 写白名单就零命中。
+import { canonicalPath } from '../../dsh-vscode-kit/src/paths.js'
 
 const point = (p) => ({ line: p.line + 1, column: p.character + 1 })
 const range = (r) => ({ start: point(r.start), end: point(r.end) })
@@ -58,14 +62,21 @@ export function createEditorEvents({ host, emit, filter = {}, timers = {}, now =
   function setPolicy(value) {
     policy = {
       roots: Array.isArray(value.roots) ? value.roots.filter((r) => typeof r === 'string').slice(0, EVENT_QUEUE_MAX_COUNT) : [],
-      files: Array.isArray(value.files) ? value.files.filter((r) => typeof r === 'string') : null,
-      bodyFiles: Array.isArray(value.bodyFiles) ? value.bodyFiles.filter((r) => typeof r === 'string') : null,
+      // ★ T60：白名单在**收进来的那一步**就规范化；之后与 `fileOf()` 的比较是同一形态的精确比较，
+      // 白名单里写 `c:/...` 还是 `C:/...` 都能命中（老版本 DSH 侧发的是小写盘符）。
+      files: Array.isArray(value.files) ? value.files.filter((r) => typeof r === 'string').map((r) => canonicalPath(r)) : null,
+      bodyFiles: Array.isArray(value.bodyFiles) ? value.bodyFiles.filter((r) => typeof r === 'string').map((r) => canonicalPath(r)) : null,
       types: Array.isArray(value.types) ? value.types.filter((t) => EVENT_TYPES.includes(t)) : null,
       textMode: value.textMode === 'delta' ? 'delta' : 'metadata',
     }
   }
   setPolicy(filter)
-  const fileOf = (doc) => doc?.uri?.fsPath ?? null
+  // ★ T60：**唯一**的 payload.file 出口。所有事件的 `file` 都从这里来（含 opened/closed 的 files），
+  // 因此只要这里规范，事件面就不可能出现第二种写法。
+  const fileOf = (doc) => {
+    const fsPath = doc?.uri?.fsPath
+    return typeof fsPath === 'string' ? canonicalPath(fsPath) : (fsPath ?? null)
+  }
   function bodyAllowed(doc) {
     const file = fileOf(doc)
     return host.isTrusted() === true && doc?.uri?.scheme === 'file'
@@ -214,7 +225,9 @@ export function createEditorEvents({ host, emit, filter = {}, timers = {}, now =
   }
   function tabMetadata(tab) {
     // No label, tooltip or unknown input object: those may contain arbitrary text.
-    return { files: host.tabUris(tab).map((u) => u.fsPath), viewColumn: tab.group?.viewColumn ?? null,
+    // ★ T60：`files` 同样是**对外可见路径**，与 `payload.file` 用同一个形态出口。
+    return { files: host.tabUris(tab).map((u) => canonicalPath(u.fsPath)),
+      viewColumn: tab.group?.viewColumn ?? null,
       isPreview: tab.isPreview === true }
   }
   function onTabs(event) {

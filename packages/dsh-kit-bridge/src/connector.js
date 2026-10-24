@@ -22,10 +22,16 @@ import {
 } from '../../dsh-vscode-kit/src/grant.js'
 import { CAPABILITIES } from './capabilities.js'
 import { createEditorEvents } from './editor-events.js'
+import { EXTENSION_VERSION } from './version.js'
 
 /** 扩展对外声明的身份（写进 hello，DSH 侧据此判能力）。 */
 export const CLIENT_ID = 'dsh-kit-bridge'
-export const EXTENSION_VERSION = '0.3.1'
+
+// ★ T60：版本号不再在这里手写。以前这里是 `'0.3.1'` 字面量，而 `package.json` 已经是
+// `0.3.2` —— 发版只改了清单，`hello` 继续报旧号（真机验证抓到的缺陷②）。
+// 现在唯一的来源是 `package.json`（见 `version.js` 的文件头），并从这里原样再导出，
+// 让既有的 `import { EXTENSION_VERSION } from './connector.js'` 全部不受影响。
+export { EXTENSION_VERSION }
 
 /**
  * hello 里的 `features` 声明（T34）—— **能力清单之外**的语义能力公告。

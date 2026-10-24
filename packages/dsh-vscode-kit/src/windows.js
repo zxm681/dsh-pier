@@ -26,6 +26,7 @@ import {
 import { dirname, join } from 'node:path'
 
 import { discoveryDir } from './discovery.js'
+import { canonicalPath } from './paths.js'
 
 /** 注册表文件名（与发现文件同目录；`sweepDiscoveryDir` 会保留非数字前缀的 json）。 */
 export const WINDOWS_FILE_NAME = 'windows.json'
@@ -120,11 +121,42 @@ export function normalizeWindowBlock(raw) {
   }
 }
 
-/** 指纹里的路径归一化：分隔符统一、去掉尾斜杠、Windows 盘符不分大小写。 */
+/**
+ * 指纹里的路径归一化：分隔符统一、去掉尾斜杠，再统一到**对外可见形态**（`canonicalPath`）。
+ *
+ * ★ T60：末尾那一步以前是"把盘符折成小写"，即注册表键自己发明了第三种大小写写法，
+ * 与 RPC 出口（大写盘符）、事件 payload（小写盘符）三足鼎立。现在它直接调用同一个
+ * `canonicalPath`：盘符大写（这是唯一被两条管线改写过的字节），段名与顺序原样保留 ——
+ * 键的**身份**语义与旧实现等价（旧实现只改盘符大小写，而 Windows 路径比较本来就不区分
+ * 盘符大小写），只是字面写法跟着对外形态走。老注册表的键由 `_load` 里的
+ * `renormalizeFingerprint` 就地迁移，`win-NN` 号不变。
+ */
 function normalizeRoot(p) {
-  let out = p.replace(/\\/g, '/').replace(/\/+$/, '')
-  if (/^[A-Za-z]:\//.test(out)) out = out[0].toLowerCase() + out.slice(1)
-  return out
+  const out = p.replace(/\\/g, '/').replace(/\/+$/, '')
+  return canonicalPath(out)
+}
+
+/**
+ * 把**旧格式**指纹就地迁移成当前格式（T60）。旧格式 = 盘符被折成小写
+ * （`["s","d:/ws","desktop"]`）；新格式 = `["s","D:/ws","desktop"]`。
+ *
+ * 只重算第二段（workspace 根），其余原样带回；解析不了就原样返回（不猜、不丢记录）。
+ * 迁移是**幂等**的：新键重算后不变。
+ *
+ * @param {string} fingerprint
+ * @returns {string}
+ */
+function renormalizeFingerprint(fingerprint) {
+  let parts
+  try {
+    parts = JSON.parse(fingerprint)
+  } catch {
+    return fingerprint
+  }
+  if (!Array.isArray(parts) || parts.length !== 3 || typeof parts[1] !== 'string') return fingerprint
+  const root = normalizeRoot(parts[1])
+  if (root === parts[1]) return fingerprint
+  return JSON.stringify([parts[0], root, parts[2]])
 }
 
 /**
@@ -186,11 +218,17 @@ export class WindowRegistry {
       payload = null // 文件不存在 / 半截 JSON / 不是文件：一律当空表，绝不因此拒连
     }
     const list = Array.isArray(payload?.windows) ? payload.windows : []
+    /** 是否发生过旧格式迁移 —— 只有真迁过才在下次写盘时落回去。 */
+    this.migrated = false
     for (const rec of list) {
       const windowId = typeof rec?.windowId === 'string' ? rec.windowId : null
-      const fingerprint = typeof rec?.fingerprint === 'string' ? rec.fingerprint : null
+      const raw = typeof rec?.fingerprint === 'string' ? rec.fingerprint : null
       const n = sequenceOf(windowId)
-      if (windowId === null || fingerprint === null || n === null) continue
+      if (windowId === null || raw === null || n === null) continue
+      // ★ T60：旧盘符小写形态就地迁移成当前形态（幂等）。`win-NN` 号不变，
+      // 不重写过的旧记录；没有任何旧记录时 `migrated` 保持 false，不会无谓写盘。
+      const fingerprint = renormalizeFingerprint(raw)
+      if (fingerprint !== raw) this.migrated = true
       this.windows.push({
         windowId,
         fingerprint,

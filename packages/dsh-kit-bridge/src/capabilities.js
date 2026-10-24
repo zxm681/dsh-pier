@@ -23,6 +23,7 @@ import {
   assertWrittenDocumentIdentity,
 } from './workspace-paths.js'
 import { createEventBroker } from '../../dsh-vscode-kit/src/event-subscriptions.js'
+import { canonicalPath, pathIdentityKey } from '../../dsh-vscode-kit/src/paths.js'
 
 /** 本扩展声明支持的能力清单（写进发现文件 / hello 的 capabilities）。 */
 export const CAPABILITIES = [
@@ -541,19 +542,8 @@ function assertRangeInBounds(shape, range, method) {
   }
 }
 
-/**
- * 出口路径规范化（Windows 盘符统一大写）。
- *
- * 真机自检抓到的坑：同一个文件，`vscode.openFile` 回传的是调用方传入的
- * `C:\Users\...`，而 `vscode.getSelection` / `listOpenEditors` 回传的是
- * VSCode URI 的 `fsPath`，在 Windows 上盘符被小写化成 `c:\Users\...`。
- * 消费者若按字符串比较（`list.some(e => e.file === p)`）会静默失败。
- * 协议是对外契约，出口必须只有一种写法 —— 这里统一成大写盘符。
- */
-function canonicalPath(p) {
-  if (typeof p !== 'string') return p
-  return /^[a-z]:/.test(p) ? p[0].toUpperCase() + p.slice(1) : p
-}
+// 出口路径规范化的实现已搬到 `dsh-vscode-kit/src/paths.js`（T60），与事件过滤 / payload / 注册表键
+// 共用同一个 `canonicalPath`。用法不变：所有**对外可见**的路径（返回值、错误 data 里的 `file`）必须过它。
 
 /**
  * 串行化键（**锁身份**）：只给 `serializeByPath` 用，不参与任何对外输出。
@@ -585,8 +575,8 @@ function canonicalPath(p) {
  * 也就是本函数要折的那一件。
  */
 function serializeKeyFor(real) {
-  if (typeof real !== 'string') return real
-  return process.platform === 'win32' ? real.toLowerCase() : real
+  // 实现是 kit 的 `pathIdentityKey`（T60：身份口径也只留一份，与 `canonicalPath` 同文件不同名）。
+  return pathIdentityKey(real)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1052,6 +1042,13 @@ export function createCapabilities(host, opts = {}) {
   const eventBroker = createEventBroker({
     log: (level, msg, extra) => log(level, msg, extra),
     roots: () => (typeof host.workspaceRoots === 'function' ? host.workspaceRoots() : []),
+    // ★ T60：订阅回执里的 `filterMatch` 就是靠这条读取的"此刻打开了哪些文件"。
+    // 数据的**来源与 `vscode.listOpenEditors` 是同一个** `host.listEditors()`
+    // （同一个宿主调用、同一套出口规范化），诊断里的数字才等于消费者真正看到的那份名单。
+    // 读失败不影响订阅（`filterMatchFor` 自己吞异常并回 null），这条通道永不因诊断而拒服。
+    openFiles: () => (typeof host.listEditors === 'function'
+      ? host.listEditors().map((entry) => entry?.file).filter((file) => typeof file === 'string')
+      : []),
     // 会话归属只认 grant 表（DSH 侧的授权事实），**不**采信订阅参数里自称的东西。
     sessionLinkOf: (sessionId) => {
       if (!grants || typeof grants.active !== 'function') return null
