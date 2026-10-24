@@ -129,7 +129,7 @@ export function createWritePolicy(opts = {}) {
 
   const stats = {
     judged: 0, refused: 0, allowed: 0, foreignEvents: 0, staleEvents: 0,
-    inflightEvents: 0, taints: 0, evicted: 0,
+    inflightEvents: 0, taints: 0, evicted: 0, firstSights: 0,
   }
 
   function stateFor(fileKey) {
@@ -201,8 +201,9 @@ export function createWritePolicy(opts = {}) {
    *    别人的增量，每一个正常的 `applyEdit` 都会把自己的文件冻结掉。
    *  - 有本端写在进行（`inflight > 0`）：**可能**是自己的 → 计数，交给 settle 判归属；
    *    窗口内混进别人的增量由账本判 `mixed`，本模块不抢这个判断。
-   *  - 其余（无进行中写入、版本更新）：**没有在飞的本端写入却能变** → 来源不明 → taint。
-   *    注意这里**不看 `isDirty`**：人改完再保存（`isDirty:false`）也**不洗白**（4.7）。
+   *  - **首次旁观**（本端从没见过这个文件的版本，`lastVersion === null`）：只按当次读到的新鲜
+   *    锚点落基线，**不**判 `foreign-change`（[2026-10-24 修订]，见下面的长注释）。
+   *  - 其余（无进行中写入、版本确实往前走）：**没有在飞的本端写入却能变** → 来源不明 → taint。
    */
   function noteChange(sample) {
     const fileKey = sample?.file ?? sample?.documentPath ?? sample?.fileKey
@@ -225,6 +226,32 @@ export function createWritePolicy(opts = {}) {
       if (version !== null) st.lastVersion = version
       return { classified: 'inflight' }
     }
+
+    // ★ [2026-10-24 修订] 首次旁观即建基线：**不允许**把"本端没见过这个版本"读成
+    //   "没有人写却变了"。冷启动时 `lastVersion` 是 `null`，而 VS Code 里任何既有文档
+    //   （`version > 1`）的**第一次**被观察都会被上面那条推断命中 —— 于是整份文件永久冻结，
+    //   每次重启 DSH 重新发生一遍。真机三次复现：`work/a2-probe.json`（B-clean.txt
+    //   `isDirty:false`/`version:5`/磁盘 sha 未变，仍然 `-32011 foreign-change`；
+    //   taint 时间戳比探针首次写入早 7~15 分钟 ⇒ 冻结来自启动后的第一次观察，不是某次写）。
+    //
+    //   契约前提本来就写着"首次干净基线必须在同源观察器安装后读取"（见 11.5 / 4.7），
+    //   只是此前**没有执行点**（`establishBaseline()` 全仓无生产调用）。这里就是那个执行点：
+    //   观察器装好之后读到的第一个锚点 = 这份文档在本进程里的干净基线。
+    //
+    //   ★ 这不放松任何东西：基线**只记锚点**，不放行——
+    //     · 脏缓冲区仍然要 `dirtyOwned === true`（账本证明是本端写的），没证明就拒；
+    //     · 归档仍然要求干净基线；
+    //     · 之后任何"版本往前走但没有在飞的本端写入"照旧 taint（见下面的分支）。
+    if (st.lastVersion === null) {
+      stats.firstSights += 1
+      if (version !== null) {
+        st.lastVersion = version
+        st.baselineVersion = version
+      }
+      st.baselineIncarnation = st.incarnation
+      return { classified: 'baseline' }
+    }
+
     if (version !== null && st.lastVersion !== null && version <= st.lastVersion) {
       stats.staleEvents += 1
       return { classified: 'stale' }
@@ -356,8 +383,16 @@ export function createWritePolicy(opts = {}) {
       return { allowed: false, reason, attribution }
     }
 
-    // ① 已冻结：**任何**写都不许（delete 也一样），且重读锚点/换 grant 不清它。
-    if (st.taint) {
+    // ① 已冻结：**脏缓冲区**与**归档**一律不许，且重读锚点/换 grant 不清它。
+    //    [2026-10-24 修订] 干净缓冲区（`isDirty !== true`）不受 taint 管，继续走第 ③ 步：
+    //    干净意味着缓冲区内容 == 磁盘，那份"别人写进来"的内容已经不在缓冲区里了（被撤销，
+    //    或者它本来就已经落成磁盘现状）。此时仍然要过双锚点，而且"别人保存过"另有码位：
+    //      · "别人保存过" → `-32013 disk-state-conflict`（`expectedDisk` 锚点）
+    //      · "缓冲区变过" → `-32012 document-version-conflict`（`expectedVersion`/`expectedIncarnation`）
+    //    真机反例（`work/a2-probe.json`）：冷启动后干净文件 B-clean.txt（`isDirty:false`、
+    //    `version:5`、磁盘 sha 未变）被这条"不分干净/脏"的判据永久冻结。收紧的三处不许动：
+    //    脏缓冲区仍拒、`deleteFile` 仍要求干净基线、`hasEvidenceSource !== true` 仍拒。
+    if (st.taint && (isDirty === true || method === 'vscode.deleteFile')) {
       const attribution = st.taint.reason === WRITE_POLICY_REASONS.MIXED_ORIGIN
         ? ATTRIBUTION.MIXED
         : ATTRIBUTION.UNKNOWN

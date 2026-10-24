@@ -48,6 +48,22 @@ function judge(policy, over = {}) {
   })
 }
 
+/**
+ * 造一条**真正的**外部增量：先让策略看见一次这个文件（`from`，首次旁观 → 落基线），
+ * 再来一条版本往前、且没有本端写在飞的变更（`to`）→ taint。
+ *
+ * ★ [2026-10-24 修订] 以前 `noteChange({version:6})` 一步就能造出 taint —— 那正是冷启动
+ *   永久冻结的病灶（"本端没见过"被当成"有人偷偷写了"）。现在必须先有基线，"变了"才有意义。
+ *   本函数只改各用例的 **setup**；那些用例的断言（"重读 / 换 grant / 脏态变化都不洗白"）没动。
+ */
+function foreignChange(policy, file = FILE_A, { from = 5, to = 6 } = {}) {
+  const first = policy.noteChange({ file, version: from, incarnation: INC, changes: null })
+  assert.equal(first.classified, 'baseline', '前置：第一次观察必须落基线，不能直接冻结')
+  const change = policy.noteChange({ file, version: to, incarnation: INC, changes: null })
+  assert.equal(change.classified, 'foreign', '前置：基线之后的版本前进必须判成外来改动')
+  return change
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 0. 常量与错误形状
 // ─────────────────────────────────────────────────────────────────────────────
@@ -195,7 +211,7 @@ test('T62 决策表第 7 行：文档实例换过（关闭重开）→ 旧证据
 
 test('T62 ★ 重读最新锚点（version 追上/换新）**不能**消除 taint', () => {
   const policy = createWritePolicy()
-  policy.noteChange({ file: FILE_A, version: 6, incarnation: INC, changes: null })
+  foreignChange(policy, FILE_A, { from: 5, to: 6 })
   for (const version of [6, 7, 99]) {
     const verdict = judge(policy, { version, isDirty: true, grantAllowsDirty: true })
     assert.equal(verdict.allowed, false, `version=${version}: 最新的锚点也不放行（否则就是"重读即洗白"）`)
@@ -203,18 +219,25 @@ test('T62 ★ 重读最新锚点（version 追上/换新）**不能**消除 tain
   }
 })
 
-test('T62 ★ isDirty 变 false **不能**洗白"观察到的非桥接修改"', () => {
+test('T62 ★ [T63 修订] isDirty 变 false：脏缓冲区照旧拒；干净缓冲区不受 taint 管（走第 ③ 步）', () => {
   const policy = createWritePolicy()
-  policy.noteChange({ file: FILE_A, version: 6, incarnation: INC, changes: null })
-  // 人工在编辑器里保存了（缓冲区不脏了），但那份内容**是别人写的**。
-  const verdict = judge(policy, { version: 7, isDirty: false, grantAllowsDirty: true })
-  assert.equal(verdict.allowed, false, '★ 脏不脏是"有没有未保存改动"，与"内容是谁写的"是两个问题')
-  assert.equal(verdict.reason, R.FOREIGN_CHANGE)
+  foreignChange(policy, FILE_A, { from: 5, to: 6 })
+  // ① 缓冲区仍然脏（有未保存的本地改动）：taint 照旧生效 —— 原断言的核心，一个字没松。
+  const dirty = judge(policy, { version: 7, isDirty: true, grantAllowsDirty: true })
+  assert.equal(dirty.allowed, false, '★ 脏不脏是"有没有未保存改动"，与"内容是谁写的"是两个问题')
+  assert.equal(dirty.reason, R.FOREIGN_CHANGE)
+  // ② [2026-10-24 修订] 缓冲区变干净了（那份外部增量已被撤销，或已保存成磁盘现状）：
+  //    干净 ⇒ 缓冲区内容 == 磁盘，"别人写的"这件事在内容上已经不存在 ⇒ 放行，改由
+  //    `expectedDisk`（-32013）与双锚点（-32012）分别兜"磁盘被人动过 / 缓冲区变过"。
+  const clean = judge(policy, { version: 7, isDirty: false, grantAllowsDirty: true })
+  assert.equal(clean.allowed, true, '干净写走原第 ③ 步：锚点齐全就放行')
+  assert.equal(policy.inspect(FILE_A).taint?.reason, R.FOREIGN_CHANGE,
+    '★ 放行 ≠ 洗白：taint 还在，脏写与 deleteFile 仍被拒')
 })
 
 test('T62 ★ 机器自动换 grant 不清 taint：只有 establishBaseline（人明确交接后的新授权）才清', () => {
   const policy = createWritePolicy()
-  policy.noteChange({ file: FILE_A, version: 6, incarnation: INC, changes: null })
+  foreignChange(policy, FILE_A, { from: 5, to: 6 })
   // 策略层不认识 grant 身份（写许可另绑 grant.id/epoch，但 taint 记在文件上），
   // 所以"再判一次"从任何角度都还是拒 —— 这就是"换 grant 不洗白"的机制。
   assert.equal(judge(policy, { version: 6, isDirty: true, grantAllowsDirty: true }).allowed, false)
@@ -231,7 +254,7 @@ test('T62 ★ 机器自动换 grant 不清 taint：只有 establishBaseline（�
 
 test('T62 ★ 一个文件被冻结，同一窗口其它干净文件照常可写', () => {
   const policy = createWritePolicy()
-  policy.noteChange({ file: FILE_A, version: 6, incarnation: INC, changes: null })
+  foreignChange(policy, FILE_A, { from: 5, to: 6 })
 
   const a = judge(policy, { fileKey: FILE_A, version: 6, isDirty: true, grantAllowsDirty: true })
   const b = judge(policy, { fileKey: FILE_B, version: 2, isDirty: false })
@@ -247,7 +270,7 @@ test('T62 ★ 冻结按"真实路径"归一：同一文件的另一种写法命�
   //   先归一化等于把被测代码的活儿替它干了 —— 变异（keyOf 改回恒等）就红不了。
   //   第一版这条用例正是这么瞎的，M6 第一次跑"没红"就是证据。
   //   真实来源：观察器事件里带的是宿主原始路径，判许可用的是 normalize 过的绝对路径。
-  policy.noteChange({ file: 'C:\\WS\\A.JS', version: 6, incarnation: INC, changes: null })
+  foreignChange(policy, 'C:\\WS\\A.JS', { from: 5, to: 6 })
   const verdict = judge(policy, { fileKey: FILE_A, version: 6, isDirty: true })
   assert.equal(verdict.allowed, false,
     '★ 归一化只有一处（keyOf）：两处不一致会让 taint 打到另一个键上，门等于不存在')
@@ -304,7 +327,7 @@ test('T62 ★ 旧参数 `allowDirtySave` 进不了判序：放进判定输入后
 
 test('T62 ★ `assertWritable` 与 `judge` 同一条判序（三个门的错误形状不许漂移）', () => {
   const policy = createWritePolicy()
-  policy.noteChange({ file: FILE_A, version: 6, incarnation: INC, changes: null })
+  foreignChange(policy, FILE_A, { from: 5, to: 6 })
   const verdict = judge(policy, { version: 6, isDirty: true })
   let thrown = null
   try {
@@ -316,4 +339,83 @@ test('T62 ★ `assertWritable` 与 `judge` 同一条判序（三个门的错误�
   assert.equal(thrown?.code, ERR.DOCUMENT_DIRTY)
   assert.equal(thrown.data.reason, verdict.reason, 'throw 与 return 必须给同一个 reason')
   assert.equal(thrown.data.attribution, verdict.attribution)
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. 冷启动首次旁观（T63）：本端没见过这个版本 ≠ 别人改过
+//
+// 真机证据（`D:/code-workspace/work/a2-probe.json`，三次复现）：DSH 冷启动后，
+// 任何「启动前就被编辑过」的文件都会被永久冻结 —— 干净文件 `B-clean.txt`
+// （`isDirty:false`、`version:5`、磁盘 sha 未变）写请求拿到 `-32011 foreign-change`，
+// 重启 DSH 后**立刻**再拒（同一个 `version:5`）。根因是这两条：
+//   ① `judge()` 第 ① 步不分干净/脏，一律按 taint 拒；
+//   ② 冷启动时 `lastVersion === null`，既有文档第一次被观察就被判成「没人写却变了」。
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('T63 ★ 冷启动 + 既有文档 version=5 + 干净（isDirty:false）→ 写必须放行', () => {
+  const policy = createWritePolicy()
+  // 冷启动第一件事：观察器送来了这份文档的一次变更（人在 DSH 启动前编辑并保存过）。
+  const first = policy.noteChange({ file: FILE_A, version: 5, incarnation: INC, changes: null })
+  assert.equal(first.classified, 'baseline',
+    '★ 首次观察只落基线：`lastVersion` 缺失不是"没有人写却变了"的证据')
+  assert.equal(policy.inspect(FILE_A).taint, null, '干净既有文档不许被首次旁观冻结')
+
+  const verdict = judge(policy, { version: 5 })
+  assert.equal(verdict.allowed, true,
+    '★ 缓冲区内容 == 磁盘（isDirty:false）+ 双锚点 ⇒ 放行；被撤销掉的他人改动已经不在缓冲区里')
+  assert.equal(policy.inspect(FILE_A).taint, null, '放行不许顺手造 taint')
+})
+
+test('T63 ★ 冷启动后「先写后存」整链不被首次旁观冻结（第 2 条修不动这一条）', () => {
+  const policy = createWritePolicy()
+  policy.noteChange({ file: FILE_A, version: 5, incarnation: INC, changes: null })
+  assert.equal(judge(policy, { version: 5 }).allowed, true)
+  // 本端写下去：缓冲区变脏，账本证明这次增量是桥接写的。
+  ownWrite(policy, FILE_A, { version: 6, dirty: true })
+  const save = judge(policy, { method: SAVE, version: 6, isDirty: true, grantAllowsDirty: true })
+  assert.equal(save.allowed, true,
+    '★ 只把 taint 收窄到"脏才管"是不够的：首次旁观留下的 taint 会让"刚写完的文件存不下去"')
+  assert.equal(save.attribution, ATTRIBUTION.SELF_ONLY)
+})
+
+test('T63 ★ taint 只对脏缓冲区与 deleteFile 生效：干净写走原第 ③ 步，脏/归档/无证据源照旧拒', () => {
+  const policy = createWritePolicy()
+  judge(policy, { version: 5 }) // 先让本端认识这份文件的锚点
+  policy.noteChange({ file: FILE_A, version: 6, incarnation: INC, changes: null }) // 别处来的增量
+  assert.equal(policy.inspect(FILE_A).taint?.reason, R.FOREIGN_CHANGE, '变更本身仍然要留证据')
+
+  // 干净：缓冲区内容 == 磁盘 ⇒ 那份他人改动已经不在缓冲区里了。
+  assert.equal(judge(policy, { version: 6 }).allowed, true, 'applyEdit 干净 ⇒ 放行')
+  assert.equal(judge(policy, { method: SAVE, version: 6 }).allowed, true, 'save 干净 ⇒ 放行（仍判 expectedDisk）')
+
+  // ★ 收紧的那三处一处都不许松动：
+  const dirty = judge(policy, { version: 6, isDirty: true, grantAllowsDirty: true })
+  assert.equal(dirty.allowed, false, '★ 脏缓冲区仍然拒：这是 taint 存在的理由')
+  assert.equal(dirty.reason, R.FOREIGN_CHANGE)
+
+  const delClean = judge(policy, { method: DELETE, version: 6 })
+  assert.equal(delClean.allowed, false, '★ deleteFile 要求干净基线：不产生新字节、但要搬走整份文件，taint 照旧生效')
+  assert.equal(delClean.reason, R.FOREIGN_CHANGE)
+
+  // ★ 这一问必须换一个**没被冻结**的文件：`refuse()` 的优先级是"已有 taint 时以 taint.reason
+  //   为准"，在被冻结的文件上问不出 observation-gap（reason 会是 foreign-change）。
+  const gap = judge(policy, { fileKey: FILE_B, version: 1, hasEvidenceSource: false })
+  assert.equal(gap.allowed, false, '★ 没有同源观察能力仍然整条写路径拒')
+  assert.equal(gap.reason, R.OBSERVATION_GAP)
+
+  assert.equal(policy.inspect(FILE_A).taint?.reason, R.FOREIGN_CHANGE,
+    '放行一次干净写**不许**顺手把 taint 洗掉（归档与脏写还靠它）')
+})
+
+test('T63 ★ 残留风险钉死：真实 taint 下干净写放行后，缓冲区转脏的 save 仍拒', () => {
+  const policy = createWritePolicy()
+  judge(policy, { version: 5 })
+  policy.noteChange({ file: FILE_A, version: 6, incarnation: INC, changes: null })
+  // 干净写放行 → 桥接把自己的编辑落进缓冲区 → 缓冲区变脏。
+  assert.equal(judge(policy, { version: 6 }).allowed, true)
+  ownWrite(policy, FILE_A, { version: 7, dirty: true })
+  const save = judge(policy, { method: SAVE, version: 7, isDirty: true, grantAllowsDirty: true })
+  assert.equal(save.allowed, false,
+    '★ 这是有意保留的：taint 未被写动作洗白（契约 11.5），处置仍是人工 rebase')
+  assert.equal(save.reason, R.FOREIGN_CHANGE)
 })

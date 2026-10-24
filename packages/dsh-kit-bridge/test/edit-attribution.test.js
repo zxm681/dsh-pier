@@ -259,7 +259,7 @@ async function expectCode(promise, code, label) {
 // ① T4 的 NO-GO 正面替代：旧版本写入被拦，人工改动留下
 // ---------------------------------------------------------------------------
 
-test('T62 ★ 重读锚点洗不白：人工键入后拿最新 version 重写 → 仍 -32011；isDirty=false 也不解冻', async () => {
+test('T62 ★ [T63 修订] 重读锚点洗不白：人工键入后拿最新 version 重写 → 仍 -32011；isDirty=false 只解除干净写拦截', async () => {
   const e = env()
   try {
     const f = e.file('a.js')
@@ -308,14 +308,25 @@ test('T62 ★ 重读锚点洗不白：人工键入后拿最新 version 重写 �
     assert.equal(e.host.buffer(f).includes('HUMAN-WROTE-THIS'), true,
       '人工的字必须留下 —— 这次不是"整行覆盖"的选择，而是根本不许写')
 
-    // ★ A2：`isDirty` 转 false（人手动保存了）**不能**洗白已经观察到的非桥接修改。
-    // 保存解决的是"盘上有没有这段字"，不解决"这段字是谁写的"。
+    // ★ [2026-10-24 修订] `isDirty` 转 false（人手动保存了）之后：**干净写放行**。
+    // 干净 ⇒ 缓冲区内容 == 磁盘，那份"来源不明"的内容已经不在缓冲区里了；「磁盘被人动过」
+    // 由 `expectedDisk`（-32013）兜，「缓冲区变过」由双锚点（-32012）兜 —— 这一笔用的就是
+    // 刚读到的 fresh version。**这不等于洗白 taint**：冻结仍在表里，见下面那一刀。
     e.host.markSaved(f)
     assert.equal(e.host.isDirtyOf(f), false)
-    await expectCode(
-      e.edit(f, wholeLine(1, 5), 'DSH-AFTER-SAVE', { expectedVersion: e.host.versionOf(f) }),
+    const afterSave = await e.edit(f, wholeLine(1, 5), 'DSH-AFTER-SAVE',
+      { expectedVersion: e.host.versionOf(f) })
+    assert.equal(afterSave.applied, true, '干净缓冲区走第 ③ 步：双锚点齐全就放行')
+    assert.equal(e.host.buffer(f).split(/\r?\n/)[0].startsWith('DSH-AFTER-SAVE'), true)
+
+    // taint 没被洗掉：缓冲区一转脏，同一份文件立刻又拒 —— 保存解决的是"盘上有没有这段字"，
+    // 不解决"这段字是谁敲的"。
+    e.host.humanType(f, 1, e.host.buffer(f).split(/\r?\n/)[0].length + 1, ' +MORE')
+    const stillTainted = await expectCode(
+      e.edit(f, wholeLine(1, 5), 'DSH-DIRTY-AGAIN', { expectedVersion: e.host.versionOf(f) }),
       ERR.DOCUMENT_DIRTY, 'taint-survives-save')
-    assert.equal(e.host.buffer(f).includes('HUMAN-WROTE-THIS'), true)
+    assert.equal(stillTainted.data.reason, 'foreign-change', '冻结原因没变')
+    assert.equal(e.host.buffer(f).includes('+MORE'), true, '缓冲区里人工的字还在')
   } finally { e.dispose() }
 })
 

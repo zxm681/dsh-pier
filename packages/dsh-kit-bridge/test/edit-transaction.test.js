@@ -695,20 +695,32 @@ test('★ T33 不同文件仍可并行（大写别名没把锁做成全局锁）
 test('★ T62 门在同步区间：排队后、构造前来了冻结证据 → 零构造 + -32011', async () => {
   const e = env({
     hooks: {
-      // 让出点：排队判定已经过了（干净），事务还没开始构造 builder。
+      // 让出点：排队判定已经过了，事务还没开始构造 builder。
       // 这里模拟"同一刻别处报来一条本桥接无法归属的证据"（真实的例子：另一个工具
       // 通过适配器报了 `markForeign`，或者上一笔写结算后判成 mixed-origin）。
       beforeTransaction: () => {
-        const key = pathIdentityKey(e.abs)
-        e.caps.writePolicy.markForeign(key, { reason: 'foreign-change', note: 'landed after queue gate' })
+        e.caps.writePolicy.markForeign(pathIdentityKey(e.abs), {
+          reason: 'foreign-change', note: 'landed after queue gate',
+        })
       },
     },
     lines: ['alpha one', 'beta two'],
   })
   try {
+    const key = pathIdentityKey(e.abs)
+    // ★ [2026-10-24 修订] 冻结证据只对**脏缓冲区**（与 `deleteFile`）生效 —— 干净写走第 ③ 步、
+    //   由双锚点与 `expectedDisk` 兜（见 `document-write-policy.test.js` 的 T63 用例）。
+    //   所以这道门必须拿一份"脏、且脏内容归本桥接所有"的缓冲区来考：等价于上一笔写已结算成
+    //   `self-only`，否则排队门就先拒了，根本到不了这道同步区间复核。
+    humanInsert(e.host.doc, 0, 5, ' HUMAN')
+    e.caps.writePolicy.beginWrite(key, { method: 'vscode.applyEdit' })
+    e.caps.writePolicy.endWrite(key, {
+      verdict: { attribution: 'self-only', after: { version: e.host.doc.version, incarnation: INCARNATION, dirty: true } },
+    })
+
     let err = null
     try {
-      await write(e.caps, e.link, params(e.abs, { expectedVersion: 0, text: 'DSH!!' }))
+      await write(e.caps, e.link, params(e.abs, { expectedVersion: e.host.doc.version, text: 'DSH!!' }))
     } catch (x) { err = x }
     assert.equal(err?.code, ERR.DOCUMENT_DIRTY, '构造前必须再判一次：这道门晚了就等于没有')
     assert.equal(err?.data?.phase, undefined, 'phase 只是诊断，不进 data；这里确认码本身')
