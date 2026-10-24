@@ -118,7 +118,7 @@ function keyOf(fileKey, incarnation) {
  *
  * @param {object} [opts]
  * @param {(level: string, msg: string) => void} [opts.log] 诊断日志
- * @param {number} [opts.maxFiles] 状态上限（逐文件表不许无限长）
+ * @param {number} [opts.maxFiles] LRU 软上限（冻结/在飞证据不淘汰，必要时超限保留）
  */
 export function createWritePolicy(opts = {}) {
   const log = typeof opts.log === 'function' ? opts.log : () => {}
@@ -170,8 +170,12 @@ export function createWritePolicy(opts = {}) {
       baselineContentHash: undefined,
     }
     files.set(key, st)
-    while (files.size > maxFiles) {
-      const oldest = files.keys().next().value
+    // T70：容量只淘汰普通观察状态，冻结/在飞证据不属于可丢诊断。
+    // 新条目也先保留：调用方可能紧接着 markForeign/beginWrite，不能先淘汰再修改孤儿对象。
+    // 全是受保护条目时允许超过软上限，绝不以重建 taint:null 代替人工 establishBaseline。
+    for (const [oldest, candidate] of files) {
+      if (files.size <= maxFiles) break
+      if (oldest === key || candidate.taint || candidate.inflight > 0) continue
       files.delete(oldest)
       stats.evicted += 1
     }

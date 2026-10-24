@@ -72,12 +72,12 @@ DSH ↔ VS Code 通用桥接通道。设计文档在 `docs/`，代码在 `packag
 
 ```bash
 cd packages/dsh-vscode-kit && node --test --test-concurrency=1 "test/*.test.js"   # 299（或 npm test）
-cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 295
+cd packages/dsh-kit-bridge && node --test "test/*.test.js"   # 306
 cd packages/dsh-kit-demo   && node --test "test/*.test.js"   # 9
 cd packages/dsh-kit-bridge && node scripts/e2e.mjs           # 22
 ```
 
-条数是**实跑的 `pass` 计数**（T68 本轮：kit 299 / bridge 295 / demo 9 / E2E 22；相对 T67 的 290 / 271 / 9 / 22 新增 33 条，原始输出与变异证据见 `work/t68-createFile.md`），加测试就得回来改这几行。
+条数是**实跑的 `pass` 计数**（T70：kit 299 / bridge 306 / demo 9 / E2E 22；bridge 在 T68 的 295 条上新增 11 条，原始输出与四变异证据见 [T70 返工报告](<work/T70-V1返工.md>)），加测试就得回来改这几行。
 （T54 那轮的同一门槛是 kit 213 / bridge 156 / demo 9 / E2E 22；那些数字只对当时的用例集成立，别拿它判断今天。）
 
 **kit 必须串行执行**（包内 `npm test` 同样使用 `node --test --test-concurrency=1 "test/*.test.js"`）。

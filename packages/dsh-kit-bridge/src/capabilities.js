@@ -25,7 +25,7 @@ import {
 } from './workspace-paths.js'
 import { createEventBroker } from '../../dsh-vscode-kit/src/event-subscriptions.js'
 import { canonicalPath, pathIdentityKey } from '../../dsh-vscode-kit/src/paths.js'
-import { createChangeLedger } from './change-ledger.js'
+import { ATTRIBUTION, createChangeLedger } from './change-ledger.js'
 import {
   createWritePolicy, documentDirtyError, WRITE_POLICY_REASONS,
 } from './document-write-policy.js'
@@ -1910,116 +1910,113 @@ export function createCapabilities(host, opts = {}) {
     // ── ⑨ 线性化点：`save()`。它没有 CAS，所以这里**不提供**"只写在锚定的那一版上"，
     //    只提供"走到这里之前，两边的锚点都还对得上"。──
     writePolicy.beginWrite(policyKey, { method })
-    let outcome
     try {
-      outcome = await host.saveDocument(writeTarget, { expectedVersion, expectedIncarnation })
-    } catch (err) {
-      // 保存抛异常：缓冲区可能已经清了、磁盘也可能已经换了 —— 一律按"不可判"收尾
-      // （不 taint：`save` 没有账本记录，判不出因果就不许凭空冻结）。
-      finishPolicyWrite(policyKey, null, null)
-      throw err
-    }
+      const outcome = await host.saveDocument(writeTarget, { expectedVersion, expectedIncarnation })
 
-    // `save()` 的返回值只可能是布尔（`Thenable<boolean>`）。非布尔 = 适配器坏了 → -32009，
-    // 不许把 `undefined` 当成"大概成功了吧"（§5.1「成功外形的错误结果」同一条禁令）。
-    if (typeof outcome?.saved !== 'boolean') {
-      throw new BridgeError(ERR.INVALID_RESPONSE,
-        'host.saveDocument must resolve {saved: boolean}; got '
-        + `${outcome?.saved === undefined ? 'undefined' : typeof outcome.saved}`,
-        { method, field: 'saved', got: { type: typeof outcome?.saved } })
-    }
-    if (outcome.saved !== true) {
-      // 宿主明确说"没存成"。untitled 单独给形状（§6.2.1 ⑭），其余一律 host-save-failed。
-      if (outcome.reason === 'untitled-document') {
-        throw new BridgeError(ERR.INVALID_PARAMS,
-          'the document has never been saved to disk (untitled); nothing to write to',
-          { method, file: canonicalPath(abs), reason: 'untitled-document' })
+      // `save()` 的返回值只可能是布尔（`Thenable<boolean>`）。非布尔 = 适配器坏了 → -32009，
+      // 不许把 `undefined` 当成"大概成功了吧"（§5.1「成功外形的错误结果」同一条禁令）。
+      if (typeof outcome?.saved !== 'boolean') {
+        throw new BridgeError(ERR.INVALID_RESPONSE,
+          'host.saveDocument must resolve {saved: boolean}; got '
+          + `${outcome?.saved === undefined ? 'undefined' : typeof outcome.saved}`,
+          { method, field: 'saved', got: { type: typeof outcome?.saved } })
       }
-      throw new BridgeError(ERR.INTERNAL,
-        'the editor refused to save the document; the file on disk may be unchanged '
-        + '(nothing is reported as saved)',
-        {
-          method,
-          file: canonicalPath(abs),
-          reason: 'host-save-failed',
-          hostReason: outcome.reason ?? null,
-          // `false` 是宿主对"我没写下去"的明确表态（`Thenable<boolean>`），
-          // 所以这里可以负责任地说"没应用"；报不出来（非布尔）那条分支才说"未知"。
-          mayHaveApplied: false,
-        })
-    }
-
-    // ── ⑩ 写后复核（与 applyEdit 同一对判据：路径采样 + 文档身份）──
-    assertTargetUnchanged(writeTarget, { method })
-    assertWrittenDocumentIdentity(outcome, writeTarget, { method })
-
-    // ── ⑩b 保存后的**诚实观测**（A2 / T62）──
-    // 保存参与者（`editor.formatOnSave` / `trimTrailingWhitespace` / `onWillSaveTextDocument`）
-    // 可能在 `save()` 内部或紧随其后改缓冲区/磁盘。这些变化**本门拦不住**（无 CAS，§6.2.6），
-    // 所以**不许**事后补一个 `-32011` 声称"我阻止了它"—— 那时字已经落盘了。
-    // 能做的只有如实报告，并且**立即冻结该文件**（暂停后续写，保留原文件，不回滚）：
-    //  · 存完还是脏 ⇒ 缓冲区在保存窗口里又被改了 ⇒ 内容来源不可判；
-    //  · 冻结后这个文件的下一次写会拿到 `-32011 attribution-unknown`。
-    let dirtyAfter = false
-    let postSave = null
-    try {
-      const measured = await readDocumentState(host, real, { includeText: false }, method)
-      dirtyAfter = measured.isDirty === true
-      if (dirtyAfter) {
-        writePolicy.markForeign(policyKey, {
-          reason: WRITE_POLICY_REASONS.ATTRIBUTION_UNKNOWN,
-          version: measured.version,
-          incarnation: measured.incarnation,
-          note: 'still-dirty-after-save',
-        })
-        postSave = {
-          dirtyAfter: true,
-          reason: WRITE_POLICY_REASONS.ATTRIBUTION_UNKNOWN,
-          // 字节已经落盘了 —— 这里报的是"应用过、但结果里混了来源不明的内容"，
-          // **不是**"没应用"。M5 变异就是把这句说成零应用；用例守着这条。
-          mayHaveApplied: true,
-          retryable: false,
-          tainted: true,
+      if (outcome.saved !== true) {
+        // 宿主明确说"没存成"。untitled 单独给形状（§6.2.1 ⑭），其余一律 host-save-failed。
+        if (outcome.reason === 'untitled-document') {
+          throw new BridgeError(ERR.INVALID_PARAMS,
+            'the document has never been saved to disk (untitled); nothing to write to',
+            { method, file: canonicalPath(abs), reason: 'untitled-document' })
         }
-        log('warn', `save: ${abs} still dirty right after save → frozen (${WRITE_POLICY_REASONS.ATTRIBUTION_UNKNOWN})`)
+        throw new BridgeError(ERR.INTERNAL,
+          'the editor refused to save the document; the file on disk may be unchanged '
+          + '(nothing is reported as saved)',
+          {
+            method,
+            file: canonicalPath(abs),
+            reason: 'host-save-failed',
+            hostReason: outcome.reason ?? null,
+            // `false` 是宿主对"我没写下去"的明确表态（`Thenable<boolean>`），
+            // 所以这里可以负责任地说"没应用"；报不出来（非布尔）那条分支才说"未知"。
+            mayHaveApplied: false,
+          })
       }
-    } catch (err) {
-      // 观测不到就不许吹"零污染"：如实标 unknown，但不冻结（没有证据，不能凭空拒写）。
-      postSave = { dirtyAfter: false, observed: false, note: 'post-save-state-unavailable' }
-      log('warn', `save: post-save state unavailable on ${abs}: ${err?.message ?? err}`)
-    }
-    finishPolicyWrite(policyKey, null, null)
 
-    // ── ⑪ 重新 stat：`disk` 必须是**保存后的真值**，不是回显 `expectedDisk` ──
-    // 回显等于骗人：`formatOnSave` / 保存参与者改过字节、或保存根本没改变文件时，
-    // 回显会让调用方以为"磁盘现在就是我给的那个锚点"。
-    const disk = await readDiskStatOf(host, real, method)
-    if (!disk) {
-      // 报了保存成功、磁盘上却 stat 不到 —— 失败闭合：不许返回 `{saved:true}` 配一个瞎编的 disk。
-      throw new BridgeError(ERR.INTERNAL,
-        `the editor reported a successful save, but ${canonicalPath(abs)} cannot be stat-ed `
-        + 'afterwards; refusing to report what cannot be observed',
-        {
-          method,
-          file: canonicalPath(abs),
-          reason: 'disk-stat-unavailable',
-          // save() 已经调过了，结果无法观测 —— 只能说"可能已写"，不能说"没写"。
-          mayHaveApplied: true,
-          retryable: false,
-        })
-    }
+      // ── ⑩ 写后复核（与 applyEdit 同一对判据：路径采样 + 文档身份）──
+      assertTargetUnchanged(writeTarget, { method })
+      assertWrittenDocumentIdentity(outcome, writeTarget, { method })
 
-    log(`save: ${abs} v${state.version}${dirtyBefore ? ' (dirty, grant-level allowDirtySave)' : ''} `
-      + `disk ${expectedDisk.mtime}/${expectedDisk.size} -> ${disk.mtime}/${disk.size}`)
-    return {
-      saved: true,
-      file: canonicalPath(abs),
-      disk,
-      dirtyBefore,
-      // ── A2 / T62：保存后的诚实观测（**只增不改**）──
-      // `saved` / `file` / `disk` / `dirtyBefore` 的语义一字未动。
-      dirtyAfter,
-      ...(postSave ? { postSave } : {}),
+      // ── ⑩b 保存后的**诚实观测**（A2 / T62）──
+      // 保存参与者（`editor.formatOnSave` / `trimTrailingWhitespace` / `onWillSaveTextDocument`）
+      // 可能在 `save()` 内部或紧随其后改缓冲区/磁盘。这些变化**本门拦不住**（无 CAS，§6.2.6），
+      // 所以**不许**事后补一个 `-32011` 声称"我阻止了它"—— 那时字已经落盘了。
+      // 能做的只有如实报告，并且**立即冻结该文件**（暂停后续写，保留原文件，不回滚）：
+      //  · 存完还是脏 ⇒ 缓冲区在保存窗口里又被改了 ⇒ 内容来源不可判；
+      //  · 冻结后这个文件的下一次写会拿到 `-32011 attribution-unknown`。
+      let dirtyAfter = false
+      let postSave = null
+      try {
+        const measured = await readDocumentState(host, real, { includeText: false }, method)
+        dirtyAfter = measured.isDirty === true
+        if (dirtyAfter) {
+          writePolicy.markForeign(policyKey, {
+            reason: WRITE_POLICY_REASONS.ATTRIBUTION_UNKNOWN,
+            version: measured.version,
+            incarnation: measured.incarnation,
+            note: 'still-dirty-after-save',
+          })
+          postSave = {
+            dirtyAfter: true,
+            reason: WRITE_POLICY_REASONS.ATTRIBUTION_UNKNOWN,
+            // 字节已经落盘了 —— 这里报的是"应用过、但结果里混了来源不明的内容"，
+            // **不是**"没应用"。M5 变异就是把这句说成零应用；用例守着这条。
+            mayHaveApplied: true,
+            retryable: false,
+            tainted: true,
+          }
+          log('warn', `save: ${abs} still dirty right after save → frozen (${WRITE_POLICY_REASONS.ATTRIBUTION_UNKNOWN})`)
+        }
+      } catch (err) {
+        // 观测不到就不许吹"零污染"：如实标 unknown，但不冻结（没有证据，不能凭空拒写）。
+        postSave = { dirtyAfter: false, observed: false, note: 'post-save-state-unavailable' }
+        log('warn', `save: post-save state unavailable on ${abs}: ${err?.message ?? err}`)
+      }
+
+      // ── ⑪ 重新 stat：`disk` 必须是**保存后的真值**，不是回显 `expectedDisk` ──
+      // 回显等于骗人：`formatOnSave` / 保存参与者改过字节、或保存根本没改变文件时，
+      // 回显会让调用方以为"磁盘现在就是我给的那个锚点"。
+      const disk = await readDiskStatOf(host, real, method)
+      if (!disk) {
+        // 报了保存成功、磁盘上却 stat 不到 —— 失败闭合：不许返回 `{saved:true}` 配一个瞎编的 disk。
+        throw new BridgeError(ERR.INTERNAL,
+          `the editor reported a successful save, but ${canonicalPath(abs)} cannot be stat-ed `
+          + 'afterwards; refusing to report what cannot be observed',
+          {
+            method,
+            file: canonicalPath(abs),
+            reason: 'disk-stat-unavailable',
+            // save() 已经调过了，结果无法观测 —— 只能说"可能已写"，不能说"没写"。
+            mayHaveApplied: true,
+            retryable: false,
+          })
+      }
+
+      log(`save: ${abs} v${state.version}${dirtyBefore ? ' (dirty, grant-level allowDirtySave)' : ''} `
+        + `disk ${expectedDisk.mtime}/${expectedDisk.size} -> ${disk.mtime}/${disk.size}`)
+      return {
+        saved: true,
+        file: canonicalPath(abs),
+        disk,
+        dirtyBefore,
+        // ── A2 / T62：保存后的诚实观测（**只增不改**）──
+        // `saved` / `file` / `disk` / `dirtyBefore` 的语义一字未动。
+        dirtyAfter,
+        ...(postSave ? { postSave } : {}),
+      }
+    } finally {
+      // T70：每个出口恰好收尾一次；save 无账本因果裁决，null 会保留旧 dirtyOwned，
+      // 必须显式 unknown 撤销脏所有权（§11.2⑥）。不凭失败制造 taint；已有 taint 不清。
+      finishPolicyWrite(policyKey, { attribution: ATTRIBUTION.UNKNOWN }, null)
     }
   }
 
